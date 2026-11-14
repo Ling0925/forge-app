@@ -3,3 +3,34 @@ name = "forge-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[[bin]]
+name = "forge-app"
+path = "src/main.rs"
+
+[dependencies]
+forge-state = { path = "../forge-state" }
+forge-protocol.workspace = true
+forge-core.workspace = true
+forge-store.workspace = true
+forge-provider.workspace = true
+forge-tools.workspace = true
+tokio.workspace = true
+# UI framework (user decision: gpui-kit 0.9.1, minor pinned).
+gpui-kit = "=0.9.1"
+
+[dev-dependencies]
+gpui-kit = { version = "=0.9.1", features = ["test-support"] }
+serde_json.workspace = true
+
+# Local UTC offset (localtime_r) for wall-clock texts; already in Cargo.lock
+# through gpui/tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# VoiceOver announcement bridge + Increase Contrast (§8). Same versions gpui
+# already links on macOS (no new crates in Cargo.lock).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSValue", "NSObjCRuntime"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAccessibilityConstants", "NSAccessibility", "NSApplication", "NSResponder", "NSWorkspace"] }

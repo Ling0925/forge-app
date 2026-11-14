@@ -30,6 +30,28 @@ pub enum NoticeLevel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    SettingsUpdated {
+        settings: Settings,
+    },
+    ProviderKeyConfigured {
+        provider: ProviderId,
+        key_status: KeyStatus,
+    },
+    HistoryLoaded {
+        session: SessionId,
+        messages: Vec<Message>,
+        next_before: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        runs: Vec<Run>,
+    },
+    Snapshot {
+        sessions: Vec<Session>,
+        workspaces: Vec<Workspace>,
+        settings: Settings,
+        providers: Vec<ProviderKeyStatus>,
+        active_runs: Vec<ActiveRun>,
+        last_seq: u64,
+    },
     WorkspaceAdded {
         workspace: Workspace,
     },
@@ -73,6 +95,7 @@ pub enum Event {
     },
     RunStarted {
         run: Run,
+        input_id: InputId,
     },
     RunStateChanged {
         run: RunId,
@@ -81,7 +104,8 @@ pub enum Event {
     RunFinished {
         run: RunId,
         outcome: RunOutcome,
-        reason: Option<String>,
+        #[serde(default)]
+        finished_at: u64,
     },
     SteerApplied {
         run: RunId,
@@ -133,7 +157,7 @@ pub enum Event {
     ContextUsage {
         run: RunId,
         used_tokens: u64,
-        available_tokens: u64,
+        context_remaining_estimate: u64,
     },
     ContextCompacted {
         run: RunId,

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 macro_rules! ids {
     ($($name:ident),+ $(,)?) => {$(
@@ -79,12 +79,46 @@ pub enum RunState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunOutcome {
     Succeeded,
-    Failed,
-    Cancelled,
+    Cancelled {
+        source: CancelSource,
+    },
+    Failed {
+        kind: RunErrorKind,
+        message: String,
+        http_status: Option<u16>,
+        retry_after_ms: Option<u64>,
+        retryable: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelSource {
+    User,
+    AppQuit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunErrorKind {
+    Network,
+    RateLimited,
+    Auth,
+    Quota,
+    Server,
+    ContextTooLong,
     Interrupted,
+    Unknown { source: UnknownSource },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownSource {
+    Provider,
+    Storage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +187,20 @@ pub struct Session {
     pub state: SessionState,
     pub archived: bool,
     pub queue_state: QueueState,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_finished_run: Option<FinishedRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinishedRun {
+    pub run: RunId,
+    pub input_id: Option<InputId>,
+    pub outcome: RunOutcome,
+    #[serde(default)]
+    pub started_at: u64,
+    pub finished_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,7 +234,7 @@ pub struct SteerInput {
     pub consumed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -201,7 +249,9 @@ pub struct Run {
     pub session_id: SessionId,
     pub queue_item_id: Option<QueueItemId>,
     pub state: RunState,
-    pub terminal_reason: Option<String>,
+    pub outcome: Option<RunOutcome>,
+    pub started_at: u64,
+    pub finished_at: Option<u64>,
     pub usage: Usage,
 }
 
@@ -223,6 +273,8 @@ pub enum MessageRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: MessageId,
+    pub ordinal: u64,
+    pub input_id: Option<InputId>,
     pub run_id: RunId,
     pub turn_id: TurnId,
     pub role: MessageRole,
@@ -300,6 +352,7 @@ pub struct ProviderSettings {
     pub id: ProviderId,
     pub endpoint: Option<String>,
     pub keychain_reference: Option<String>,
+    pub max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,7 +369,30 @@ pub enum ProviderKeyErrorKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    pub ui_prefs: BTreeMap<String, String>,
     pub providers: Vec<ProviderSettings>,
     pub model: ModelSelection,
     pub permission_mode: PermissionMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderKeyStatus {
+    pub provider: ProviderId,
+    pub key_status: KeyStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStatus {
+    Configured,
+    Missing,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActiveRun {
+    pub run: Run,
+    pub input_id: InputId,
+    pub text: String,
+    pub reasoning: String,
 }

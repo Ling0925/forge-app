@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     pin::Pin,
-    time::{Duration, Instant},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
 
@@ -12,21 +12,14 @@ pub trait Clock: Send + Sync {
     fn sleep(&self, duration: Duration) -> Sleep;
 }
 
-pub struct RealClock {
-    origin: Instant,
-}
-
-impl Default for RealClock {
-    fn default() -> Self {
-        Self {
-            origin: Instant::now(),
-        }
-    }
-}
+#[derive(Default)]
+pub struct RealClock;
 
 impl Clock for RealClock {
     fn now(&self) -> Duration {
-        self.origin.elapsed()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after Unix epoch")
     }
     fn sleep(&self, duration: Duration) -> Sleep {
         Box::pin(tokio::time::sleep(duration))
@@ -119,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_clock_sleeps_and_moves_forward() {
-        let clock = RealClock::default();
+        let clock = RealClock;
         let start = clock.now();
         let duration = Duration::from_millis(1);
         clock.sleep(duration).await;

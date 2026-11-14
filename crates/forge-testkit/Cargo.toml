@@ -11,6 +11,7 @@ forge-tools.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 forge-store.workspace = true
 tempfile.workspace = true
 forge-core.workspace = true
@@ -19,4 +20,4 @@ forge-core.workspace = true
 libc.workspace = true
 
 [features]
-failpoints = ["forge-tools/failpoints"]
+failpoints = ["forge-tools/failpoints", "forge-core/failpoints"]

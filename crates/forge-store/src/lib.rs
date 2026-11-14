@@ -1,5 +1,7 @@
 mod blob;
+mod data;
 pub use blob::BlobStore;
+pub use data::WriteTransaction;
 
 use rusqlite::Connection;
 use std::{fs, path::Path};
@@ -10,7 +12,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error(transparent)]
+    Integer(#[from] std::num::TryFromIntError),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("schema {found} is newer than supported schema {supported}")]
@@ -93,6 +99,7 @@ mod tests {
                 "runs",
                 "sessions",
                 "settings",
+                "sqlite_sequence",
                 "steer_inputs",
                 "tool_calls",
                 "turns",

@@ -24,8 +24,8 @@ fn every_command_round_trips_with_ui_idempotency_ids() {
         json!({"type":"rename_session", "session":"s", "title":"renamed"}),
         json!({"type":"archive_session", "session":"s", "archived":true}),
         json!({"type":"delete_session", "session":"s"}),
-        json!({"type":"load_history", "session":"s", "before_seq":42}),
-        json!({"type":"load_history", "session":"s", "before_seq":null}),
+        json!({"type":"load_history", "session":"s", "before":42, "limit":20}),
+        json!({"type":"load_history", "session":"s", "before":null, "limit":20}),
         json!({"type":"send", "session":"s", "input_id":"ui-input", "content":content}),
         json!({"type":"steer", "run":"r", "steer_id":"ui-steer", "content":content}),
         json!({"type":"edit_queue_item", "item":"q", "content":content}),
@@ -44,7 +44,10 @@ fn every_command_round_trips_with_ui_idempotency_ids() {
         json!({"type":"preview_restore", "checkpoint":"c"}),
         json!({"type":"restore_checkpoint", "checkpoint":"c", "overwrite":["/project/file"]}),
         json!({"type":"restore_checkpoint", "checkpoint":"c", "overwrite":[]}),
-        json!({"type":"update_settings", "settings":{"providers":[{"id":"provider", "endpoint":null,"keychain_reference":"key-ref"}], "model":model,"permission_mode":"unrestricted"}}),
+        json!({"type":"update_settings", "settings":{"providers":[{"id":"provider", "endpoint":null,"keychain_reference":"key-ref", "max_output_tokens":null}], "model":model,"permission_mode":"unrestricted", "ui_prefs":{}}}),
+        json!({"type":"get_snapshot"}),
+        json!({"type":"set_provider_key", "provider":"provider", "key":"test-only"}),
+        json!({"type":"set_provider_key", "provider":"provider", "key":null}),
         json!({"type":"shutdown"}),
     ] {
         round_trip::<Command>(command);
@@ -53,7 +56,7 @@ fn every_command_round_trips_with_ui_idempotency_ids() {
 
 #[test]
 fn every_event_round_trips_inside_a_sequence_envelope() {
-    let session = json!({"id":"s", "workspace_id":"w", "title":"title", "model":{"provider":"provider", "model":"fixture"}, "permission_mode":"ask", "state":"idle", "archived":false, "queue_state":"active"});
+    let session = json!({"id":"s", "workspace_id":"w", "title":"title", "model":{"provider":"provider", "model":"fixture"}, "permission_mode":"ask", "state":"idle", "archived":false, "queue_state":"active", "created_at":1000, "updated_at":2000});
     let content = json!({"text":"input", "attachments":[]});
     let item = json!({"id":"q", "input_id":"ui-input", "session_id":"s", "content":content, "state":"pending", "ordinal":0});
     let usage = json!({"input_tokens":3, "output_tokens":2, "cached_tokens":1, "requests":1, "estimated_cost_usd":0.1});
@@ -71,9 +74,9 @@ fn every_event_round_trips_inside_a_sequence_envelope() {
         json!({"type":"queue_item_removed", "session":"s", "item":"q"}),
         json!({"type":"queue_paused", "session":"s", "reason":"cancelled"}),
         json!({"type":"queue_resumed", "session":"s"}),
-        json!({"type":"run_started", "run":{"id":"r", "session_id":"s", "queue_item_id":"q", "state":"running", "terminal_reason":null, "usage":usage}}),
+        json!({"type":"run_started", "run":{"id":"r", "session_id":"s", "queue_item_id":"q", "state":"running", "outcome":null, "started_at":1000, "finished_at":null, "usage":usage}, "input_id":"ui-input"}),
         json!({"type":"run_state_changed", "run":"r", "state":"cancelling"}),
-        json!({"type":"run_finished", "run":"r", "outcome":"cancelled", "reason":null}),
+        json!({"type":"run_finished", "run":"r", "outcome":{"type":"cancelled", "source":"app_quit"}, "finished_at":2000}),
         json!({"type":"steer_applied", "run":"r", "steer_id":"ui-steer"}),
         json!({"type":"text_delta", "run":"r", "text":"hello"}),
         json!({"type":"reasoning_delta", "run":"r", "text":"reason"}),
@@ -85,7 +88,7 @@ fn every_event_round_trips_inside_a_sequence_envelope() {
         json!({"type":"tool_output_chunk", "call":"t", "stream":"stdout", "bytes":[0, 255]}),
         json!({"type":"approval_requested", "approval":{"id":"a", "tool_call_id":"t", "requested_at_unix_ms":0, "state":"pending", "decision":null, "resolved_by":null, "scope":"once"}}),
         json!({"type":"approval_resolved", "approval":"a", "decision":"deny", "scope":"once", "by":"cancel"}),
-        json!({"type":"context_usage", "run":"r", "used_tokens":1, "available_tokens":2}),
+        json!({"type":"context_usage", "run":"r", "used_tokens":1, "context_remaining_estimate":2}),
         json!({"type":"context_compacted", "run":"r", "before_tokens":2, "after_tokens":1}),
         json!({"type":"checkpoint_created", "checkpoint":{"id":"c", "run_id":"r", "files":[{"path":"file", "before":null, "after":"hash"}]}}),
         json!({"type":"restore_previewed", "checkpoint":"c", "files":[{"path":"clean", "status":"clean"}, {"path":"changed", "status":"modified_externally"}, {"path":"missing", "status":"deleted_externally"}]}),
@@ -148,8 +151,129 @@ fn provider_key_error_kinds_round_trip() {
 }
 
 #[test]
+fn key_statuses_serialize_as_snake_case_strings() {
+    use forge_protocol::{Event, KeyStatus, ProviderKeyStatus};
+    for (status, name) in [
+        (KeyStatus::Configured, "configured"),
+        (KeyStatus::Missing, "missing"),
+        (KeyStatus::Unavailable, "unavailable"),
+    ] {
+        assert_eq!(
+            serde_json::to_string(&status).unwrap(),
+            format!("\"{name}\"")
+        );
+        assert_eq!(
+            serde_json::from_value::<KeyStatus>(json!(name)).unwrap(),
+            status
+        );
+        round_trip::<ProviderKeyStatus>(json!({"provider":"provider", "key_status":name}));
+        round_trip::<Event>(
+            json!({"type":"provider_key_configured", "provider":"provider", "key_status":name}),
+        );
+    }
+}
+
+#[test]
 fn uncertain_actions_round_trip() {
     for action in ["requeue", "discard"] {
         round_trip::<UncertainAction>(json!(action));
     }
+}
+
+#[test]
+fn p1_snapshots_history_settings_and_structured_outcomes_round_trip() {
+    use forge_protocol::{RunOutcome, Settings};
+    let settings = json!({"providers":[{"id":"openai","endpoint":null,"keychain_reference":null,"max_output_tokens":null}],"model":{"provider":"openai","model":"fixture"},"permission_mode":"ask","ui_prefs":{"onboarding_complete":"true"}});
+    round_trip::<Settings>(settings.clone());
+    for event in [
+        json!({"type":"settings_updated","settings":settings}),
+        json!({"type":"provider_key_configured","provider":"openai","key_status":"configured"}),
+        json!({"type":"snapshot","sessions":[],"workspaces":[],"settings":settings,"providers":[{"provider":"openai","key_status":"missing"}],"active_runs":[{"run":{"id":"r","session_id":"s","queue_item_id":null,"state":"running","outcome":null,"started_at":1000,"finished_at":null,"usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,"requests":0,"estimated_cost_usd":null}},"input_id":"i","text":"partial","reasoning":"why"}],"last_seq":10}),
+        json!({"type":"history_loaded","session":"s","messages":[{"id":"m","ordinal":2,"input_id":"i","run_id":"r","turn_id":"t","role":"user","content":{"text":"hello","attachments":[]},"tool_call_id":null}],"next_before":2}),
+    ] {
+        round_trip::<EventEnvelope>(json!({"seq":10,"event":event}));
+    }
+    round_trip::<RunOutcome>(json!({"type":"succeeded"}));
+    for source in ["user", "app_quit"] {
+        round_trip::<RunOutcome>(json!({"type":"cancelled","source":source}));
+    }
+    for kind in [
+        "network",
+        "rate_limited",
+        "auth",
+        "quota",
+        "server",
+        "context_too_long",
+        "interrupted",
+    ] {
+        let outcome = json!({"type":"failed","kind":kind,"message":"failure","http_status":429,"retry_after_ms":120000,"retryable":true});
+        round_trip::<RunOutcome>(outcome.clone());
+        round_trip::<EventEnvelope>(
+            json!({"seq":10,"event":{"type":"run_finished","run":"r","outcome":outcome,"finished_at":2000}}),
+        );
+    }
+}
+
+#[test]
+fn unknown_run_errors_round_trip_with_provider_or_storage_source() {
+    use forge_protocol::{RunErrorKind, RunOutcome, UnknownSource};
+    for (source, name) in [
+        (UnknownSource::Provider, "provider"),
+        (UnknownSource::Storage, "storage"),
+    ] {
+        let kind = RunErrorKind::Unknown { source };
+        let value = json!({"unknown":{"source":name}});
+        assert_eq!(serde_json::to_value(&kind).unwrap(), value);
+        assert_eq!(
+            serde_json::from_value::<RunErrorKind>(value.clone()).unwrap(),
+            kind
+        );
+        let outcome = json!({"type":"failed", "kind":value, "message":"failure", "http_status":null, "retry_after_ms":null, "retryable":false});
+        round_trip::<RunOutcome>(outcome.clone());
+        round_trip::<EventEnvelope>(
+            json!({"seq":1, "event":{"type":"run_finished", "run":"r", "outcome":outcome,"finished_at":2000}}),
+        );
+    }
+}
+
+#[test]
+fn finished_run_fields_are_additive_and_round_trip() {
+    use forge_protocol::{Event, FinishedRun, Session};
+    let mut session = json!({"id":"s", "workspace_id":"w", "title":"title", "model":{"provider":"provider", "model":"fixture"}, "permission_mode":"ask", "state":"idle", "archived":false, "queue_state":"active", "created_at":1000, "updated_at":2000});
+    let legacy: Session = serde_json::from_value(session.clone()).unwrap();
+    assert_eq!(legacy.last_finished_run, None);
+    round_trip::<Session>(session.clone());
+    let outcome = json!({"type":"failed", "kind":"interrupted", "message":"上次异常退出时中断", "http_status":null, "retry_after_ms":null, "retryable":true});
+    let finished = json!({"run":"r", "input_id":"i", "outcome":outcome, "started_at":1000, "finished_at":2000});
+    round_trip::<FinishedRun>(finished.clone());
+    session["last_finished_run"] = finished;
+    round_trip::<Session>(session.clone());
+    round_trip::<EventEnvelope>(json!({"seq":10, "event":{
+        "type":"snapshot", "sessions":[session], "workspaces":[],
+        "settings":{"providers":[], "model":{"provider":"provider", "model":"fixture"}, "permission_mode":"ask", "ui_prefs":{}},
+        "providers":[], "active_runs":[], "last_seq":10
+    }}));
+    let mut history = json!({"type":"history_loaded", "session":"s", "messages":[{"id":"m", "ordinal":1, "input_id":"i", "run_id":"r", "turn_id":"t", "role":"user", "content":{"text":"hello", "attachments":[]}, "tool_call_id":null}], "next_before":null});
+    let legacy: Event = serde_json::from_value(history.clone()).unwrap();
+    assert!(matches!(legacy, Event::HistoryLoaded { runs, .. } if runs.is_empty()));
+    round_trip::<Event>(history.clone());
+    history["runs"] = json!([{"id":"r", "session_id":"s", "queue_item_id":null, "state":"failed", "outcome":outcome, "started_at":1000, "finished_at":2000, "usage":{"input_tokens":0, "output_tokens":0, "cached_tokens":0, "requests":0, "estimated_cost_usd":null}}]);
+    round_trip::<Event>(history);
+}
+
+#[test]
+fn run_timestamps_decode_legacy_payloads() {
+    use forge_protocol::{Event, FinishedRun};
+    let mut event = json!({"type":"run_finished", "run":"r", "outcome":{"type":"succeeded"}});
+    let legacy: Event = serde_json::from_value(event.clone()).unwrap();
+    assert!(matches!(legacy, Event::RunFinished { finished_at: 0, .. }));
+    event["finished_at"] = json!(2000);
+    round_trip::<Event>(event);
+
+    let mut finished =
+        json!({"run":"r", "input_id":"i", "outcome":{"type":"succeeded"}, "finished_at":2000});
+    let legacy: FinishedRun = serde_json::from_value(finished.clone()).unwrap();
+    assert_eq!(legacy.started_at, 0);
+    finished["started_at"] = json!(1000);
+    round_trip::<FinishedRun>(finished);
 }
