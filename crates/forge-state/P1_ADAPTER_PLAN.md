@@ -1,4 +1,6 @@
-# forge-state ← Core P1 protocol: adapter plan (not implemented yet)
+# forge-state ← Core P1 protocol: adapter plan
+
+**Status (built against core/p1 3ea2965b37e5a56f76fdbc221051e8af3cb3a59f): implemented.** The table below is the original plan; see "Implemented since" at the end.
 
 Scope: what changes in `forge-state` once Core lands the agreed P1 protocol.
 Every item is local to `forge-state` (+ the `forge-ui` backend glue); the view
@@ -19,3 +21,14 @@ Open questions for Core: the 10 `ErrorKind` values vs the 9 spec cards
 (`provider`/`storage` currently fall into the Unknown card); whether
 `retry_after_ms` on `failed` is absolute or relative (UI assumes relative to
 `finished_at`); `RetryRun` (P3) reject code until then (UI shows a toast).
+
+## Implemented since (core/p1 3ea2965)
+
+- Structured `RunOutcome` → `FailureVm` 1:1 (`outcome::failure_of`); `retry_after_ms` is relative to `finished_at`; ≤ 60000 ms ⇒ retry now (⌘R), > 60000 ⇒ wait card; when the countdown ends the body becomes `error.retry_after_ready` and one polite "现在可以重试" is announced.
+- Details: `outcome::remove_request_headers` mirrors `forge-core/src/errors.rs` exactly (same header list, in-segment `[已移除请求头]`), then `sanitize_details` turns literal `\n` into lines and masks residual `sk-…` / Bearer / `api_key=`.
+- `GetSnapshot` at boot and once per seq gap; snapshot restores active runs, keeps in-memory error cards, reloads the selected session's newest page (TODO(core): no per-run outcome for runs that ended inside the gap other than `last_finished_run`).
+- R-1: `Session.last_finished_run` (Snapshot / SessionCreated / SessionUpdated) drives the sidebar status and finishes a run that ended unseen; `HistoryLoaded.runs[].outcome` rebuilds error card + divider right after that run's last message in the page, also for older pages. Restores are idempotent and never announce. An older run restored while paging never overrides `last_finished_run` in the sidebar.
+- R-2: `failed{interrupted}` ("上次异常退出时中断", retryable=true) → Interrupted card with retry enabled.
+- `SetProviderKey` / `ProviderKeyConfigured` / `Snapshot.providers[].key_configured` drive the no-key banner; "打开设置" opens the settings panel.
+- `Settings.ui_prefs` round-trip (sidebar/inspector width + visibility), written on drag end.
+- A session stuck in Running with no active run adopts its newest run so 停止 ⌘. still sends `CancelRun`; `invalid_state` rejections restore the draft.

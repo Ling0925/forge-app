@@ -30,6 +30,8 @@ pub enum Scene {
     Error,
     /// Run whose result could not be written (unknown + storage → 保存失败).
     Storage,
+    /// Conversation with a third run still streaming: composer shows 停止 ⌘.
+    Running,
 }
 
 impl Scene {
@@ -45,6 +47,7 @@ impl Scene {
             "conversation" | "timeline" => Some(Scene::Conversation),
             "error" => Some(Scene::Error),
             "storage" => Some(Scene::Storage),
+            "running" => Some(Scene::Running),
             _ => None,
         }
     }
@@ -340,6 +343,13 @@ pub fn populate(app: &mut AppState, scene: Scene, base: u64) -> u64 {
 
     f.at(90_000).send("再把错误卡片也做了吧。");
     f.start("r3", "s1", T1);
+    if scene == Scene::Running {
+        f.at(92_000).event(delta(
+            "r3",
+            "好的，先在 forge-state 里加错误卡片的视图模型，",
+        ));
+        return f.at(98_000).now;
+    }
     let outcome = if scene == Scene::Storage {
         failure(
             RunErrorKind::Unknown {
