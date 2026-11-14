@@ -42,6 +42,7 @@ fn ui_sb_01_approval_moves_session_to_needs_attention_and_back() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     assert_eq!(ids(&app.sidebar().in_progress), ["s1"]);
@@ -84,6 +85,7 @@ fn ui_sb_02_cancel_with_pending_queue_needs_attention() {
         [
             Event::RunStarted {
                 run: run("r1", "s1", None),
+                input_id: "in-1".into(),
             },
             Event::QueueItemAdded {
                 item: item("q2", "s1", "in-x", "next", QueueItemState::Pending, 2),
@@ -95,8 +97,7 @@ fn ui_sb_02_cancel_with_pending_queue_needs_attention() {
         &mut app,
         [Event::RunFinished {
             run: "r1".into(),
-            outcome: RunOutcome::Cancelled,
-            reason: None,
+            outcome: cancelled(),
         }],
     );
     let sidebar = app.sidebar();
@@ -123,6 +124,7 @@ fn row_status_texts_cover_each_state() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     app.set_now_ms(93_000);
@@ -142,8 +144,7 @@ fn row_status_texts_cover_each_state() {
         &mut app,
         [Event::RunFinished {
             run: "r1".into(),
-            outcome: RunOutcome::Failed,
-            reason: Some("network".into()),
+            outcome: failed(RunErrorKind::Network),
         }],
     );
     let row = app.sidebar().recent[0].clone();
@@ -157,11 +158,11 @@ fn row_status_texts_cover_each_state() {
         [
             Event::RunStarted {
                 run: run("r2", "s1", None),
+                input_id: "in-1".into(),
             },
             Event::RunFinished {
                 run: "r2".into(),
-                outcome: RunOutcome::Interrupted,
-                reason: None,
+                outcome: interrupted(),
             },
         ],
     );
@@ -192,14 +193,14 @@ fn failed_with_paused_queue_shows_paused_text() {
         [
             Event::RunStarted {
                 run: run("r1", "s1", None),
+                input_id: "in-1".into(),
             },
             Event::QueueItemAdded {
                 item: item("q2", "s1", "x", "n", QueueItemState::Pending, 2),
             },
             Event::RunFinished {
                 run: "r1".into(),
-                outcome: RunOutcome::Failed,
-                reason: Some("auth".into()),
+                outcome: failed(RunErrorKind::Auth),
             },
             Event::QueuePaused {
                 session: "s1".into(),
@@ -220,7 +221,7 @@ fn recent_is_ordered_by_activity_and_filtered_by_workspace() {
         &mut app,
         [
             Event::SessionCreated {
-                session: session("s2"),
+                session: session_at("s2", 1_000),
             },
             Event::SessionCreated { session: other },
         ],
@@ -230,6 +231,7 @@ fn recent_is_ordered_by_activity_and_filtered_by_workspace() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     feed(
@@ -237,7 +239,13 @@ fn recent_is_ordered_by_activity_and_filtered_by_workspace() {
         [Event::RunFinished {
             run: "r1".into(),
             outcome: RunOutcome::Succeeded,
-            reason: None,
+        }],
+    );
+    // Core bumps `updated_at` with the run and publishes SessionUpdated.
+    feed(
+        &mut app,
+        [Event::SessionUpdated {
+            session: session_at("s1", 5_000),
         }],
     );
     assert_eq!(ids(&app.sidebar().recent), ["s1", "s2"]);
@@ -283,6 +291,7 @@ fn ui_sb_05_running_session_cannot_be_deleted() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     assert!(!app.can_delete(&"s1".into()));
@@ -292,7 +301,6 @@ fn ui_sb_05_running_session_cannot_be_deleted() {
         [Event::RunFinished {
             run: "r1".into(),
             outcome: RunOutcome::Succeeded,
-            reason: None,
         }],
     );
     assert!(app.delete_session(&"s1".into()).is_some());
@@ -320,7 +328,8 @@ fn opening_a_session_loads_history_once_and_retries_on_error() {
         out.command,
         Command::LoadHistory {
             session: id.clone(),
-            before_seq: None
+            before: None,
+            limit: HISTORY_PAGE,
         }
     );
     assert_eq!(app.sessions[&id].history, HistoryState::Loading);
@@ -331,6 +340,16 @@ fn opening_a_session_loads_history_once_and_retries_on_error() {
     app.retry_history(&id);
     let retry = single_command(&mut app);
     app.apply_result(retry.token, accepted());
+    // Accepted only means Core will answer; the page arrives as HistoryLoaded.
+    assert_eq!(app.sessions[&id].history, HistoryState::Loading);
+    feed(
+        &mut app,
+        [Event::HistoryLoaded {
+            session: id.clone(),
+            messages: vec![],
+            next_before: None,
+        }],
+    );
     assert_eq!(app.sessions[&id].history, HistoryState::Complete);
 }
 
@@ -367,10 +386,10 @@ fn adjacent_navigation_follows_sidebar_order() {
         &mut app,
         [
             Event::SessionCreated {
-                session: session("s2"),
+                session: session_at("s2", 1_000),
             },
             Event::SessionCreated {
-                session: session("s3"),
+                session: session_at("s3", 2_000),
             },
         ],
     );
@@ -525,7 +544,7 @@ fn idle_rows_show_relative_time_and_split_by_local_day() {
         feed(
             &mut app,
             [Event::SessionCreated {
-                session: session(id),
+                session: session_at(id, at),
             }],
         );
     }
@@ -554,8 +573,11 @@ fn idle_rows_show_relative_time_and_split_by_local_day() {
     );
     assert_eq!(relative_time(now - 30_000, now), "刚刚");
     assert_eq!(relative_time(now - 5 * 60_000, now), "5 分钟前");
-    // No known time (restored session) → 更早, no time text.
-    assert_eq!(DayBucket::for_time(None, now, 0), DayBucket::Older);
+    // More than a week ago → 更早.
+    assert_eq!(
+        DayBucket::for_time(now - 8 * 86_400_000, now, 0),
+        DayBucket::Older
+    );
 }
 
 #[test]
@@ -565,6 +587,7 @@ fn ui_ref_03_attention_count_change_is_announced() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     app.take_announcements();

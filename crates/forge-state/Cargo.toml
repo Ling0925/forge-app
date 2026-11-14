@@ -9,6 +9,7 @@ forge-protocol.workspace = true
 
 [dev-dependencies]
 forge-core.workspace = true
+forge-provider.workspace = true
 forge-store.workspace = true
 forge-testkit = { path = "../forge-testkit" }
 forge-tools.workspace = true

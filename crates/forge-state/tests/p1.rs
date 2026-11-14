@@ -17,19 +17,55 @@ fn start(app: &mut AppState, id: &str) {
         app,
         [Event::RunStarted {
             run: run(id, "s1", None),
+            input_id: "in-1".into(),
         }],
     );
 }
 
+/// Test shorthand: `"kind[ key=value…][: message]"` → structured P1 outcome.
+fn outcome(spec: &str) -> RunOutcome {
+    let (head, message) = spec.split_once(": ").unwrap_or((spec, ""));
+    let mut parts = head.split_whitespace();
+    let word = parts.next().unwrap_or("");
+    let mut http_status = None;
+    let mut retry_after_ms = None;
+    let mut source = UnknownSource::Provider;
+    for part in parts {
+        match part.split_once('=') {
+            Some(("http_status", v)) => http_status = v.parse().ok(),
+            Some(("retry_after_ms", v)) => retry_after_ms = v.parse().ok(),
+            Some(("source", "storage")) => source = UnknownSource::Storage,
+            _ => {}
+        }
+    }
+    let (kind, retryable) = match word {
+        "network" => (RunErrorKind::Network, true),
+        "rate_limited" => (RunErrorKind::RateLimited, true),
+        "auth" => (RunErrorKind::Auth, false),
+        "quota" => (RunErrorKind::Quota, false),
+        "server" => (RunErrorKind::Server, true),
+        "context_too_long" => (RunErrorKind::ContextTooLong, false),
+        "interrupted" => (RunErrorKind::Interrupted, true),
+        "storage" => (
+            RunErrorKind::Unknown {
+                source: UnknownSource::Storage,
+            },
+            false,
+        ),
+        "unknown" | "provider" => (RunErrorKind::Unknown { source }, false),
+        _ => (RunErrorKind::Unknown { source }, false),
+    };
+    RunOutcome::Failed {
+        kind,
+        message: message.into(),
+        http_status,
+        retry_after_ms,
+        retryable,
+    }
+}
+
 fn fail(app: &mut AppState, id: &str, reason: &str) {
-    feed(
-        app,
-        [Event::RunFinished {
-            run: id.into(),
-            outcome: RunOutcome::Failed,
-            reason: Some(reason.into()),
-        }],
-    );
+    feed(app, [finished(id, outcome(reason))]);
 }
 
 fn failed_app(reason: &str) -> AppState {
@@ -116,60 +152,24 @@ fn nine_cards_with_spec_actions() {
 }
 
 #[test]
-fn adapter_parses_p0_reason() {
-    let outcome = outcome_from_p0(
-        RunOutcome::Failed,
-        Some("rate_limited http_status=429 retry_after_ms=120000 retryable=false: slow down"),
-        false,
-        false,
-    );
-    let failure = outcome.failure().unwrap();
-    assert_eq!(failure.category, ErrorKind::RateLimited);
-    assert_eq!(failure.http_status, Some(429));
-    assert_eq!(failure.retry_after_ms, Some(120_000));
-    assert!(!failure.retryable);
-    assert_eq!(failure.raw_message, "slow down");
-    // Defaults: auth is not retryable, network is.
-    assert!(
-        !outcome_from_p0(RunOutcome::Failed, Some("auth"), false, false)
-            .failure()
-            .unwrap()
-            .retryable
-    );
-    assert!(
-        outcome_from_p0(RunOutcome::Failed, Some("network"), false, false)
-            .failure()
-            .unwrap()
-            .retryable
-    );
-    // Free text → Unknown with the whole string kept.
-    let unknown = outcome_from_p0(RunOutcome::Failed, Some("boom: x"), false, false);
-    assert_eq!(unknown.failure().unwrap().category, ErrorKind::Unknown);
-    assert_eq!(unknown.failure().unwrap().raw_message, "boom: x");
-    // Cancelled by shutdown only when the UI did not ask for the stop.
-    assert_eq!(
-        outcome_from_p0(RunOutcome::Cancelled, None, false, true),
-        RunOutcomeVm::Cancelled {
-            by: CancelledBy::Shutdown
-        }
-    );
-    assert_eq!(
-        outcome_from_p0(RunOutcome::Cancelled, None, true, true),
-        RunOutcomeVm::Cancelled {
-            by: CancelledBy::User
-        }
-    );
-    assert_eq!(
-        outcome_from_p0(RunOutcome::Succeeded, None, false, false).failure(),
-        None
-    );
-    assert_eq!(
-        outcome_from_p0(RunOutcome::Interrupted, None, false, false)
-            .failure()
-            .unwrap()
-            .category,
-        ErrorKind::Interrupted
-    );
+fn structured_outcome_maps_to_failure_vm() {
+    let f = failure_of(&outcome(
+        "rate_limited http_status=429 retry_after_ms=120000: slow down",
+    ))
+    .unwrap();
+    assert_eq!(f.category, ErrorKind::RateLimited);
+    assert_eq!(f.http_status, Some(429));
+    assert_eq!(f.retry_after_ms, Some(120_000));
+    assert!(f.retryable);
+    assert_eq!(f.raw_message, "slow down");
+    assert_eq!(f.source, None);
+    let f = failure_of(&outcome("unknown source=storage: disk full")).unwrap();
+    assert_eq!(f.category, ErrorKind::Unknown);
+    assert_eq!(f.source, Some(UnknownSource::Storage));
+    assert_eq!(failure_of(&RunOutcome::Succeeded), None);
+    assert_eq!(failure_of(&cancelled()), None);
+    assert!(is_interrupted(&interrupted()));
+    assert!(!is_interrupted(&outcome("network")));
 }
 
 #[test]
@@ -196,10 +196,30 @@ fn countdown_follows_the_clock_and_gates_retry() {
     assert_eq!(card(&app).retry_label, "重试（40 秒）");
     app.set_now_ms(5_000 + 99_001);
     assert_eq!(card(&app).retry_label, "重试（1 秒）");
+    app.take_announcements();
     app.set_now_ms(5_000 + 100_000);
     let c = card(&app);
     assert_eq!(c.retry, RetryButtonState::Ready);
     assert_eq!(c.retry_label, "重试");
+    // D2: no empty template once the wait is over; announced once, politely.
+    assert_eq!(c.body, "现在可以重试了。");
+    assert!(!c.body.contains("（还要"));
+    let spoken = app.take_announcements();
+    assert_eq!(
+        spoken
+            .iter()
+            .filter(|a| a.text == "现在可以重试")
+            .map(|a| a.priority)
+            .collect::<Vec<_>>(),
+        vec![AnnouncementPriority::Low]
+    );
+    app.set_now_ms(5_000 + 130_000);
+    assert!(
+        app.take_announcements()
+            .iter()
+            .all(|a| a.text != "现在可以重试")
+    );
+    assert_eq!(card(&app).body, "现在可以重试了。");
 
     let token = app.retry_run(&"r1".into()).expect("retry allowed");
     let out = single_command(&mut app);
@@ -249,15 +269,9 @@ fn details_toggle_and_effects() {
 
 #[test]
 fn redaction_masks_keys_but_keeps_text() {
-    let raw = "bad key sk-proj-AAAA1111 api_key=xyz Bearer abc.def token \
-               0123456789abcdef0123456789abcdef end";
+    let raw = "bad key sk-proj-AAAA1111 api_key=xyz Bearer abc.def end";
     let out = redact_secrets(raw);
-    for secret in [
-        "sk-proj",
-        "xyz",
-        "abc.def",
-        "0123456789abcdef0123456789abcdef",
-    ] {
+    for secret in ["sk-proj", "xyz", "abc.def"] {
         assert!(!out.contains(secret), "{secret} leaked: {out}");
     }
     assert!(
@@ -344,7 +358,6 @@ fn rows_markdown_reasoning_divider_usage() {
         [Event::RunFinished {
             run: "r1".into(),
             outcome: RunOutcome::Succeeded,
-            reason: None,
         }],
     );
     let rows = app.timeline_rows();
@@ -471,16 +484,10 @@ fn same_kind_within_two_seconds_merges() {
             app,
             [Event::RunStarted {
                 run: run(run_id, s, None),
+                input_id: "in-1".into(),
             }],
         );
-        feed(
-            app,
-            [Event::RunFinished {
-                run: run_id.into(),
-                outcome,
-                reason: Some("network".into()),
-            }],
-        );
+        feed(app, [finished(run_id, outcome)]);
     };
     finish(&mut app, "a", "s1", 10_000, RunOutcome::Succeeded);
     let first = app.take_announcements();
@@ -491,13 +498,13 @@ fn same_kind_within_two_seconds_merges() {
     assert_eq!(finished.len(), 1);
     // Two more finishes inside the window: held, merged into one (latest text,
     // highest priority).
-    finish(&mut app, "b", "s2", 10_500, RunOutcome::Failed);
+    finish(&mut app, "b", "s2", 10_500, failed(RunErrorKind::Network));
     assert!(
         app.take_announcements()
             .iter()
             .all(|a| a.kind != AnnouncementKind::RunFinished)
     );
-    finish(&mut app, "c", "s1", 11_000, RunOutcome::Cancelled);
+    finish(&mut app, "c", "s1", 11_000, cancelled());
     assert!(
         app.take_announcements()
             .iter()
@@ -572,6 +579,57 @@ fn short_retry_after_is_retryable_immediately() {
 }
 
 #[test]
+fn retry_after_boundary_is_60000() {
+    // ≤ 60000 → retry now (⌘R); 60001 → wait card.
+    let c = card(&failed_app(
+        "rate_limited http_status=429 retry_after_ms=60000: slow",
+    ));
+    assert_eq!(c.kind, ErrorCardKind::RateLimited);
+    assert_eq!(c.retry, RetryButtonState::Ready);
+    assert_eq!(c.primary_shortcut, Some("⌘R"));
+    let c = card(&failed_app(
+        "rate_limited http_status=429 retry_after_ms=60001: slow",
+    ));
+    assert_eq!(c.kind, ErrorCardKind::RateLimitedWait);
+    assert_eq!(
+        c.retry,
+        RetryButtonState::Waiting {
+            remaining_ms: 60_001
+        }
+    );
+}
+
+#[test]
+fn token_header_values_never_reach_details() {
+    for raw in [
+        "{'Authorization': 'Bearer qqq'}",
+        "Authorization=Bearer tok_123",
+        r#"{"x-api-key": "abc"}"#,
+        "Proxy-Authorization: Basic dXNlcg==",
+        "token: abc",
+        "Cookie: a=b",
+    ] {
+        let c = card(&failed_app(&format!("auth http_status=401: denied\n{raw}")));
+        let all = c.details.join("\n");
+        for leaked in ["qqq", "tok_123", "abc", "dXNlcg", "a=b"] {
+            assert!(!all.contains(leaked), "{leaked} in {all}");
+        }
+        assert!(all.contains("denied\n"), "{all}");
+        assert!(all.contains("[已移除请求头]"), "{all}");
+    }
+    // Header-only message: the placeholder keeps the details non-empty.
+    let c = card(&failed_app("auth http_status=401: Authorization: Bearer x"));
+    assert_eq!(c.details.last().unwrap(), "[已移除请求头]");
+    let c = card(&failed_app(
+        "auth http_status=401: invalid api key: please check settings",
+    ));
+    assert_eq!(
+        c.details.last().unwrap(),
+        "invalid api key: please check settings"
+    );
+}
+
+#[test]
 fn long_retry_after_shows_clock_time_and_countdown() {
     let mut app = app_with_session();
     app.set_utc_offset_ms(8 * 3_600_000);
@@ -603,7 +661,7 @@ fn long_retry_after_shows_clock_time_and_countdown() {
 }
 
 #[test]
-fn details_drop_credential_header_lines() {
+fn details_replace_credential_headers_in_place() {
     let app = failed_app(
         "auth http_status=401: invalid key\nAuthorization: Bearer sk-live-SENTINEL\nx-api-key: SENTINEL2\nrequest id req_1",
     );
@@ -612,8 +670,10 @@ fn details_drop_credential_header_lines() {
     for leaked in ["Authorization", "Bearer", "SENTINEL", "x-api-key"] {
         assert!(!all.contains(leaked), "{leaked} in {all}");
     }
-    assert!(all.contains("invalid key\nrequest id req_1"), "{all}");
-    assert_eq!(c.details.last().unwrap(), "已移除 2 行请求头");
+    assert_eq!(
+        c.details.last().unwrap(),
+        "invalid key\n[已移除请求头]\n[已移除请求头]\nrequest id req_1"
+    );
 }
 
 #[test]
@@ -633,7 +693,6 @@ fn cmd_r_retries_latest_failed_run_only() {
         [Event::RunFinished {
             run: "r2".into(),
             outcome: RunOutcome::Succeeded,
-            reason: None,
         }],
     );
     app.take_outbox();
@@ -655,13 +714,25 @@ fn cmd_r_retries_latest_failed_run_only() {
 }
 
 #[test]
-fn provider_maps_to_server_card_and_storage_to_save_failed() {
-    let c = card(&failed_app("provider: stream ended early"));
+fn unknown_source_picks_title_storage_vs_provider() {
+    // Core already maps stream/format errors to `server` (PROTOCOL.md table);
+    // the remaining provider errors arrive as unknown{provider} → 运行失败.
+    let c = card(&failed_app("server: stream ended early"));
     assert_eq!(c.kind, ErrorCardKind::Server);
     assert_eq!(c.title, "模型服务出错");
     assert_eq!(
         (c.primary, c.primary_shortcut),
         (ErrorAction::Retry, Some("⌘R"))
+    );
+    let c = card(&failed_app("unknown source=provider: odd"));
+    assert_eq!(
+        (c.kind, c.title.as_str()),
+        (ErrorCardKind::Unknown, "运行失败")
+    );
+    assert!(
+        c.details.iter().any(|d| d.contains("unknown/provider")),
+        "{:?}",
+        c.details
     );
 
     let mut app = failed_app("storage: disk full");

@@ -56,8 +56,13 @@ pub(crate) enum Pending {
     },
     LoadHistory {
         session: SessionId,
+        before: Option<u64>,
     },
+    Snapshot,
     TestKey {
+        provider: ProviderId,
+    },
+    SetKey {
         provider: ProviderId,
     },
     UpdateSettings {
@@ -108,13 +113,17 @@ pub enum BootState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResyncState {
     Idle,
-    /// A `seq` gap was seen; the host should re-fetch a snapshot (§5.2). Old
-    /// state is kept so the UI does not flash.
+    /// A `seq` gap was seen; one `GetSnapshot` is in flight (PROTOCOL.md).
+    /// Old state is kept so the UI does not flash.
     Resyncing {
         expected: u64,
         got: u64,
     },
 }
+
+/// `LoadHistory.limit` per page (PROTOCOL.md: newest `limit` messages before
+/// the cursor, returned oldest → newest).
+pub const HISTORY_PAGE: u32 = 50;
 
 /// Crash-recovery banner input (§6.12). No protocol event carries this yet;
 /// the host fills it from the core boot report.
@@ -231,6 +240,10 @@ pub struct AppState {
     pub toasts: Vec<ToastVm>,
     pub last_seq: u64,
     pub resync: ResyncState,
+    /// A `GetSnapshot` is in flight (boot or gap); a second one is not sent.
+    pub(crate) snapshot_pending: bool,
+    /// At least one `Snapshot` was applied.
+    pub synced: bool,
     pub(crate) now_ms: u64,
     /// Local time zone offset from UTC (host supplies it; wall-clock texts).
     pub(crate) utc_offset_ms: i64,
@@ -240,7 +253,9 @@ pub struct AppState {
     /// When each kind was last handed to the screen reader (merge window).
     pub(crate) announced_at: HashMap<AnnouncementKind, u64>,
     pub(crate) outbox: Vec<Outgoing>,
-    pub(crate) pending: HashMap<CommandToken, (Pending, Command)>,
+    /// In-flight commands. The command copy is kept for R10 replay, except for
+    /// `SetProviderKey`, whose key must not linger in UI memory.
+    pub(crate) pending: HashMap<CommandToken, (Pending, Option<Command>)>,
     next_token: u64,
     pub(crate) ids: Box<dyn IdSource>,
     /// run → session, for events that only carry a run id.
@@ -277,6 +292,8 @@ impl AppState {
             toasts: Vec::new(),
             last_seq: 0,
             resync: ResyncState::Idle,
+            snapshot_pending: false,
+            synced: false,
             now_ms: 0,
             announcements: Vec::new(),
             utc_offset_ms: 0,
@@ -305,7 +322,22 @@ impl AppState {
     }
 
     pub fn set_now_ms(&mut self, now_ms: u64) {
+        let before = self.now_ms;
         self.now_ms = now_ms;
+        // D2: a Retry-After wait that just ran out is announced once (polite).
+        let ready = self.sessions.values().any(|vm| {
+            vm.timeline.iter().any(|item| {
+                matches!(item, TimelineItem::Error(e)
+                    if e.retry_at_ms.is_some_and(|at| before < at && at <= now_ms))
+            })
+        });
+        if ready {
+            self.announce(
+                AnnouncementKind::Other,
+                AnnouncementPriority::Low,
+                crate::i18n::t("announce.retry_ready").to_owned(),
+            );
+        }
     }
 
     pub fn now_ms(&self) -> u64 {
@@ -351,16 +383,27 @@ impl AppState {
         let (_, command) = self.pending.get(&token)?;
         Some(Outgoing {
             token,
-            command: command.clone(),
+            command: command.clone()?,
         })
     }
 
     pub(crate) fn push(&mut self, pending: Pending, command: Command) -> CommandToken {
+        let keep = !matches!(command, Command::SetProviderKey { .. });
         self.next_token += 1;
         let token = CommandToken(self.next_token);
-        self.pending.insert(token, (pending, command.clone()));
+        self.pending
+            .insert(token, (pending, keep.then(|| command.clone())));
         self.outbox.push(Outgoing { token, command });
         token
+    }
+
+    /// Boot: ask Core for the state to start from (PROTOCOL.md `GetSnapshot`).
+    pub fn request_snapshot(&mut self) -> Option<CommandToken> {
+        if self.snapshot_pending {
+            return None;
+        }
+        self.snapshot_pending = true;
+        Some(self.push(Pending::Snapshot, Command::GetSnapshot))
     }
 
     pub(crate) fn announce(
@@ -422,28 +465,30 @@ impl AppState {
     // ------------------------------------------------------------------ events
 
     /// Applies one event. Duplicate or stale `seq`s are ignored (idempotent
-    /// replay); a gap flags `resync` but the event is still applied.
+    /// replay). A gap sends exactly one `GetSnapshot` (the event itself is
+    /// still applied; the snapshot supersedes it). A requested `Snapshot`
+    /// resets the cursor to its `last_seq`; afterwards only `seq > last_seq`
+    /// is applied.
     pub fn apply(&mut self, envelope: EventEnvelope) {
-        if self.last_seq != 0 && envelope.seq <= self.last_seq {
-            return;
-        }
-        if self.last_seq != 0 && envelope.seq != self.last_seq + 1 {
-            self.resync = ResyncState::Resyncing {
-                expected: self.last_seq + 1,
-                got: envelope.seq,
-            };
-        }
-        self.last_seq = envelope.seq;
-        self.apply_event(envelope.event, envelope.seq);
-        // Wall-clock stamp for sessions this event touched (relative time and
-        // day buckets in the sidebar). TODO(core-p1): use `Session.updated_at`
-        // once the protocol carries it, so restored sessions get a time too.
-        let now = self.now_ms;
-        for vm in self.sessions.values_mut() {
-            if vm.last_activity == envelope.seq {
-                vm.last_activity_ms = Some(now);
+        if let Event::Snapshot { .. } = &envelope.event {
+            let requested = self.snapshot_pending;
+            if !requested && self.last_seq != 0 && envelope.seq <= self.last_seq {
+                return;
             }
+        } else {
+            if self.last_seq != 0 && envelope.seq <= self.last_seq {
+                return;
+            }
+            if self.last_seq != 0 && envelope.seq != self.last_seq + 1 && !self.snapshot_pending {
+                self.resync = ResyncState::Resyncing {
+                    expected: self.last_seq + 1,
+                    got: envelope.seq,
+                };
+                self.request_snapshot();
+            }
+            self.last_seq = envelope.seq;
         }
+        self.apply_event(envelope.event, envelope.seq);
         self.announce_attention_count();
     }
 
@@ -465,19 +510,34 @@ impl AppState {
         );
     }
 
-    /// Host finished re-fetching after a seq gap.
-    pub fn resync_done(&mut self) {
-        self.resync = ResyncState::Idle;
-    }
-
-    fn touch(&mut self, session: &SessionId, seq: u64) {
-        if let Some(vm) = self.sessions.get_mut(session) {
-            vm.last_activity = seq;
-        }
-    }
-
     fn apply_event(&mut self, event: Event, seq: u64) {
+        let _ = seq;
         match event {
+            Event::Snapshot {
+                sessions,
+                workspaces,
+                settings,
+                providers,
+                active_runs,
+                last_seq,
+            } => self.apply_snapshot(
+                sessions,
+                workspaces,
+                settings,
+                providers,
+                active_runs,
+                last_seq,
+            ),
+            Event::HistoryLoaded {
+                session,
+                messages,
+                next_before,
+            } => self.on_history_loaded(session, messages, next_before),
+            Event::SettingsUpdated { settings } => self.load_settings(settings),
+            Event::ProviderKeyConfigured {
+                provider,
+                configured,
+            } => self.on_key_configured(provider, configured),
             Event::WorkspaceAdded { workspace } => {
                 if self.active_workspace.is_none() {
                     self.active_workspace = Some(workspace.id.clone());
@@ -501,13 +561,12 @@ impl AppState {
                 match self.sessions.get_mut(&id) {
                     Some(vm) => vm.session = session,
                     None => {
-                        let mut vm = SessionVm::new(session, seq);
+                        let mut vm = SessionVm::new(session);
                         // A session we just created is empty and fully loaded.
                         vm.history = HistoryState::Complete;
                         self.sessions.insert(id.clone(), vm);
                     }
                 }
-                self.touch(&id, seq);
                 if self.pending_create > 0 {
                     self.pending_create -= 1;
                     self.selected_session = Some(id);
@@ -518,8 +577,7 @@ impl AppState {
                 match self.sessions.get_mut(&id) {
                     Some(vm) => vm.session = session,
                     None => {
-                        self.sessions
-                            .insert(id.clone(), SessionVm::new(session, seq));
+                        self.sessions.insert(id.clone(), SessionVm::new(session));
                     }
                 }
             }
@@ -541,7 +599,7 @@ impl AppState {
                 self.approvals.retain(|_, (s, _)| s != &session);
             }
             Event::QueueItemAdded { item } | Event::QueueItemUpdated { item } => {
-                self.on_queue_item(item, seq)
+                self.on_queue_item(item)
             }
             Event::QueueItemRemoved { session, item } => {
                 if let Some(vm) = self.sessions.get_mut(&session) {
@@ -570,13 +628,9 @@ impl AppState {
                     vm.queue_paused = None;
                 }
             }
-            Event::RunStarted { run } => self.on_run_started(run, seq),
+            Event::RunStarted { run, input_id } => self.on_run_started(run, input_id),
             Event::RunStateChanged { run, state } => self.on_run_state(run, state),
-            Event::RunFinished {
-                run,
-                outcome,
-                reason,
-            } => self.finish_run(&run, outcome, reason, seq),
+            Event::RunFinished { run, outcome } => self.finish_run(&run, outcome),
             Event::SteerApplied { .. } => {
                 // Steer bubbles land in P3 (§11 phase mapping).
             }
@@ -657,7 +711,7 @@ impl AppState {
             Event::ToolCallStateChanged { .. } | Event::ToolOutputChunk { .. } => {
                 // Tool step rows are P2 (§6.5).
             }
-            Event::ApprovalRequested { approval } => self.on_approval_requested(approval, seq),
+            Event::ApprovalRequested { approval } => self.on_approval_requested(approval),
             Event::ApprovalResolved { approval, .. } => {
                 if let Some((session, _)) = self.approvals.remove(&approval)
                     && let Some(vm) = self.sessions.get_mut(&session)
@@ -672,14 +726,16 @@ impl AppState {
                     }
                 }
             }
+            // Not emitted in P1; the ring stays hidden until it arrives.
             Event::ContextUsage {
                 run,
                 used_tokens,
-                available_tokens,
+                context_remaining_estimate,
             } => {
                 if let Some((vm, _)) = self.run_mut(&run) {
                     vm.context.used_tokens = used_tokens;
-                    vm.context.limit_tokens = available_tokens;
+                    vm.context.limit_tokens =
+                        used_tokens.saturating_add(context_remaining_estimate);
                 }
             }
             Event::ContextCompacted {
@@ -718,7 +774,7 @@ impl AppState {
         }
     }
 
-    fn on_queue_item(&mut self, item: QueueItem, seq: u64) {
+    fn on_queue_item(&mut self, item: QueueItem) {
         let Some(vm) = self.sessions.get_mut(&item.session_id) else {
             return;
         };
@@ -726,7 +782,6 @@ impl AppState {
             Self::insert_user_message(vm, &item.input_id, &item.content.text, Some(&item.id));
         }
         vm.queue.insert(item.id.clone(), item);
-        vm.last_activity = seq;
     }
 
     /// Inserts the user message once per input id. `queue` is the queue item it
@@ -753,64 +808,47 @@ impl AppState {
         };
         vm.timeline.push(TimelineItem::User(UserMessageVm {
             input_id: input.clone(),
+            ordinal: None,
             text: text.to_owned(),
             origin,
         }));
     }
 
-    fn on_run_started(&mut self, run: Run, seq: u64) {
+    fn on_run_started(&mut self, run: Run, input_id: InputId) {
         let session = run.session_id.clone();
         self.run_sessions.insert(run.id.clone(), session.clone());
-        let now = self.now_ms;
         let Some(vm) = self.sessions.get_mut(&session) else {
             return;
         };
-        // User message: from the queue item if known, otherwise the oldest
-        // accepted `Send` of this session (P1 core may not emit queue events).
+        // User message: from the queue item if there is one (P3), otherwise
+        // the accepted / in-flight `Send` with this `input_id` (idle send, no
+        // QueueItem in P1). `RunStarted` can arrive before `Accepted`.
         let from_queue = run
             .queue_item_id
             .as_ref()
             .and_then(|id| vm.queue.get(id))
-            .map(|item| {
-                (
-                    item.input_id.clone(),
-                    item.content.text.clone(),
-                    item.id.clone(),
-                )
-            });
+            .map(|item| (item.content.text.clone(), item.id.clone()));
         match from_queue {
-            Some((input, text, item)) => Self::insert_user_message(vm, &input, &text, Some(&item)),
+            Some((text, item)) => Self::insert_user_message(vm, &input_id, &text, Some(&item)),
             None => {
-                if let Some((input, text, _)) = vm.accepted_inputs.front().cloned() {
-                    Self::insert_user_message(vm, &input, &text, None);
-                } else if let Some(InFlight::Send {
-                    input_id,
-                    text,
-                    queued: false,
-                }) = vm.composer.in_flight.clone()
-                {
-                    // `RunStarted` can arrive before the `Accepted` reply.
+                let accepted = vm
+                    .accepted_inputs
+                    .iter()
+                    .find(|(id, _, _)| id == &input_id)
+                    .map(|(_, text, _)| text.clone());
+                let in_flight = match &vm.composer.in_flight {
+                    Some(InFlight::Send {
+                        input_id: id, text, ..
+                    }) if id == &input_id => Some(text.clone()),
+                    _ => None,
+                };
+                if let Some(text) = accepted.or(in_flight) {
                     Self::insert_user_message(vm, &input_id, &text, None);
                 }
             }
         }
-        vm.runs.insert(
-            run.id.clone(),
-            RunVm {
-                id: run.id.clone(),
-                session_id: session.clone(),
-                queue_item_id: run.queue_item_id,
-                phase: RunPhase::Starting,
-                usage: run.usage,
-                reason: None,
-                started_at_ms: now,
-                finished_at_ms: None,
-                cancel_requested: false,
-                outcome: None,
-            },
-        );
+        vm.runs.insert(run.id.clone(), RunVm::from_run(&run));
         vm.active_run = Some(run.id);
-        vm.last_activity = seq;
         self.announce(
             AnnouncementKind::RunStarted,
             AnnouncementPriority::Low,
@@ -819,16 +857,12 @@ impl AppState {
     }
 
     fn on_run_state(&mut self, run: RunId, state: RunState) {
-        let outcome = match state {
-            RunState::Succeeded => Some(RunOutcome::Succeeded),
-            RunState::Failed => Some(RunOutcome::Failed),
-            RunState::Cancelled => Some(RunOutcome::Cancelled),
-            RunState::Interrupted => Some(RunOutcome::Interrupted),
-            _ => None,
-        };
-        if let Some(outcome) = outcome {
-            let seq = self.last_seq;
-            self.finish_run(&run, outcome, None, seq);
+        // Terminal states carry no outcome here; `RunFinished{outcome}` ends
+        // the run.
+        if matches!(
+            state,
+            RunState::Succeeded | RunState::Failed | RunState::Cancelled | RunState::Interrupted
+        ) {
             return;
         }
         let Some((vm, run)) = self.run_mut(&run) else {
@@ -869,9 +903,8 @@ impl AppState {
 
     /// Terminal state is written once (R4 "终态只写一次"); later duplicates are
     /// ignored.
-    fn finish_run(&mut self, run: &RunId, outcome: RunOutcome, reason: Option<String>, seq: u64) {
+    fn finish_run(&mut self, run: &RunId, outcome: RunOutcome) {
         let now = self.now_ms;
-        let shutting_down = matches!(self.quit, crate::QuitState::ShuttingDown { .. });
         let Some((vm, run)) = self.run_mut(run) else {
             return;
         };
@@ -881,45 +914,37 @@ impl AppState {
         if r.phase.is_terminal() {
             return;
         }
-        let outcome_vm = crate::outcome::outcome_from_p0(
-            outcome.clone(),
-            reason.as_deref(),
-            r.cancel_requested,
-            shutting_down,
-        );
         r.phase = RunPhase::Finished(outcome.clone());
-        r.finished_at_ms = Some(now);
-        r.outcome = Some(outcome_vm.clone());
-        if reason.is_some() {
-            r.reason = reason.clone();
-        }
-        let elapsed_secs = now.saturating_sub(r.started_at_ms) / 1000;
+        let finished_at = *r.finished_at_ms.get_or_insert(now);
+        let elapsed_secs = finished_at.saturating_sub(r.started_at_ms) / 1000;
         if vm.active_run.as_ref() == Some(&run) {
             vm.active_run = None;
         }
+        let cancelled = matches!(outcome, RunOutcome::Cancelled { .. });
         if let Some(message) = vm.assistant_mut(&run) {
             message.streaming = false;
-            message.stopped = outcome == RunOutcome::Cancelled;
+            message.stopped = cancelled;
             if let Some(start) = message.reasoning_started_ms
                 && message.reasoning_ms.is_none()
             {
                 message.reasoning_ms = Some(now.saturating_sub(start));
             }
         }
-        let failure = outcome_vm.failure();
+        let failure = crate::outcome::failure_of(&outcome);
         let error_kind = failure.as_ref().map(|f| f.category);
         let failure_title = failure.as_ref().map(crate::outcome::card_title);
+        vm.last_error_source = failure.as_ref().and_then(|f| f.source.clone());
         // §6.7: the error card sits after the run's content, before the divider.
         if let Some(failure) = failure {
             vm.timeline.push(TimelineItem::Error(ErrorVm {
                 run_id: run.clone(),
                 kind: failure.category,
-                detail: reason,
-                // Only a long Retry-After (> 60 s, R7a) gates the retry button.
+                // Only a long Retry-After (> 60 s, R7a) gates the retry button;
+                // it counts from when the run ended.
                 retry_at_ms: failure
                     .retry_after_ms
                     .filter(|ms| *ms > crate::outcome::LONG_RETRY_AFTER_MS)
-                    .map(|ms| now + ms),
+                    .map(|ms| finished_at + ms),
                 failure,
             }));
         }
@@ -929,23 +954,22 @@ impl AppState {
         });
         vm.last_error = error_kind;
         vm.last_outcome = Some(outcome.clone());
-        vm.last_activity = seq.max(vm.last_activity);
         // R2 / R2a: a non-succeeded run pauses the queue when items wait. Core
         // confirms with `QueuePaused`; set it now so the sidebar does not lag.
         if vm.queue_paused.is_none() && vm.pending_queue_len() > 0 {
-            vm.queue_paused = match outcome {
-                RunOutcome::Failed => Some(QueuePauseReason::Failed),
-                RunOutcome::Cancelled => Some(QueuePauseReason::Cancelled),
-                RunOutcome::Interrupted => Some(QueuePauseReason::Interrupted),
+            vm.queue_paused = match &outcome {
                 RunOutcome::Succeeded => None,
+                RunOutcome::Cancelled { .. } => Some(QueuePauseReason::Cancelled),
+                o if crate::outcome::is_interrupted(o) => Some(QueuePauseReason::Interrupted),
+                RunOutcome::Failed { .. } => Some(QueuePauseReason::Failed),
             };
         }
-        let text = match (outcome, error_kind) {
+        let text = match (&outcome, error_kind) {
             (RunOutcome::Succeeded, _) => tf(
                 "announce.run.succeeded",
                 &[("duration", &crate::i18n::format_elapsed(elapsed_secs))],
             ),
-            (RunOutcome::Cancelled, _) => t("announce.run.cancelled").into(),
+            (RunOutcome::Cancelled { .. }, _) => t("announce.run.cancelled").into(),
             (_, _) => tf(
                 "announce.run.failed",
                 &[(
@@ -962,7 +986,7 @@ impl AppState {
         self.announce(AnnouncementKind::RunFinished, priority, text);
     }
 
-    fn on_approval_requested(&mut self, approval: Approval, seq: u64) {
+    fn on_approval_requested(&mut self, approval: Approval) {
         let Some((run, tool)) = self.tool_calls.get(&approval.tool_call_id).cloned() else {
             return;
         };
@@ -971,7 +995,6 @@ impl AppState {
         };
         if let Some(vm) = self.sessions.get_mut(&session) {
             vm.pending_approvals.insert(approval.id.clone());
-            vm.last_activity = seq;
             if let Some(r) = vm.runs.get_mut(&run)
                 && !r.phase.is_terminal()
             {
@@ -1065,15 +1088,27 @@ impl AppState {
                     self.toast_rejected(&code, &message);
                 }
             }
-            Pending::LoadHistory { session } => {
-                if let Some(vm) = self.sessions.get_mut(&session) {
-                    vm.history = if rejected.is_some() {
-                        HistoryState::Error
-                    } else {
-                        // Gap: no event carries loaded history yet; treat an
-                        // accepted request as "everything we have is shown".
-                        HistoryState::Complete
+            Pending::LoadHistory { session, before } => {
+                // Accepted: the page arrives as `HistoryLoaded`.
+                if rejected.is_some()
+                    && let Some(vm) = self.sessions.get_mut(&session)
+                {
+                    vm.history = match before {
+                        // An older page failed: keep what is shown, allow retry.
+                        Some(_) => HistoryState::HasMore,
+                        None => HistoryState::Error,
                     };
+                }
+            }
+            Pending::Snapshot => {
+                if let Some((code, message)) = rejected {
+                    self.snapshot_pending = false;
+                    self.toast_rejected(&code, &message);
+                }
+            }
+            Pending::SetKey { provider } => {
+                if let Some((code, message)) = rejected {
+                    self.on_key_set_rejected(provider, code, message);
                 }
             }
             Pending::TestKey { provider } => {
@@ -1083,6 +1118,7 @@ impl AppState {
             }
             Pending::UpdateSettings { previous } => {
                 if let Some((code, message)) = rejected {
+                    self.ui.apply_map(&previous.ui_prefs);
                     self.settings.settings = Some(previous);
                     self.settings.error = Some(not_sent(&code, &message));
                 }
@@ -1171,17 +1207,37 @@ impl AppState {
             if let Some(vm) = self.sessions.get_mut(id) {
                 vm.history = HistoryState::Loading;
             }
-            self.push(
-                Pending::LoadHistory {
-                    session: id.clone(),
-                },
-                Command::LoadHistory {
-                    session: id.clone(),
-                    before_seq: None,
-                },
-            );
+            self.push_load_history(id, None);
         }
         true
+    }
+
+    fn push_load_history(&mut self, id: &SessionId, before: Option<u64>) -> CommandToken {
+        self.push(
+            Pending::LoadHistory {
+                session: id.clone(),
+                before,
+            },
+            Command::LoadHistory {
+                session: id.clone(),
+                before,
+                limit: HISTORY_PAGE,
+            },
+        )
+    }
+
+    /// Scrolled to the top of the timeline: fetch the next older page
+    /// (`LoadHistory{before: next_before}`). One page in flight at a time;
+    /// nothing once the oldest message is shown.
+    pub fn load_older(&mut self) -> Option<CommandToken> {
+        let vm = self.selected_mut()?;
+        if vm.history != HistoryState::HasMore {
+            return None;
+        }
+        let before = vm.history_before?;
+        vm.history = HistoryState::LoadingOlder;
+        let id = vm.session.id.clone();
+        Some(self.push_load_history(&id, Some(before)))
     }
 
     /// Retry after `HistoryState::Error` (§6.3 "重试").

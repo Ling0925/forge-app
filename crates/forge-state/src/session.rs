@@ -2,7 +2,7 @@
 
 use forge_protocol::{
     InputId, ModelSelection, NoticeLevel, PermissionMode, QueueItem, QueueItemId, QueueItemState,
-    QueuePauseReason, RunId, RunOutcome, Session, SessionId, SteerId, Usage,
+    QueuePauseReason, RunId, RunOutcome, Session, SessionId, SteerId, UnknownSource, Usage,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -16,6 +16,8 @@ pub enum MessageOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserMessageVm {
     pub input_id: InputId,
+    /// `Message.ordinal` once known (history page); `None` for live rows.
+    pub ordinal: Option<u64>,
     pub text: String,
     pub origin: MessageOrigin,
 }
@@ -23,6 +25,8 @@ pub struct UserMessageVm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantMessageVm {
     pub run_id: RunId,
+    /// `Message.ordinal` once known (history page); `None` while streaming.
+    pub ordinal: Option<u64>,
     pub text: String,
     pub reasoning: String,
     pub streaming: bool,
@@ -43,31 +47,13 @@ pub enum ErrorKind {
     Quota,
     Server,
     ContextTooLong,
-    Provider,
-    Storage,
     Interrupted,
+    /// `unknown{source}`; the source lives next to it (`FailureVm.source`,
+    /// `SessionVm.last_error_source`).
     Unknown,
 }
 
 impl ErrorKind {
-    /// Best-effort mapping from `RunFinished.reason`. The protocol carries a free
-    /// string today (see protocol gap notes), so only exact snake_case kind names
-    /// are recognised.
-    pub fn from_reason(reason: Option<&str>) -> Self {
-        match reason.map(|r| r.trim()) {
-            Some("network") => Self::Network,
-            Some("rate_limited") => Self::RateLimited,
-            Some("auth") => Self::Auth,
-            Some("quota") => Self::Quota,
-            Some("server") => Self::Server,
-            Some("context_too_long") | Some("context") => Self::ContextTooLong,
-            Some("provider") => Self::Provider,
-            Some("storage") => Self::Storage,
-            Some("interrupted") => Self::Interrupted,
-            _ => Self::Unknown,
-        }
-    }
-
     /// Short label key for the sidebar second line ("失败 · 认证错误").
     pub fn label_key(self) -> &'static str {
         match self {
@@ -77,8 +63,6 @@ impl ErrorKind {
             Self::Quota => "error_kind.quota",
             Self::Server => "error_kind.server",
             Self::ContextTooLong => "error_kind.context",
-            Self::Provider => "error_kind.provider",
-            Self::Storage => "error_kind.storage",
             Self::Interrupted => "error_kind.interrupted",
             Self::Unknown => "error_kind.unknown",
         }
@@ -94,8 +78,17 @@ impl ErrorKind {
             Self::Server => "error.server.title",
             Self::ContextTooLong => "error.context.title",
             Self::Interrupted => "error.interrupted.title",
-            Self::Provider | Self::Storage | Self::Unknown => "error.unknown.title",
+            Self::Unknown => "error.unknown.title",
         }
+    }
+}
+
+/// Sidebar second-line label for a failure ("失败 · 存储错误").
+pub fn error_label_key(kind: ErrorKind, source: Option<&UnknownSource>) -> &'static str {
+    match (kind, source) {
+        (ErrorKind::Unknown, Some(UnknownSource::Storage)) => "error_kind.storage",
+        (ErrorKind::Unknown, Some(UnknownSource::Provider)) => "error_kind.provider",
+        _ => kind.label_key(),
     }
 }
 
@@ -103,10 +96,10 @@ impl ErrorKind {
 pub struct ErrorVm {
     pub run_id: RunId,
     pub kind: ErrorKind,
-    /// Raw P0 reason string (unredacted; render only via `ErrorCardVm`).
-    pub detail: Option<String>,
+    /// Card input from `RunOutcome::Failed` (raw message unredacted; render
+    /// only via `ErrorCardVm`).
     pub failure: crate::outcome::FailureVm,
-    /// UI clock (ms) before which retry stays disabled (Retry-After, R7a).
+    /// Wall clock (UTC ms) before which retry stays disabled (Retry-After > 60 s, R7a).
     pub retry_at_ms: Option<u64>,
 }
 
@@ -126,12 +119,17 @@ pub enum TimelineItem {
     Notice(NoticeVm),
 }
 
-/// `TimelineVm.history` (§6.3).
+/// `TimelineVm.history` (§6.3). Paging follows `LoadHistory{before}` /
+/// `HistoryLoaded{next_before}` (PROTOCOL.md): `HasMore` keeps the cursor
+/// (`SessionVm.history_before`), `Complete` means the oldest message is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryState {
     NotLoaded,
+    /// First page (newest messages) in flight.
     Loading,
     HasMore,
+    /// An older page is in flight; the loaded rows stay visible.
+    LoadingOlder,
     Complete,
     Error,
 }
@@ -151,11 +149,15 @@ pub enum RunPhase {
     },
     Cancelling,
     Finished(RunOutcome),
+    /// The run ended while events were missed (seq gap): the snapshot no
+    /// longer lists it as active, but no `RunFinished` was seen. Nothing is
+    /// invented: no divider, no error card.
+    EndedUnseen,
 }
 
 impl RunPhase {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Finished(_))
+        matches!(self, Self::Finished(_) | Self::EndedUnseen)
     }
 }
 
@@ -166,15 +168,38 @@ pub struct RunVm {
     pub queue_item_id: Option<QueueItemId>,
     pub phase: RunPhase,
     pub usage: Usage,
-    pub reason: Option<String>,
-    /// UI-local time (ms) when `RunStarted` was applied; the protocol `Run`
-    /// carries no timestamp.
+    /// `Run.started_at` (Core clock, UTC ms).
     pub started_at_ms: u64,
+    /// `Run.finished_at` when known, else the wall clock when `RunFinished`
+    /// arrived (the event carries no timestamp).
     pub finished_at_ms: Option<u64>,
     /// `CancelRun` already sent for this run; ⌘. must not send it again (UI-CP-04).
     pub cancel_requested: bool,
-    /// Structured outcome once finished (P0 adapter today, see `outcome.rs`).
-    pub outcome: Option<crate::outcome::RunOutcomeVm>,
+}
+
+impl RunVm {
+    pub fn from_run(run: &forge_protocol::Run) -> Self {
+        Self {
+            id: run.id.clone(),
+            session_id: run.session_id.clone(),
+            queue_item_id: run.queue_item_id.clone(),
+            phase: match &run.outcome {
+                Some(outcome) => RunPhase::Finished(outcome.clone()),
+                None => RunPhase::Starting,
+            },
+            usage: run.usage.clone(),
+            started_at_ms: run.started_at,
+            finished_at_ms: run.finished_at,
+            cancel_requested: false,
+        }
+    }
+
+    pub fn outcome(&self) -> Option<&RunOutcome> {
+        match &self.phase {
+            RunPhase::Finished(outcome) => Some(outcome),
+            _ => None,
+        }
+    }
 }
 
 /// Composer in-flight request (§6.9 "发送中").
@@ -235,12 +260,11 @@ pub struct SessionVm {
     pub pending_approvals: BTreeSet<forge_protocol::ApprovalId>,
     pub last_outcome: Option<RunOutcome>,
     pub last_error: Option<ErrorKind>,
-    /// Monotonic activity stamp (event seq) used to order the sidebar; the
-    /// protocol `Session` has no `updated_at` yet.
-    pub last_activity: u64,
-    /// Wall-clock time (UTC ms) of the last event seen for this session, if
-    /// any arrived since launch.
-    pub last_activity_ms: Option<u64>,
+    pub last_error_source: Option<UnknownSource>,
+    /// `HistoryLoaded.next_before` of the oldest page loaded (`HasMore`).
+    pub history_before: Option<u64>,
+    /// Smallest `Message.ordinal` shown; older pages are prepended before it.
+    pub oldest_ordinal: Option<u64>,
     /// UI-only disclosure state: reasoning (`run id`) and error details.
     pub expanded_reasoning: BTreeSet<RunId>,
     pub expanded_details: BTreeSet<RunId>,
@@ -249,7 +273,7 @@ pub struct SessionVm {
 }
 
 impl SessionVm {
-    pub fn new(session: Session, activity: u64) -> Self {
+    pub fn new(session: Session) -> Self {
         Self {
             session,
             timeline: Vec::new(),
@@ -263,8 +287,9 @@ impl SessionVm {
             pending_approvals: BTreeSet::new(),
             last_outcome: None,
             last_error: None,
-            last_activity: activity,
-            last_activity_ms: None,
+            last_error_source: None,
+            history_before: None,
+            oldest_ordinal: None,
             expanded_reasoning: BTreeSet::new(),
             expanded_details: BTreeSet::new(),
             accepted_inputs: VecDeque::new(),
@@ -281,6 +306,11 @@ impl SessionVm {
 
     pub fn model(&self) -> &ModelSelection {
         &self.session.model
+    }
+
+    /// `Session.updated_at` (UTC ms): sidebar order, relative time, day bucket.
+    pub fn updated_at(&self) -> u64 {
+        self.session.updated_at
     }
 
     pub fn permission_mode(&self) -> &PermissionMode {
@@ -330,6 +360,7 @@ impl SessionVm {
             self.timeline
                 .push(TimelineItem::Assistant(AssistantMessageVm {
                     run_id: run.clone(),
+                    ordinal: None,
                     text: String::new(),
                     reasoning: String::new(),
                     streaming: true,

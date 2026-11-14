@@ -4,18 +4,36 @@ use forge_protocol::*;
 use forge_state::ids::SequentialIds;
 use forge_state::*;
 
+/// App with settings and a configured OpenAI key (`ProviderKeyConfigured`).
 pub fn app() -> AppState {
     let mut app = AppState::new(Box::new(SequentialIds::default()));
     app.load_settings(settings(true));
+    set_key(&mut app, true);
     app
 }
 
-pub fn settings(with_key: bool) -> Settings {
+/// `ProviderKeyConfigured{openai, configured}` as the next event.
+pub fn set_key(app: &mut AppState, configured: bool) {
+    feed(
+        app,
+        [Event::ProviderKeyConfigured {
+            provider: "openai".into(),
+            configured,
+        }],
+    );
+}
+
+/// Settings fixture. Whether a key exists is not part of `Settings` any more
+/// (P1: `key_configured` comes from the snapshot / `ProviderKeyConfigured`);
+/// the flag is kept so call sites read the same.
+pub fn settings(_with_key: bool) -> Settings {
     Settings {
+        ui_prefs: Default::default(),
         providers: vec![ProviderSettings {
             id: "openai".into(),
             endpoint: None,
-            keychain_reference: with_key.then(|| "forge-app.openai".to_owned()),
+            keychain_reference: None,
+            max_output_tokens: None,
         }],
         model: ModelSelection {
             provider: "openai".into(),
@@ -26,7 +44,14 @@ pub fn settings(with_key: bool) -> Settings {
 }
 
 pub fn session(id: &str) -> Session {
+    session_at(id, 0)
+}
+
+/// Session whose `updated_at` (= `created_at`) is `at_ms` (UTC ms).
+pub fn session_at(id: &str, at_ms: u64) -> Session {
     Session {
+        created_at: at_ms,
+        updated_at: at_ms,
         id: id.into(),
         workspace_id: "ws".into(),
         title: format!("会话 {id}"),
@@ -47,7 +72,9 @@ pub fn run(id: &str, session: &str, item: Option<&str>) -> Run {
         session_id: session.into(),
         queue_item_id: item.map(Into::into),
         state: RunState::Running,
-        terminal_reason: None,
+        outcome: None,
+        started_at: 0,
+        finished_at: None,
         usage: Usage {
             input_tokens: 0,
             output_tokens: 0,
@@ -55,6 +82,64 @@ pub fn run(id: &str, session: &str, item: Option<&str>) -> Run {
             requests: 0,
             estimated_cost_usd: None,
         },
+    }
+}
+
+/// `RunStarted{run, input_id}` for run `id` in `session`.
+pub fn started(id: &str, session: &str, input: &str) -> Event {
+    Event::RunStarted {
+        run: run(id, session, None),
+        input_id: input.into(),
+    }
+}
+
+/// `RunFinished` helpers for the structured outcome.
+pub fn finished(id: &str, outcome: RunOutcome) -> Event {
+    Event::RunFinished {
+        run: id.into(),
+        outcome,
+    }
+}
+
+pub fn failed(kind: RunErrorKind) -> RunOutcome {
+    RunOutcome::Failed {
+        kind,
+        message: String::new(),
+        http_status: None,
+        retry_after_ms: None,
+        retryable: false,
+    }
+}
+
+pub fn cancelled() -> RunOutcome {
+    RunOutcome::Cancelled {
+        source: CancelSource::User,
+    }
+}
+
+pub fn interrupted() -> RunOutcome {
+    failed(RunErrorKind::Interrupted)
+}
+
+pub fn message(
+    ordinal: u64,
+    role: MessageRole,
+    run: &str,
+    input: Option<&str>,
+    text: &str,
+) -> Message {
+    Message {
+        id: MessageId(format!("m{ordinal}")),
+        ordinal,
+        input_id: input.map(Into::into),
+        run_id: run.into(),
+        turn_id: TurnId(format!("t-{run}")),
+        role,
+        content: Content {
+            text: text.into(),
+            attachments: vec![],
+        },
+        tool_call_id: None,
     }
 }
 
@@ -80,8 +165,16 @@ pub fn item(
 }
 
 /// Feeds events with consecutive seqs, continuing from `app.last_seq`.
+/// Applies events with consecutive seqs. A `RunStarted` fixture without a
+/// start time (`started_at == 0`) is stamped with the app clock, the way Core
+/// stamps `Run.started_at` with its own clock.
 pub fn feed(app: &mut AppState, events: impl IntoIterator<Item = Event>) {
-    for event in events {
+    for mut event in events {
+        if let Event::RunStarted { run, .. } = &mut event
+            && run.started_at == 0
+        {
+            run.started_at = app.now_ms();
+        }
         let seq = app.last_seq + 1;
         app.apply(EventEnvelope { seq, event });
     }

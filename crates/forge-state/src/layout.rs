@@ -1,7 +1,15 @@
 //! Window / three-column layout (spec §4) and the UI preferences behind it.
 //!
-//! `UiPrefs` is the forge-state side of `Settings.ui_prefs`; persisting it is
-//! wired up once Core adds that field (see the P1 adapter plan).
+//! `UiPrefs` is the forge-state side of `Settings.ui_prefs` (a string map Core
+//! stores verbatim): keys `sidebar.width`, `sidebar.visible`,
+//! `inspector.width`, `inspector.visible`.
+
+use std::collections::BTreeMap;
+
+pub const PREF_SIDEBAR_WIDTH: &str = "sidebar.width";
+pub const PREF_SIDEBAR_VISIBLE: &str = "sidebar.visible";
+pub const PREF_INSPECTOR_WIDTH: &str = "inspector.width";
+pub const PREF_INSPECTOR_VISIBLE: &str = "inspector.visible";
 
 /// Main window minimum (§4).
 pub const MIN_WINDOW_WIDTH: f32 = 960.0;
@@ -79,6 +87,45 @@ pub enum SidebarResize {
 }
 
 impl UiPrefs {
+    /// Restores values from `Settings.ui_prefs`; missing or unparsable keys
+    /// keep their current value, widths are clamped to the §4 ranges.
+    pub fn apply_map(&mut self, map: &BTreeMap<String, String>) {
+        let number = |key: &str| map.get(key).and_then(|v| v.parse::<f32>().ok());
+        let flag = |key: &str| map.get(key).and_then(|v| v.parse::<bool>().ok());
+        if let Some(w) = number(PREF_SIDEBAR_WIDTH).filter(|w| w.is_finite()) {
+            self.sidebar_width = w.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+        }
+        if let Some(v) = flag(PREF_SIDEBAR_VISIBLE) {
+            self.sidebar_visible = v;
+        }
+        if let Some(w) = number(PREF_INSPECTOR_WIDTH).filter(|w| w.is_finite()) {
+            self.inspector_width = w.clamp(INSPECTOR_MIN, INSPECTOR_MAX);
+        }
+        if let Some(v) = flag(PREF_INSPECTOR_VISIBLE) {
+            self.inspector_visible = v;
+        }
+    }
+
+    /// Writes the layout keys, leaving other `ui_prefs` keys untouched.
+    pub fn write_map(&self, map: &mut BTreeMap<String, String>) {
+        map.insert(
+            PREF_SIDEBAR_WIDTH.into(),
+            format!("{}", self.sidebar_width.round()),
+        );
+        map.insert(
+            PREF_SIDEBAR_VISIBLE.into(),
+            self.sidebar_visible.to_string(),
+        );
+        map.insert(
+            PREF_INSPECTOR_WIDTH.into(),
+            format!("{}", self.inspector_width.round()),
+        );
+        map.insert(
+            PREF_INSPECTOR_VISIBLE.into(),
+            self.inspector_visible.to_string(),
+        );
+    }
+
     /// Divider drag: clamps to 200–360, collapses below 160.
     pub fn drag_sidebar(&mut self, width: f32) -> SidebarResize {
         if width < SIDEBAR_COLLAPSE_BELOW {

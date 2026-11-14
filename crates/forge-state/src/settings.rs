@@ -60,9 +60,16 @@ pub enum ConfirmDialog {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SettingsVm {
-    /// `None` until the host loads settings (no snapshot command yet).
+    /// `None` until the first `Snapshot` / `SettingsUpdated`.
     pub settings: Option<Settings>,
+    /// `Snapshot.providers[].key_configured` / `ProviderKeyConfigured` — the
+    /// only source for "is there a key" (drives the no-key banner and
+    /// placeholder, §6.3 / §6.9).
+    pub key_configured: BTreeMap<ProviderId, bool>,
     pub key_status: BTreeMap<ProviderId, KeyStatus>,
+    /// The settings surface is open ("打开设置" on error cards, the no-key
+    /// notice, ⌘,).
+    pub open: bool,
     /// Inline error under the last changed item; value already reverted.
     pub error: Option<String>,
     pub confirm: Option<ConfirmDialog>,
@@ -70,33 +77,94 @@ pub struct SettingsVm {
 
 impl SettingsVm {
     pub fn has_any_key(&self) -> bool {
-        let configured = self
-            .settings
-            .as_ref()
-            .is_some_and(|s| s.providers.iter().any(|p| p.keychain_reference.is_some()));
-        configured
-            || self
-                .key_status
-                .values()
-                .any(|s| matches!(s, KeyStatus::Verified | KeyStatus::SavedUnverified))
+        self.key_configured.values().any(|configured| *configured)
+    }
+
+    /// Key configured for the provider of the default model.
+    pub fn has_key_for(&self, provider: &ProviderId) -> bool {
+        self.key_configured.get(provider).copied().unwrap_or(false)
     }
 }
 
 impl AppState {
-    /// Host provides settings (from boot snapshot or after a save).
+    /// Settings from `Snapshot` / `SettingsUpdated`: also restores the layout
+    /// stored in `Settings.ui_prefs`.
     pub fn load_settings(&mut self, settings: Settings) {
         for provider in &settings.providers {
-            let status = if provider.keychain_reference.is_some() {
-                KeyStatus::SavedUnverified
-            } else {
-                KeyStatus::Unconfigured
-            };
             self.settings
                 .key_status
                 .entry(provider.id.clone())
-                .or_insert(status);
+                .or_insert(KeyStatus::Unconfigured);
         }
+        self.ui.apply_map(&settings.ui_prefs);
         self.settings.settings = Some(settings);
+    }
+
+    /// `ProviderKeyConfigured` (and each `Snapshot.providers` row).
+    pub(crate) fn on_key_configured(&mut self, provider: ProviderId, configured: bool) {
+        let status = self
+            .settings
+            .key_status
+            .entry(provider.clone())
+            .or_insert(KeyStatus::Unconfigured);
+        let was = self.settings.key_configured.insert(provider, configured);
+        *status = match (configured, was, &*status) {
+            (false, _, _) => KeyStatus::Unconfigured,
+            // Same key still there (snapshot after resync): keep the result
+            // of an earlier test.
+            (true, Some(true), KeyStatus::Verified | KeyStatus::Testing) => status.clone(),
+            (true, _, _) => KeyStatus::SavedUnverified,
+        };
+    }
+
+    /// "添加 / 更换"(`Some`) or "移除"(`None`): `SetProviderKey`. The key goes
+    /// straight into the command and is not kept in UI state.
+    pub fn set_provider_key(&mut self, provider: ProviderId, key: Option<String>) -> CommandToken {
+        let key = key.map(|k| k.trim().to_owned()).filter(|k| !k.is_empty());
+        self.settings.error = None;
+        self.push(
+            Pending::SetKey {
+                provider: provider.clone(),
+            },
+            Command::SetProviderKey { provider, key },
+        )
+    }
+
+    pub(crate) fn on_key_set_rejected(
+        &mut self,
+        provider: ProviderId,
+        code: RejectCode,
+        message: String,
+    ) {
+        // Keychain refused (Core answers `unavailable`).
+        let text = if code == RejectCode::Unavailable {
+            t("settings.keychain_denied").to_owned()
+        } else {
+            crate::app::not_sent(&code, &message)
+        };
+        self.settings.key_status.insert(
+            provider,
+            KeyStatus::Failed {
+                kind: None,
+                message: Some(text.clone()),
+            },
+        );
+        self.settings.error = Some(text);
+    }
+
+    pub fn open_settings(&mut self) {
+        self.settings.open = true;
+    }
+
+    pub fn close_settings(&mut self) {
+        self.settings.open = false;
+    }
+
+    /// Writes the current layout into `Settings.ui_prefs` (one
+    /// `UpdateSettings`; nothing when unchanged). Call at drag end / toggle.
+    pub fn persist_ui_prefs(&mut self) -> Option<CommandToken> {
+        let prefs = self.ui;
+        self.update_settings(|s| prefs.write_map(&mut s.ui_prefs))
     }
 
     /// "验证" button (G2 `TestProviderKey`).

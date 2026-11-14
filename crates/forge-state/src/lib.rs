@@ -14,6 +14,7 @@ mod quit;
 mod session;
 mod settings;
 mod sidebar;
+mod sync;
 mod timeline;
 
 pub use app::*;

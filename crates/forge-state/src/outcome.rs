@@ -1,37 +1,33 @@
 //! Structured run outcomes, error cards (spec §6.7) and retry countdowns
 //! (§6.4.3 auto-retry marker, R7a Retry-After wait).
 //!
-//! These are forge-state-local view types shaped like the agreed P1 protocol
-//! `RunFinished.outcome = success | cancelled{by} | failed{category,
-//! http_status, retry_after_ms, retryable, message}`. Until Core lands that
-//! shape, [`outcome_from_p0`] adapts today's P0 `RunFinished{outcome, reason}`.
+//! The source of truth is Core's `RunOutcome` (PROTOCOL.md "Core → UI 错误映射"):
+//! [`failure_of`] turns `RunOutcome::Failed` into the card input and
+//! [`ErrorCardKind::for_failure`] picks one of the nine §6.7 cards.
 
 use crate::i18n::{t, tf};
 use crate::session::ErrorKind;
-use forge_protocol::{RunId, RunOutcome};
+use forge_protocol::{RunErrorKind, RunId, RunOutcome, UnknownSource};
 
 /// Provider attempts before a run gives up (spec §6.4.3 "共 5 次").
 pub const RETRY_MAX_ATTEMPTS: u32 = 5;
-/// Retry-After above this is the "服务要求等待" card (R7a) instead of auto-retry.
+/// Retry-After above this is the "服务要求等待" card (R7a); at or below it the
+/// plain "请求太频繁" card with an immediate 重试 ⌘R (PROTOCOL.md mapping table).
 pub const LONG_RETRY_AFTER_MS: u64 = 60_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CancelledBy {
-    User,
-    Shutdown,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureVm {
     pub category: ErrorKind,
     pub http_status: Option<u16>,
     pub retry_after_ms: Option<u64>,
+    /// Core's `retryable` (informational: P1 never retries on its own, and the
+    /// card's 重试 is a user action, so it does not gate the button).
     pub retryable: bool,
-    /// Provider/raw message. Shown only under "详情", always via [`redact_secrets`].
+    /// Provider/raw message. Shown only under "详情", always via [`sanitize_details`].
     pub raw_message: String,
-    /// Where an Unknown/Server failure came from (`storage`, `provider`, …);
-    /// lets the card swap its title (§6.7 mapping, 2026-11-14).
-    pub source: Option<String>,
+    /// `Failed.kind = unknown{source}`: lets the Unknown card swap its title
+    /// (`storage` → "保存失败").
+    pub source: Option<UnknownSource>,
 }
 
 impl FailureVm {
@@ -40,119 +36,63 @@ impl FailureVm {
             category,
             http_status: None,
             retry_after_ms: None,
-            retryable: default_retryable(category),
+            retryable: false,
             raw_message: String::new(),
             source: None,
         }
     }
 }
 
-/// Retry is offered for everything except auth/quota/context, where retrying
-/// the same input cannot succeed without user action (§6.7 primary actions).
-pub fn default_retryable(category: ErrorKind) -> bool {
-    !matches!(
-        category,
-        ErrorKind::Auth | ErrorKind::Quota | ErrorKind::ContextTooLong
-    )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunOutcomeVm {
-    Succeeded,
-    Cancelled {
-        by: CancelledBy,
-    },
-    Failed(FailureVm),
-    /// R9: found unfinished at startup.
-    Interrupted,
-}
-
-impl RunOutcomeVm {
-    pub fn outcome(&self) -> RunOutcome {
-        match self {
-            Self::Succeeded => RunOutcome::Succeeded,
-            Self::Cancelled { .. } => RunOutcome::Cancelled,
-            Self::Failed(_) => RunOutcome::Failed,
-            Self::Interrupted => RunOutcome::Interrupted,
-        }
-    }
-
-    pub fn failure(&self) -> Option<FailureVm> {
-        match self {
-            Self::Failed(failure) => Some(failure.clone()),
-            Self::Interrupted => Some(FailureVm {
-                retryable: true,
-                ..FailureVm::new(ErrorKind::Interrupted)
-            }),
-            _ => None,
+impl From<&RunErrorKind> for ErrorKind {
+    fn from(kind: &RunErrorKind) -> Self {
+        match kind {
+            RunErrorKind::Network => Self::Network,
+            RunErrorKind::RateLimited => Self::RateLimited,
+            RunErrorKind::Auth => Self::Auth,
+            RunErrorKind::Quota => Self::Quota,
+            RunErrorKind::Server => Self::Server,
+            RunErrorKind::ContextTooLong => Self::ContextTooLong,
+            RunErrorKind::Interrupted => Self::Interrupted,
+            RunErrorKind::Unknown { .. } => Self::Unknown,
         }
     }
 }
 
-/// Adapter from the P0 `RunFinished { outcome, reason: Option<String> }`.
-///
-/// TODO(core-p1): replace with a `From<forge_protocol::RunOutcome>` once
-/// `RunFinished.outcome` carries `cancelled{by}` and `failed{category,
-/// http_status, retry_after_ms, retryable, message}`. Until then `reason` is
-/// parsed leniently as `<category>[ key=value ...][: message]`, e.g.
-/// `rate_limited http_status=429 retry_after_ms=120000: slow down`; anything
-/// unrecognised becomes `Unknown` with the whole string as the raw message.
-/// `cancelled{by}` is inferred from what the UI itself sent.
-pub fn outcome_from_p0(
-    outcome: RunOutcome,
-    reason: Option<&str>,
-    cancel_requested: bool,
-    shutting_down: bool,
-) -> RunOutcomeVm {
-    match outcome {
-        RunOutcome::Succeeded => RunOutcomeVm::Succeeded,
-        RunOutcome::Interrupted => RunOutcomeVm::Interrupted,
-        RunOutcome::Cancelled => RunOutcomeVm::Cancelled {
-            by: if shutting_down && !cancel_requested {
-                CancelledBy::Shutdown
-            } else {
-                CancelledBy::User
-            },
-        },
-        RunOutcome::Failed => RunOutcomeVm::Failed(parse_p0_reason(reason.unwrap_or(""))),
-    }
-}
-
-fn parse_p0_reason(reason: &str) -> FailureVm {
-    let (head, message) = match reason.split_once(':') {
-        Some((head, message)) => (head, message.trim()),
-        None => (reason, ""),
-    };
-    let mut words = head.split_whitespace();
-    let first = words.next();
-    let category = first.map(|w| ErrorKind::from_reason(Some(w)));
-    let Some(category) = category.filter(|c| *c != ErrorKind::Unknown || first == Some("unknown"))
+/// Card input for a finished run; `None` for succeeded / cancelled runs.
+pub fn failure_of(outcome: &RunOutcome) -> Option<FailureVm> {
+    let RunOutcome::Failed {
+        kind,
+        message,
+        http_status,
+        retry_after_ms,
+        retryable,
+    } = outcome
     else {
-        let mut failure = FailureVm::new(ErrorKind::Unknown);
-        failure.raw_message = reason.trim().to_owned();
-        return failure;
+        return None;
     };
-    // Design mapping (2026-11-14, final table lives in Core's PROTOCOL.md):
-    // `provider` (no HTTP status, bad response/stream) → Server card;
-    // `storage` during a run → Unknown card titled "保存失败".
-    let (category, source) = match category {
-        ErrorKind::Provider => (ErrorKind::Server, Some("provider")),
-        ErrorKind::Storage => (ErrorKind::Unknown, Some("storage")),
-        other => (other, None),
-    };
-    let mut failure = FailureVm::new(category);
-    failure.source = source.map(str::to_owned);
-    for word in words {
-        match word.split_once('=') {
-            Some(("http_status", v)) => failure.http_status = v.parse().ok(),
-            Some(("retry_after_ms", v)) => failure.retry_after_ms = v.parse().ok(),
-            Some(("retryable", v)) => failure.retryable = v == "true",
-            Some(("source", v)) => failure.source = Some(v.to_owned()),
-            _ => {}
+    Some(FailureVm {
+        category: ErrorKind::from(kind),
+        http_status: *http_status,
+        retry_after_ms: *retry_after_ms,
+        retryable: *retryable,
+        raw_message: message.clone(),
+        source: match kind {
+            RunErrorKind::Unknown { source } => Some(source.clone()),
+            _ => None,
+        },
+    })
+}
+
+/// R9 `interrupted` is a `Failed` outcome in P1, rendered with its own divider
+/// and sidebar icon.
+pub fn is_interrupted(outcome: &RunOutcome) -> bool {
+    matches!(
+        outcome,
+        RunOutcome::Failed {
+            kind: RunErrorKind::Interrupted,
+            ..
         }
-    }
-    failure.raw_message = message.to_owned();
-    failure
+    )
 }
 
 /// The nine error cards of spec §6.7 (RateLimited splits on Retry-After).
@@ -198,15 +138,18 @@ impl ErrorCardKind {
             ErrorKind::Server => Self::Server,
             ErrorKind::ContextTooLong => Self::ContextTooLong,
             ErrorKind::Interrupted => Self::Interrupted,
-            ErrorKind::Provider | ErrorKind::Storage | ErrorKind::Unknown => Self::Unknown,
+            ErrorKind::Unknown => Self::Unknown,
         }
     }
 
-    /// Title/body keys, with the source override (Unknown + `storage` →
-    /// "保存失败").
+    /// Title/body keys, with the source override (`unknown{source: storage}` →
+    /// "保存失败"). `unknown{source: provider}` keeps "运行失败" per the
+    /// PROTOCOL.md table ("其余 Provider 错误").
     pub fn keys_for(self, failure: &FailureVm) -> (&'static str, &'static str) {
-        match (self, failure.source.as_deref()) {
-            (Self::Unknown, Some("storage")) => ("error.storage.title", "error.storage.body"),
+        match (self, failure.source.as_ref()) {
+            (Self::Unknown, Some(UnknownSource::Storage)) => {
+                ("error.storage.title", "error.storage.body")
+            }
             _ => self.keys(),
         }
     }
@@ -331,6 +274,14 @@ impl ErrorCardVm {
             RetryButtonState::Waiting { remaining_ms } => format_remaining(remaining_ms),
             RetryButtonState::Ready => String::new(),
         };
+        // D2 (designer, 2026-11-14): once the wait is over the card says so
+        // instead of rendering the wait template with empty slots.
+        let body_key = if kind == ErrorCardKind::RateLimitedWait && retry == RetryButtonState::Ready
+        {
+            "error.retry_after_ready"
+        } else {
+            body_key
+        };
         let title = t(title_key).to_owned();
         let body = tf(
             body_key,
@@ -351,21 +302,9 @@ impl ErrorCardVm {
         if let Some(status) = failure.http_status {
             details.push(format!("HTTP {status}"));
         }
-        details.push(tf(
-            "error.detail.code",
-            &[("code", category_code(failure.category))],
-        ));
+        details.push(tf("error.detail.code", &[("code", &error_code(failure))]));
         if !failure.raw_message.is_empty() {
-            let (text, removed) = sanitize_details(&failure.raw_message);
-            if !text.is_empty() {
-                details.push(text);
-            }
-            if removed > 0 {
-                details.push(tf(
-                    "error.detail.headers_removed",
-                    &[("n", &removed.to_string())],
-                ));
-            }
+            details.push(sanitize_details(&failure.raw_message));
         }
         let (primary, secondary) = kind.actions();
         let primary_shortcut = match primary {
@@ -405,18 +344,22 @@ impl ErrorCardVm {
     }
 }
 
-fn category_code(kind: ErrorKind) -> &'static str {
-    match kind {
+/// Protocol spelling of `Failed.kind` for the details ("错误码 unknown/storage").
+fn error_code(failure: &FailureVm) -> String {
+    let code = match failure.category {
         ErrorKind::Network => "network",
         ErrorKind::RateLimited => "rate_limited",
         ErrorKind::Auth => "auth",
         ErrorKind::Quota => "quota",
         ErrorKind::Server => "server",
         ErrorKind::ContextTooLong => "context_too_long",
-        ErrorKind::Provider => "provider",
-        ErrorKind::Storage => "storage",
         ErrorKind::Interrupted => "interrupted",
         ErrorKind::Unknown => "unknown",
+    };
+    match &failure.source {
+        Some(UnknownSource::Provider) => format!("{code}/provider"),
+        Some(UnknownSource::Storage) => format!("{code}/storage"),
+        None => code.to_owned(),
     }
 }
 
@@ -477,67 +420,74 @@ impl RetryMarkerVm {
     }
 }
 
-/// Header names whose whole line is dropped from error details (UI-ER-04):
-/// anything that names credentials or session state.
-const SENSITIVE_HEADER_PARTS: [&str; 8] = [
-    "auth",
-    "key",
-    "token",
-    "secret",
+/// Credential header names matched exactly (case-insensitive).
+const SENSITIVE_HEADERS: [&str; 4] = [
+    "authorization",
+    "proxy-authorization",
     "cookie",
-    "session",
-    "password",
-    "organization",
+    "set-cookie",
 ];
+/// …and any single token ending in one of these (`x-api-key`, `token`,
+/// `client_secret`, `apikey`).
+const SENSITIVE_SUFFIXES: [&str; 5] = ["api-key", "api_key", "apikey", "token", "secret"];
 
-/// `Name:` / `"name":` at the start of `word` → the lower-cased header name.
-fn header_name(word: &str) -> Option<String> {
-    let word = word.trim_start_matches(['"', '\'', '{', ',', '[']);
-    let (name, _) = word.split_once(':')?;
-    let name = name.trim_end_matches(['"', '\'']);
-    let valid = !name.is_empty()
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    valid.then(|| name.to_ascii_lowercase())
+fn is_header_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_'
 }
 
-fn is_sensitive_header(word: &str) -> bool {
-    header_name(word).is_some_and(|name| SENSITIVE_HEADER_PARTS.iter().any(|p| name.contains(p)))
+fn is_sensitive_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    !lower.is_empty()
+        && (SENSITIVE_HEADERS.contains(&lower.as_str())
+            || SENSITIVE_SUFFIXES.iter().any(|s| lower.ends_with(s)))
 }
 
-/// Error-details text for display (UI-ER-04). Request-header lines that carry
-/// credentials (`Authorization:`, `x-api-key:`, `Cookie:` …) are removed
-/// entirely — a header that starts mid-line cuts the rest of that line — and
-/// whatever remains goes through [`redact_secrets`]. Returns the text and the
-/// number of header lines removed.
-pub fn sanitize_details(text: &str) -> (String, usize) {
-    let mut removed = 0;
-    let mut lines = Vec::new();
-    for line in text.lines() {
-        let cut = line
-            .split_whitespace()
-            .find(|word| is_sensitive_header(word))
-            // Byte offset of this word inside `line`.
-            .map(|word| word.as_ptr() as usize - line.as_ptr() as usize);
-        let kept = match cut {
-            Some(offset) => {
-                removed += 1;
-                line[..offset].trim_end()
+/// Byte offset where a credential header starts in `segment`: a sensitive
+/// name (optionally quoted / backslash-escaped) directly followed — spaces
+/// allowed — by `:` or `=`. `invalid api key: …` does not match: the token
+/// before `:` is just `key`.
+fn header_start(segment: &str) -> Option<usize> {
+    segment.match_indices([':', '=']).find_map(|(index, _)| {
+        let prefix = segment[..index]
+            .trim_end()
+            .trim_end_matches(['"', '\'', '\\']);
+        let start = prefix
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| is_header_char(*c))
+            .last()
+            .map(|(i, _)| i)?;
+        is_sensitive_name(&prefix[start..]).then_some(start)
+    })
+}
+
+/// Error-details text for display (UI-ER-04, designer rule 2026-11-14; Core
+/// applies the same rule and is authoritative — this is a defensive layer).
+/// The text is split at real newlines and at literal `\n` / `\r\n` escapes
+/// (JSON bodies collapsed onto one line). In each segment a credential header
+/// (`Authorization:`, `{'Cookie': …`, `x-api-key=`, `token:` …) is replaced,
+/// from its name to the end of the segment, by `[已移除请求头]`; the text
+/// before it stays, so the result is never empty for a non-empty message.
+/// What remains goes through [`redact_secrets`].
+pub fn sanitize_details(text: &str) -> String {
+    let normalized = text.replace("\\r\\n", "\n").replace("\\n", "\n");
+    let placeholder = crate::i18n::t("error.detail.header_redacted");
+    normalized
+        .split('\n')
+        .map(|segment| {
+            let segment = segment.strip_suffix('\r').unwrap_or(segment);
+            match header_start(segment) {
+                Some(start) => format!("{}{placeholder}", redact_secrets(&segment[..start])),
+                None => redact_secrets(segment),
             }
-            None => line,
-        };
-        if !kept.trim().is_empty() {
-            lines.push(redact_secrets(kept));
-        }
-    }
-    (lines.join("\n"), removed)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// UI-ER-04: no API key may reach the card. Masks `sk-…`-style keys, bearer
-/// tokens, `api_key=` values and any long opaque token (≥ 32 chars), line by
-/// line (whitespace is preserved).
+/// UI-ER-04: no API key may reach the card. Masks `sk-…`-style keys, the
+/// word after `Bearer`, and `api_key=` values, line by line (whitespace is
+/// preserved). No length-based guessing.
 pub fn redact_secrets(text: &str) -> String {
     text.split('\n')
         .map(redact_line)
@@ -553,17 +503,11 @@ fn redact_line(text: &str) -> String {
             out.push(' ');
         }
         let lower = piece.to_ascii_lowercase();
-        let token =
-            piece.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
         let looks_secret = mask_next
             || lower.starts_with("sk-")
             || lower.contains("api_key=")
             || lower.contains("apikey=")
-            || lower.contains("key=sk")
-            || (token.len() >= 32
-                && token
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+            || lower.contains("key=sk");
         mask_next = lower == "bearer" || lower == "authorization:";
         if looks_secret {
             match piece.split_once('=') {
@@ -586,39 +530,68 @@ mod tests {
 
     #[test]
     fn redacts_keys_and_tokens() {
-        let raw = "401 invalid key sk-proj-abcdefghijklmnop Authorization: Bearer xyz api_key=hunter2 \
-                   0123456789abcdef0123456789abcdef ok";
+        let raw = "401 invalid key sk-proj-abcdefghijklmnop Bearer xyz api_key=hunter2 ok";
         let red = redact_secrets(raw);
-        for secret in ["sk-proj", "xyz", "hunter2", "0123456789abcdef"] {
+        for secret in ["sk-proj", "xyz", "hunter2"] {
             assert!(!red.contains(secret), "{secret} leaked in {red}");
         }
         assert!(red.starts_with("401 invalid key ••••"));
         assert!(red.ends_with(" ok"));
+        // No length heuristic: an ordinary long identifier stays.
+        let id = "req_0123456789abcdef0123456789abcdef";
+        assert_eq!(redact_secrets(id), id);
+    }
+
+    const X: &str = "[已移除请求头]";
+
+    #[test]
+    fn header_values_are_replaced_in_segment() {
+        let raw = "429 Too Many Requests\nAuthorization: Bearer abc\nx-api-key: hunter2\n\
+                   rate limit reached. Authorization: Bearer sk-x\ncontent-type: json";
+        assert_eq!(
+            sanitize_details(raw),
+            format!("429 Too Many Requests\n{X}\n{X}\nrate limit reached. {X}\ncontent-type: json")
+        );
     }
 
     #[test]
-    fn header_lines_are_removed_not_masked() {
-        let raw = "429 Too Many Requests\nAuthorization: Bearer abc\nx-api-key: hunter2\n\
-                   Cookie: sid=1\nrate limit reached. Authorization: Bearer sk-x\ncontent-type: json";
-        let (text, removed) = sanitize_details(raw);
-        assert_eq!(removed, 4);
-        assert_eq!(
-            text,
-            "429 Too Many Requests\nrate limit reached.\ncontent-type: json"
-        );
-        for gone in [
-            "Authorization",
-            "Bearer",
-            "hunter2",
-            "Cookie",
-            "sid=1",
-            "sk-x",
-        ] {
-            assert!(!text.contains(gone), "{gone} in {text}");
+    fn d3_final_rule_cases() {
+        let cases = [
+            // 401 body collapsed onto one line with escaped newlines.
+            (
+                r#"401 {"error":{"message":"invalid key\nProxy-Authorization: Basic abc\nx-api-key: zzz"}}"#,
+                format!("401 {{\"error\":{{\"message\":\"invalid key\n{X}\n{X}"),
+            ),
+            ("token: abc", X.to_string()),
+            ("Cookie: a=b", X.to_string()),
+            ("Set-Cookie: sid=1; HttpOnly", X.to_string()),
+            (r#"{"X-Api-Key":"k1","ok":1}"#, format!("{{\"{X}")),
+            ("client_secret=s3", X.to_string()),
+            // Tester's strings.
+            ("{'Authorization': 'Bearer qqq'}", format!("{{'{X}")),
+            ("Authorization=Bearer tok_123", X.to_string()),
+            (
+                "invalid api key: please check settings",
+                "invalid api key: please check settings".to_string(),
+            ),
+            (r"a\r\nAuthorization: Bearer q\r\nb", format!("a\n{X}\nb")),
+            ("authorization failed", "authorization failed".to_string()),
+            (
+                "x-api-key-info: unavailable",
+                "x-api-key-info: unavailable".to_string(),
+            ),
+        ];
+        for (raw, want) in cases {
+            let got = sanitize_details(raw);
+            assert_eq!(got, want, "{raw}");
+            for leaked in ["abc", "zzz", "qqq", "tok_123", "k1", "s3", "sid=1", "a=b"] {
+                if !raw.contains("unavailable") && !raw.starts_with("authorization failed") {
+                    assert!(!got.contains(leaked), "{leaked} leaked from {raw}: {got}");
+                }
+            }
         }
-        // JSON-ish header dumps too.
-        let (text, removed) = sanitize_details(r#"{"error": "bad", "authorization": "Bearer t"}"#);
-        assert_eq!((text.as_str(), removed), (r#"{"error": "bad","#, 1));
+        // A single-line header message never becomes empty.
+        assert_eq!(sanitize_details("Authorization: Bearer x"), X);
     }
 
     #[test]

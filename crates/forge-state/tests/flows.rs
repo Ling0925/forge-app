@@ -19,6 +19,7 @@ fn quit_with_runs_confirms_then_sends_shutdown_once() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     assert_eq!(
@@ -60,6 +61,7 @@ fn shutdown_rejected_still_exits_and_lists_unfinished() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     app.request_quit();
@@ -81,6 +83,7 @@ fn shutdown_ui_timeout() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     app.set_now_ms(1_000);
@@ -331,6 +334,7 @@ fn palette_hides_unavailable_actions_and_filters() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     assert!(labels(&app).contains(&"停止".to_owned()));
@@ -359,6 +363,7 @@ fn palette_switches_session_and_stops() {
         &mut app,
         [Event::RunStarted {
             run: run("r2", "s2", None),
+            input_id: "in-1".into(),
         }],
     );
     app.open_palette();

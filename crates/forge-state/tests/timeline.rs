@@ -17,14 +17,6 @@ fn delta(run: &str, text: &str) -> Event {
     }
 }
 
-fn finished(run: &str, outcome: RunOutcome, reason: Option<&str>) -> Event {
-    Event::RunFinished {
-        run: run.into(),
-        outcome,
-        reason: reason.map(Into::into),
-    }
-}
-
 #[test]
 fn single_turn_flow() {
     let mut app = app_with_session();
@@ -35,6 +27,7 @@ fn single_turn_flow() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     let s = app.selected().unwrap();
@@ -43,6 +36,7 @@ fn single_turn_flow() {
         s.timeline,
         vec![TimelineItem::User(UserMessageVm {
             input_id: "in-1".into(),
+            ordinal: None,
             text: "解释这个项目".into(),
             origin: MessageOrigin::Direct,
         })]
@@ -56,13 +50,14 @@ fn single_turn_flow() {
         RunPhase::Streaming
     );
     app.set_now_ms(47_000);
-    feed(&mut app, [finished("r1", RunOutcome::Succeeded, None)]);
+    feed(&mut app, [finished("r1", RunOutcome::Succeeded)]);
     let s = app.selected().unwrap();
     assert_eq!(s.active_run, None);
     assert_eq!(
         s.timeline[1],
         TimelineItem::Assistant(AssistantMessageVm {
             run_id: "r1".into(),
+            ordinal: None,
             text: "这是一个 Rust 项目".into(),
             reasoning: String::new(),
             streaming: false,
@@ -85,6 +80,7 @@ fn single_turn_flow() {
         .into_iter()
         .map(|a| a.text)
         .collect();
+    // Elapsed = local finish time − `Run.started_at` (fixture: 0).
     assert_eq!(announcements, vec!["开始运行", "运行完成，用时 0:46"]);
 }
 
@@ -96,6 +92,7 @@ fn run_started_before_accepted_inserts_user_message_once() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     app.apply_result(out.token, accepted());
@@ -126,6 +123,7 @@ fn queue_item_events_supply_the_user_message() {
             },
             Event::RunStarted {
                 run: run("r1", "s1", Some("q1")),
+                input_id: "in-1".into(),
             },
         ],
     );
@@ -143,6 +141,7 @@ fn message_queued_while_busy_is_tagged_from_queue() {
         &mut app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     let out = send(&mut app, "later");
@@ -153,7 +152,7 @@ fn message_queued_while_busy_is_tagged_from_queue() {
             Event::QueueItemAdded {
                 item: item("q2", "s1", "in-1", "later", QueueItemState::Pending, 2),
             },
-            finished("r1", RunOutcome::Succeeded, None),
+            finished("r1", RunOutcome::Succeeded),
             Event::QueueItemUpdated {
                 item: item("q2", "s1", "in-1", "later", QueueItemState::Started, 2),
             },
@@ -180,6 +179,7 @@ fn ui_msg_01_generation_reset_leaves_only_final_text() {
         [
             Event::RunStarted {
                 run: run("r1", "s1", None),
+                input_id: "in-1".into(),
             },
             delta("r1", "a"),
             delta("r1", "b"),
@@ -207,7 +207,7 @@ fn ui_msg_01_generation_reset_leaves_only_final_text() {
             Event::GenerationReset { run: "r1".into() },
             delta("r1", "final "),
             delta("r1", "answer"),
-            finished("r1", RunOutcome::Succeeded, None),
+            finished("r1", RunOutcome::Succeeded),
         ],
     );
     assert_eq!(
@@ -232,6 +232,7 @@ fn reasoning_sets_thinking_then_text_streams() {
         [
             Event::RunStarted {
                 run: run("r1", "s1", None),
+                input_id: "in-1".into(),
             },
             Event::ReasoningDelta {
                 run: "r1".into(),
@@ -265,6 +266,7 @@ fn cancelled_run_keeps_text_and_marks_stopped() {
         [
             Event::RunStarted {
                 run: run("r1", "s1", None),
+                input_id: "in-1".into(),
             },
             delta("r1", "partial"),
             Event::RunStateChanged {
@@ -278,7 +280,7 @@ fn cancelled_run_keeps_text_and_marks_stopped() {
         app.selected().unwrap().running().unwrap().phase,
         RunPhase::Cancelling
     );
-    feed(&mut app, [finished("r1", RunOutcome::Cancelled, None)]);
+    feed(&mut app, [finished("r1", cancelled())]);
     match &app.selected().unwrap().timeline[0] {
         TimelineItem::Assistant(m) => {
             assert_eq!(m.text, "partial more");
@@ -296,8 +298,9 @@ fn failed_run_adds_error_item_with_kind() {
         [
             Event::RunStarted {
                 run: run("r1", "s1", None),
+                input_id: "in-1".into(),
             },
-            finished("r1", RunOutcome::Failed, Some("auth")),
+            finished("r1", failed(RunErrorKind::Auth)),
         ],
     );
     let s = app.selected().unwrap();
@@ -306,7 +309,6 @@ fn failed_run_adds_error_item_with_kind() {
     assert!(s.timeline.contains(&TimelineItem::Error(ErrorVm {
         run_id: "r1".into(),
         kind: ErrorKind::Auth,
-        detail: Some("auth".into()),
         failure,
         retry_at_ms: None,
     })));
@@ -324,13 +326,14 @@ fn terminal_state_is_applied_once() {
         [
             Event::RunStarted {
                 run: run("r1", "s1", None),
+                input_id: "in-1".into(),
             },
             Event::RunStateChanged {
                 run: "r1".into(),
                 state: RunState::Succeeded,
             },
-            finished("r1", RunOutcome::Succeeded, None),
-            finished("r1", RunOutcome::Failed, Some("late")),
+            finished("r1", RunOutcome::Succeeded),
+            finished("r1", failed(RunErrorKind::Server)),
         ],
     );
     let s = app.selected().unwrap();
@@ -351,11 +354,12 @@ fn ui_tb_01_context_warning_at_80_percent_and_compaction_notice() {
         [
             Event::RunStarted {
                 run: run("r1", "s1", None),
+                input_id: "in-1".into(),
             },
             Event::ContextUsage {
                 run: "r1".into(),
                 used_tokens: 79_000,
-                available_tokens: 100_000,
+                context_remaining_estimate: 21_000,
             },
         ],
     );
@@ -365,7 +369,7 @@ fn ui_tb_01_context_warning_at_80_percent_and_compaction_notice() {
         [Event::ContextUsage {
             run: "r1".into(),
             used_tokens: 82_000,
-            available_tokens: 100_000,
+            context_remaining_estimate: 18_000,
         }],
     );
     let ctx = app.selected().unwrap().context;
@@ -395,7 +399,7 @@ fn events_for_unknown_runs_are_ignored() {
         &mut app,
         [
             delta("ghost", "x"),
-            finished("ghost", RunOutcome::Failed, None),
+            finished("ghost", failed(RunErrorKind::Network)),
         ],
     );
     assert!(app.selected().unwrap().timeline.is_empty());
@@ -425,11 +429,11 @@ fn duplicate_seq_is_ignored_and_gap_flags_resync() {
             got: seq + 5
         }
     );
-    // Old state is kept and the event still applied.
+    // Old state is kept and the event still applied; exactly one snapshot
+    // request goes out.
     assert!(app.sessions.contains_key(&SessionId::from("s1")));
     assert!(app.sessions.contains_key(&SessionId::from("s9")));
-    app.resync_done();
-    assert_eq!(app.resync, ResyncState::Idle);
+    assert_eq!(single_command(&mut app).command, Command::GetSnapshot);
 }
 
 #[test]
@@ -460,6 +464,7 @@ fn usage_recorded_updates_run() {
         [
             Event::RunStarted {
                 run: run("r1", "s1", None),
+                input_id: "in-1".into(),
             },
             Event::UsageRecorded {
                 record: UsageRecord {

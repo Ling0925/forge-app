@@ -3,7 +3,7 @@
 
 use crate::app::AppState;
 use crate::i18n::{format_elapsed, t, tf};
-use crate::session::{ErrorKind, RunPhase, SessionVm};
+use crate::session::{ErrorKind, RunPhase, SessionVm, error_label_key};
 use forge_protocol::{QueuePauseReason, RunOutcome, SessionId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,8 +25,7 @@ impl SidebarGroup {
     }
 }
 
-/// "最近" sub-buckets by local calendar day (§6.1). Sessions with no known
-/// time (restored from storage, no protocol timestamp yet) fall into `Older`.
+/// "最近" sub-buckets by local calendar day of `Session.updated_at` (§6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DayBucket {
     Today,
@@ -47,10 +46,7 @@ impl DayBucket {
 
     pub const ALL: [DayBucket; 4] = [Self::Today, Self::Yesterday, Self::Week, Self::Older];
 
-    pub fn for_time(at_ms: Option<u64>, now_ms: u64, utc_offset_ms: i64) -> Self {
-        let Some(at) = at_ms else {
-            return Self::Older;
-        };
+    pub fn for_time(at: u64, now_ms: u64, utc_offset_ms: i64) -> Self {
         let day = |ms: u64| (ms as i64 + utc_offset_ms).div_euclid(DAY_MS);
         match day(now_ms) - day(at) {
             ..=0 => Self::Today,
@@ -193,7 +189,10 @@ impl AppState {
         } else {
             SidebarGroup::Recent
         };
-        let error_label = t(vm.last_error.unwrap_or(ErrorKind::Unknown).label_key());
+        let error_label = t(error_label_key(
+            vm.last_error.unwrap_or(ErrorKind::Unknown),
+            vm.last_error_source.as_ref(),
+        ));
         let (icon, status_text) = if approvals > 0 {
             let action = self
                 .first_approval_action(&vm.session.id)
@@ -219,28 +218,25 @@ impl AppState {
                 }
                 Activity::WaitingApproval => (StatusIcon::Approval, String::new()),
                 _ => match (&vm.last_outcome, vm.queue_paused.as_ref()) {
-                    (Some(RunOutcome::Failed), Some(QueuePauseReason::Failed)) => (
+                    (Some(o), _) if crate::outcome::is_interrupted(o) => {
+                        (StatusIcon::Interrupted, t("row.interrupted").into())
+                    }
+                    (Some(RunOutcome::Failed { .. }), Some(QueuePauseReason::Failed)) => (
                         StatusIcon::Failed,
                         tf("row.failed_paused", &[("error_kind", error_label)]),
                     ),
-                    (Some(RunOutcome::Failed), _) => (
+                    (Some(RunOutcome::Failed { .. }), _) => (
                         StatusIcon::Failed,
                         tf("row.failed", &[("error_kind", error_label)]),
                     ),
-                    (Some(RunOutcome::Cancelled), _) => {
+                    (Some(RunOutcome::Cancelled { .. }), _) => {
                         (StatusIcon::Stopped, t("row.cancelled").into())
                     }
-                    (Some(RunOutcome::Interrupted), _) => {
-                        (StatusIcon::Interrupted, t("row.interrupted").into())
-                    }
-                    // Idle: "2 小时前 · +12 −3". The time is when this window
-                    // last saw activity. TODO(core-p1): diffstat needs
-                    // checkpoints, and restored sessions need `updated_at`.
+                    // Idle: "2 小时前 · +12 −3" from `Session.updated_at`.
+                    // TODO(core-p2): the "+12 −3" diffstat needs checkpoints.
                     _ => (
                         StatusIcon::None,
-                        vm.last_activity_ms
-                            .map(|at| relative_time(at, self.now_ms))
-                            .unwrap_or_default(),
+                        relative_time(vm.updated_at(), self.now_ms),
                     ),
                 },
             }
@@ -272,7 +268,7 @@ impl AppState {
             last_outcome: vm.last_outcome.clone(),
             last_error: vm.last_error,
             group,
-            bucket: DayBucket::for_time(vm.last_activity_ms, self.now_ms, self.utc_offset_ms),
+            bucket: DayBucket::for_time(vm.updated_at(), self.now_ms, self.utc_offset_ms),
             icon,
             status_text,
             a11y_label,
@@ -286,10 +282,10 @@ impl AppState {
             .values()
             .filter(|vm| self.in_active_workspace(vm))
             .collect();
-        // Most recent activity first; id breaks ties for a stable order.
+        // Most recently updated first (`Session.updated_at`); id breaks ties.
         sessions.sort_by(|a, b| {
-            b.last_activity
-                .cmp(&a.last_activity)
+            b.updated_at()
+                .cmp(&a.updated_at())
                 .then_with(|| a.session.id.cmp(&b.session.id))
         });
         let mut vm = SidebarVm {

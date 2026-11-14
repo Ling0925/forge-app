@@ -240,9 +240,11 @@ impl AppState {
                     let run = vm.runs.get(run_id);
                     let (icon, key) = match outcome {
                         RunOutcome::Succeeded => (DividerIcon::Success, "run.succeeded"),
-                        RunOutcome::Failed => (DividerIcon::Failed, "run.failed"),
-                        RunOutcome::Cancelled => (DividerIcon::Stopped, "run.cancelled"),
-                        RunOutcome::Interrupted => (DividerIcon::Interrupted, "run.interrupted"),
+                        o if crate::outcome::is_interrupted(o) => {
+                            (DividerIcon::Interrupted, "run.interrupted")
+                        }
+                        RunOutcome::Failed { .. } => (DividerIcon::Failed, "run.failed"),
+                        RunOutcome::Cancelled { .. } => (DividerIcon::Stopped, "run.cancelled"),
                     };
                     let mut text = t(key).to_owned();
                     let mut a11y = tf("a11y.divider", &[("outcome", t(key))]);
@@ -410,7 +412,7 @@ impl AppState {
         let in_flight = self
             .pending
             .values()
-            .any(|(_, command)| matches!(command, Command::RetryRun { run: r } if r == run));
+            .any(|(_, command)| matches!(command, Some(Command::RetryRun { run: r }) if r == run));
         if in_flight {
             return None;
         }

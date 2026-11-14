@@ -140,6 +140,7 @@ fn start_run(app: &mut AppState) {
         app,
         [Event::RunStarted {
             run: run("r1", "s1", None),
+            input_id: "in-1".into(),
         }],
     );
     app.take_announcements();
@@ -203,8 +204,7 @@ fn p3_busy_enter_queues_and_alt_enter_steers_with_steer_id() {
 #[test]
 fn no_key_and_storage_error_disable_the_composer() {
     let mut app = app_with_session();
-    app.load_settings(settings(false));
-    app.settings.key_status.clear();
+    set_key(&mut app, false);
     assert_eq!(
         app.composer_mode(),
         ComposerMode::Disabled(DisabledReason::NoKey)
@@ -215,7 +215,7 @@ fn no_key_and_storage_error_disable_the_composer() {
         app.composer_key(ComposerKey::Enter),
         KeyOutcome::Ignored(IgnoreReason::Disabled)
     );
-    app.load_settings(settings(true));
+    set_key(&mut app, true);
     app.boot = BootState::StorageError {
         code: "SQLITE_READONLY".into(),
         path: "/data".into(),
