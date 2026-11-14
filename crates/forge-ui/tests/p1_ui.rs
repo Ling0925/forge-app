@@ -418,3 +418,56 @@ fn short_rate_limit_retries_at_once_with_cmd_r(cx: &mut TestAppContext) {
         "⌘R sends RetryRun for the latest failed run"
     );
 }
+
+#[gpui_kit::test]
+fn composer_toolbar_and_stop_button(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("composer-box").is_some());
+        assert!(window.try_find("composer-toolbar").is_some());
+        assert!(window.try_find("composer-attach").is_some());
+        let send = window.find("composer-send");
+        assert_eq!(send.label(), Some("发送"));
+        assert_eq!(send.disabled(), Some(true), "empty draft");
+    });
+    f.start_run(cx, "r1");
+    f.backend.take();
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("composer-send").is_none());
+        assert_eq!(window.find("composer-stop").label(), Some("停止"));
+        window.click("composer-stop", cx);
+    });
+    cx.run_until_parked();
+    let cancels = f
+        .backend
+        .take()
+        .into_iter()
+        .filter(|c| matches!(c, Command::CancelRun { .. }))
+        .count();
+    assert_eq!(cancels, 1);
+}
+
+#[gpui_kit::test]
+fn no_key_shows_banner_and_settings_link(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.update(cx, |app, window, cx| {
+        app.state.load_settings(Settings {
+            providers: vec![],
+            model: model(),
+            permission_mode: PermissionMode::Ask,
+        });
+        app.state.settings.key_status.clear();
+        app.after_change(window, cx);
+    });
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("no-key").is_some(),
+            "还没有添加 API Key banner"
+        );
+        assert!(window.try_find("composer-open-settings").is_some());
+        assert_eq!(window.find("composer-send").disabled(), Some(true));
+    });
+}
