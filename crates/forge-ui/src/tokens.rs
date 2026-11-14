@@ -303,6 +303,57 @@ pub const CONTRAST_PAIRS: &[(&str, &str, &str, f64, f64, f64)] = &[
     ("焦点环", "accent", "surface", 3.0, 6.09, 5.48),
 ];
 
+/// Type scale at 100% (spec §3.3), sizes and line-heights in points.
+pub struct TypeRole {
+    pub size: f32,
+    pub line_height: f32,
+}
+
+pub const TITLE1: TypeRole = TypeRole {
+    size: 22.0,
+    line_height: 28.0,
+};
+pub const TITLE2: TypeRole = TypeRole {
+    size: 17.0,
+    line_height: 22.0,
+};
+pub const TITLE3: TypeRole = TypeRole {
+    size: 15.0,
+    line_height: 20.0,
+};
+pub const BODY: TypeRole = TypeRole {
+    size: 13.0,
+    line_height: 20.0,
+};
+pub const CALLOUT: TypeRole = TypeRole {
+    size: 14.0,
+    line_height: 21.0,
+};
+pub const FOOTNOTE: TypeRole = TypeRole {
+    size: 12.0,
+    line_height: 16.0,
+};
+pub const CAPTION: TypeRole = TypeRole {
+    size: 11.0,
+    line_height: 14.0,
+};
+pub const MONO: TypeRole = TypeRole {
+    size: 12.0,
+    line_height: 18.0,
+};
+
+/// Spacing scale on a 4pt grid (spec §3.4), in points.
+pub const SPACE_1: f32 = 2.0;
+pub const SPACE_2: f32 = 4.0;
+pub const SPACE_3: f32 = 6.0;
+pub const SPACE_4: f32 = 8.0;
+pub const SPACE_5: f32 = 12.0;
+pub const SPACE_6: f32 = 16.0;
+pub const SPACE_7: f32 = 20.0;
+pub const SPACE_8: f32 = 24.0;
+pub const SPACE_9: f32 = 32.0;
+pub const SPACE_10: f32 = 48.0;
+
 #[cfg(test)]
 mod tests {
     use super::*;

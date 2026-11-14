@@ -32,7 +32,7 @@ fn column(child: impl IntoElement) -> AnyElement {
     h_flex()
         .w_full()
         .justify_center()
-        .px_6()
+        .px_8()
         .child(div().w_full().max_w(px(CONTENT_MAX)).child(child))
         .into_any_element()
 }

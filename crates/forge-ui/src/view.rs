@@ -8,7 +8,7 @@ use crate::actions::{
 use crate::announce::Announcer;
 use crate::backend::{Backend, EventReceiver, StartError};
 use crate::timeline_view::render_row;
-use crate::tokens::Palette;
+use crate::tokens::{self, Palette};
 use forge_protocol::{EventEnvelope, ProviderId, RunId, SessionId};
 use forge_state::i18n::{t, tf};
 use forge_state::{
@@ -801,7 +801,13 @@ impl ForgeApp {
                     .child(Icon::new(IconName::Plus))
                     .child(t("sidebar.new_session"))
                     .child(div().flex_1())
-                    .child(div().text_xs().text_color(rgb(palette.fg2)).child("⌘N")),
+                    .child(
+                        div()
+                            .text_size(px(tokens::CAPTION.size))
+                            .line_height(px(tokens::CAPTION.line_height))
+                            .text_color(rgb(palette.fg2))
+                            .child("⌘N"),
+                    ),
             )
             .on_click(
                 cx.listener(|this, _, window, cx| this.on_new_session(&NewSession, window, cx)),
@@ -815,8 +821,8 @@ impl ForgeApp {
             .flex_shrink_0()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
-            .p_2()
-            .gap_3()
+            .p_3()
+            .gap_4()
             .child(new_session);
         if sidebar.is_empty() {
             list = list.child(
@@ -868,8 +874,11 @@ impl ForgeApp {
                     h_flex()
                         .id(SharedString::from(format!("group-{key}-header")))
                         .px_3()
+                        .pt_1()
                         .gap_1p5()
-                        .text_xs()
+                        .text_size(px(tokens::CAPTION.size))
+                        .line_height(px(tokens::CAPTION.line_height))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .text_color(rgb(palette.fg2))
                         .child(name)
                         .child(div().child(count.to_string()))
@@ -957,7 +966,9 @@ impl ForgeApp {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_sm()
+                                    .text_size(px(tokens::BODY.size))
+                                    .line_height(px(tokens::BODY.line_height))
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
                                     .truncate()
                                     .child(row.title.clone()),
                             )
@@ -976,7 +987,8 @@ impl ForgeApp {
                     .child(
                         div()
                             .pl(px(24.))
-                            .text_xs()
+                            .text_size(px(tokens::CAPTION.size))
+                            .line_height(px(tokens::CAPTION.line_height))
                             .text_color(rgb(palette.fg2))
                             .truncate()
                             .child(row.status_text.clone()),
@@ -999,27 +1011,34 @@ impl ForgeApp {
                 .id("session-header")
                 .h(px(52.))
                 .flex_shrink_0()
-                .px_6()
+                .px_8()
                 .gap_3()
                 .items_center()
                 .border_b_1()
                 .border_color(theme.border)
                 .child(
                     div()
+                        .text_size(px(tokens::TITLE3.size))
+                        .line_height(px(tokens::TITLE3.line_height))
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .truncate()
                         .child(vm.session.title.clone()),
                 )
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(px(tokens::FOOTNOTE.size))
+                        .line_height(px(tokens::FOOTNOTE.line_height))
                         .text_color(theme.muted_foreground)
                         .child(vm.session.model.model.clone()),
                 )
                 .child(div().flex_1())
-                .children(
-                    context.map(|c| div().text_sm().text_color(theme.muted_foreground).child(c)),
-                )
+                .children(context.map(|c| {
+                    div()
+                        .text_size(px(tokens::FOOTNOTE.size))
+                        .line_height(px(tokens::FOOTNOTE.line_height))
+                        .text_color(theme.muted_foreground)
+                        .child(c)
+                }))
                 .into_any_element(),
         )
     }
@@ -1034,24 +1053,31 @@ impl ForgeApp {
             .flex_1()
             .items_center()
             .justify_center()
-            .gap_4()
+            .gap_6()
+            .px_6()
             .child(
                 div()
-                    .text_size(px(22.))
-                    .line_height(px(28.))
+                    .text_size(px(tokens::TITLE1.size))
+                    .line_height(px(tokens::TITLE1.line_height))
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .child(t("empty.title")),
             );
         if has_session && !no_key {
-            col = col.child(h_flex().gap_2().children((1..=3).map(|i| {
-                Button::new(SharedString::from(format!("example-{i}")))
-                    .label(t(&format!("empty.example.{i}")))
-                    .outline()
-                    .small()
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.fill_example(i, window, cx)),
-                    )
-            })));
+            col = col.child(
+                v_flex()
+                    .w(px(360.))
+                    .max_w_full()
+                    .gap_2()
+                    .children((1..=3).map(|i| {
+                        Button::new(SharedString::from(format!("example-{i}")))
+                            .label(t(&format!("empty.example.{i}")))
+                            .outline()
+                            .w_full()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.fill_example(i, window, cx)
+                            }))
+                    })),
+            );
         }
         if no_key {
             let palette = *Palette::for_dark(theme.is_dark());
@@ -1182,8 +1208,8 @@ impl ForgeApp {
                         .child(stepper)
                         .child(
                             div()
-                                .text_size(px(22.))
-                                .line_height(px(28.))
+                                .text_size(px(tokens::TITLE1.size))
+                                .line_height(px(tokens::TITLE1.line_height))
                                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                 .child(title.to_owned()),
                         )
@@ -1246,7 +1272,7 @@ impl ForgeApp {
                         let row = rows.borrow().get(index).cloned();
                         match row {
                             Some(row) => div()
-                                .pt_4()
+                                .pt_5()
                                 .child(render_row(&row, &weak, cx))
                                 .into_any_element(),
                             None => div().into_any_element(),
@@ -1381,7 +1407,8 @@ impl ForgeApp {
                     .h(px(28.))
                     .gap_2()
                     .items_center()
-                    .text_xs()
+                    .text_size(px(tokens::CAPTION.size))
+                    .line_height(px(tokens::CAPTION.line_height))
                     .text_color(rgb(palette.fg2))
                     .child(
                         Button::new("composer-attach")
@@ -1428,9 +1455,9 @@ impl ForgeApp {
             .w_full()
             .justify_center()
             .flex_shrink_0()
-            .px_6()
-            .pb_4()
-            .pt_2()
+            .px_8()
+            .pb_6()
+            .pt_3()
             .child(
                 v_flex()
                     .id("composer")
@@ -1557,8 +1584,8 @@ impl ForgeApp {
                 )
                 .child(
                     div()
-                        .text_size(px(22.))
-                        .line_height(px(28.))
+                        .text_size(px(tokens::TITLE1.size))
+                        .line_height(px(tokens::TITLE1.line_height))
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .child(t("storage.title")),
                 )
@@ -1782,9 +1809,11 @@ impl ForgeApp {
                                 .shadow_lg()
                                 .child(
                                     h_flex()
+                                        .items_center()
                                         .child(
                                             div()
-                                                .text_size(px(17.))
+                                                .text_size(px(tokens::TITLE2.size))
+                                                .line_height(px(tokens::TITLE2.line_height))
                                                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                                 .child(t("settings.page.keys")),
                                         )
