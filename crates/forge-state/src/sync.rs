@@ -4,7 +4,7 @@
 use crate::app::{AppState, ResyncState};
 use crate::session::*;
 use forge_protocol::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 impl AppState {
     /// `Snapshot`: replaces sessions, workspaces, settings, key flags and
@@ -54,14 +54,16 @@ impl AppState {
         {
             self.selected_session = None;
         }
+        let mut adopt = Vec::new();
         for session in sessions {
             match self.sessions.get_mut(&session.id) {
-                Some(vm) => vm.session = session,
+                Some(vm) => vm.session = session.clone(),
                 None => {
                     self.sessions
-                        .insert(session.id.clone(), SessionVm::new(session));
+                        .insert(session.id.clone(), SessionVm::new(session.clone()));
                 }
             }
+            adopt.push(session);
         }
 
         // Active runs: the snapshot is authoritative. Error cards already in
@@ -90,6 +92,11 @@ impl AppState {
         }
         for active_run in active_runs {
             self.restore_active_run(active_run);
+        }
+        // R-1: `Session.last_finished_run` gives the sidebar its last outcome
+        // after a restart and fills in runs that ended during a gap.
+        for session in adopt {
+            self.adopt_session(session);
         }
 
         // Selection and history.
@@ -174,20 +181,64 @@ impl AppState {
         }
     }
 
-    /// Rebuilds the error card + divider of a run that finished while this
-    /// window was not listening (restart or seq gap).
+    /// `SessionCreated` / `SessionUpdated` / snapshot rows: store the session
+    /// and adopt `last_finished_run` (R-1).
     ///
-    /// TODO(core): P1 at 0200866 carries no finished-run outcomes in
-    /// `Snapshot` / `HistoryLoaded`, so nothing calls this from the wire yet;
-    /// Core plans a per-session latest finished run `{run, outcome,
-    /// finished_at}` in `Snapshot` and `outcome` on each `Run` of
-    /// `HistoryLoaded`. Feed those `Run`s here. Until then an error card
-    /// survives a gap resync only because the in-memory timeline is kept, and
-    /// is lost after a restart.
-    ///
-    /// Idempotent and conservative: a run already terminal in memory, or one
-    /// without an outcome, is left alone. No announcement (it is history).
+    /// In-memory knowledge wins. A run we saw finish is left alone; a run
+    /// that ended unseen (seq gap) gets its outcome, card and divider now.
+    /// Otherwise the finished run only sets the sidebar status (last
+    /// outcome / error), unless a newer finished run is already known. Its
+    /// card is placed when the history page carrying the run arrives
+    /// (`HistoryLoaded.runs`), since only that has the run's messages and
+    /// start time.
+    pub(crate) fn adopt_session(&mut self, session: Session) {
+        let id = session.id.clone();
+        let finished = session.last_finished_run.clone();
+        match self.sessions.get_mut(&id) {
+            Some(vm) => vm.session = session,
+            None => {
+                self.sessions.insert(id.clone(), SessionVm::new(session));
+            }
+        }
+        let Some(finished) = finished else {
+            return;
+        };
+        let Some(vm) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        self.run_sessions.insert(finished.run.clone(), id.clone());
+        match vm.runs.get_mut(&finished.run).map(|r| r.phase.clone()) {
+            Some(RunPhase::Finished(_)) => return,
+            Some(RunPhase::EndedUnseen) => {
+                if let Some(r) = vm.runs.get_mut(&finished.run) {
+                    r.phase = RunPhase::Finished(finished.outcome.clone());
+                    r.finished_at_ms = Some(finished.finished_at);
+                }
+                place_outcome(
+                    vm,
+                    &finished.run,
+                    &finished.outcome,
+                    finished.finished_at,
+                    None,
+                );
+            }
+            // Still running in memory: `RunFinished` follows (Core sends
+            // SessionUpdated first); only the sidebar status moves early.
+            _ => {}
+        }
+        note_latest(vm, &finished.outcome, finished.finished_at);
+    }
+
+    /// Rebuilds the error card + divider of a finished run reported by Core
+    /// after the fact (`HistoryLoaded.runs`, R-1), placed after the run's
+    /// last message in the page (`anchor` ordinal) or, without one, after its
+    /// assistant message / at the end. Idempotent: a run already finished in
+    /// memory is left alone; no announcement (it is history).
     pub fn restore_finished_run(&mut self, run: Run) {
+        self.restore_run_at(run, None);
+    }
+
+    fn restore_run_at(&mut self, run: Run, anchor: Option<u64>) {
         let Some(outcome) = run.outcome.clone() else {
             return;
         };
@@ -196,11 +247,10 @@ impl AppState {
         };
         self.run_sessions
             .insert(run.id.clone(), run.session_id.clone());
-        if vm.runs.get(&run.id).is_some_and(|r| r.phase.is_terminal())
-            || vm
-                .timeline
-                .iter()
-                .any(|i| matches!(i, TimelineItem::RunDivider { run_id, .. } if run_id == &run.id))
+        if vm
+            .runs
+            .get(&run.id)
+            .is_some_and(|r| matches!(r.phase, RunPhase::Finished(_)))
         {
             return;
         }
@@ -213,40 +263,16 @@ impl AppState {
             message.streaming = false;
             message.stopped = matches!(outcome, RunOutcome::Cancelled { .. });
         }
-        let mut items = Vec::new();
-        let failure = crate::outcome::failure_of(&outcome);
-        if let Some(failure) = &failure {
-            items.push(TimelineItem::Error(ErrorVm {
-                run_id: run.id.clone(),
-                kind: failure.category,
-                retry_at_ms: failure
-                    .retry_after_ms
-                    .filter(|ms| *ms > crate::outcome::LONG_RETRY_AFTER_MS)
-                    .map(|ms| finished_at + ms),
-                failure: failure.clone(),
-            }));
-        }
-        items.push(TimelineItem::RunDivider {
-            run_id: run.id.clone(),
-            outcome: outcome.clone(),
-        });
-        // After the run's assistant message when it is loaded, else at the end.
-        let at = vm
-            .timeline
-            .iter()
-            .rposition(|i| matches!(i, TimelineItem::Assistant(m) if m.run_id == run.id))
-            .map_or(vm.timeline.len(), |i| i + 1);
-        vm.timeline.splice(at..at, items);
-        // Sidebar status follows the newest finished run.
-        let newest = vm
-            .runs
-            .values()
-            .filter(|r| r.phase.is_terminal())
-            .all(|r| r.finished_at_ms.unwrap_or(0) <= finished_at);
-        if newest {
-            vm.last_error = failure.as_ref().map(|f| f.category);
-            vm.last_error_source = failure.and_then(|f| f.source);
-            vm.last_outcome = Some(outcome);
+        place_outcome(vm, &run.id, &outcome, finished_at, anchor);
+        // `Session.last_finished_run` (R-1) is authoritative for the sidebar:
+        // an older run restored while paging back never takes it over.
+        let is_latest = vm
+            .session
+            .last_finished_run
+            .as_ref()
+            .is_none_or(|f| f.run == run.id);
+        if is_latest {
+            note_latest(vm, &outcome, finished_at);
         }
     }
 
@@ -257,7 +283,14 @@ impl AppState {
         session: SessionId,
         messages: Vec<Message>,
         next_before: Option<u64>,
+        runs: Vec<Run>,
     ) {
+        // Each run's last message in this page anchors its card / divider.
+        let mut anchors: BTreeMap<RunId, u64> = BTreeMap::new();
+        for m in &messages {
+            let e = anchors.entry(m.run_id.clone()).or_insert(m.ordinal);
+            *e = (*e).max(m.ordinal);
+        }
         let Some(vm) = self.sessions.get_mut(&session) else {
             return;
         };
@@ -302,6 +335,13 @@ impl AppState {
                 Some(_) => HistoryState::HasMore,
                 None => HistoryState::Complete,
             };
+        }
+        // R-1: outcomes of the page's runs (older failures too when paging).
+        for run in runs {
+            if run.session_id == session && run.outcome.is_some() {
+                let anchor = anchors.get(&run.id).copied();
+                self.restore_run_at(run, anchor);
+            }
         }
     }
 }
@@ -396,4 +436,66 @@ pub(crate) fn merge_messages(vm: &mut SessionVm, mut messages: Vec<Message>) {
             });
         vm.timeline.insert(position, item);
     }
+}
+
+/// Error card (failures) + divider for `run`, unless its divider exists.
+fn place_outcome(
+    vm: &mut SessionVm,
+    run: &RunId,
+    outcome: &RunOutcome,
+    finished_at: u64,
+    anchor: Option<u64>,
+) {
+    if vm
+        .timeline
+        .iter()
+        .any(|i| matches!(i, TimelineItem::RunDivider { run_id, .. } if run_id == run))
+    {
+        return;
+    }
+    let mut items = Vec::new();
+    if let Some(failure) = crate::outcome::failure_of(outcome) {
+        items.push(TimelineItem::Error(ErrorVm {
+            run_id: run.clone(),
+            kind: failure.category,
+            retry_at_ms: failure
+                .retry_after_ms
+                .filter(|ms| *ms > crate::outcome::LONG_RETRY_AFTER_MS)
+                .map(|ms| finished_at + ms),
+            failure,
+        }));
+    }
+    items.push(TimelineItem::RunDivider {
+        run_id: run.clone(),
+        outcome: outcome.clone(),
+    });
+    let after_anchor = anchor.and_then(|ordinal| {
+        vm.timeline
+            .iter()
+            .rposition(|i| item_ordinal(i) == Some(ordinal))
+    });
+    let after_assistant = || {
+        vm.timeline
+            .iter()
+            .rposition(|i| matches!(i, TimelineItem::Assistant(m) if &m.run_id == run))
+    };
+    let at = after_anchor
+        .or_else(after_assistant)
+        .map_or(vm.timeline.len(), |i| i + 1);
+    vm.timeline.splice(at..at, items);
+}
+
+/// Sidebar status follows the newest finished run we know of.
+fn note_latest(vm: &mut SessionVm, outcome: &RunOutcome, finished_at: u64) {
+    let newer = vm.runs.values().any(|r| {
+        matches!(r.phase, RunPhase::Finished(_))
+            && r.finished_at_ms.is_some_and(|t| t > finished_at)
+    });
+    if newer {
+        return;
+    }
+    let failure = crate::outcome::failure_of(outcome);
+    vm.last_error = failure.as_ref().map(|f| f.category);
+    vm.last_error_source = failure.and_then(|f| f.source);
+    vm.last_outcome = Some(outcome.clone());
 }

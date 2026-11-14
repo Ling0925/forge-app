@@ -532,7 +532,8 @@ impl AppState {
                 session,
                 messages,
                 next_before,
-            } => self.on_history_loaded(session, messages, next_before),
+                runs,
+            } => self.on_history_loaded(session, messages, next_before, runs),
             Event::SettingsUpdated { settings } => self.load_settings(settings),
             Event::ProviderKeyConfigured {
                 provider,
@@ -558,29 +559,19 @@ impl AppState {
             } => self.on_key_tested(provider, ok, error_kind),
             Event::SessionCreated { session } => {
                 let id = session.id.clone();
-                match self.sessions.get_mut(&id) {
-                    Some(vm) => vm.session = session,
-                    None => {
-                        let mut vm = SessionVm::new(session);
-                        // A session we just created is empty and fully loaded.
-                        vm.history = HistoryState::Complete;
-                        self.sessions.insert(id.clone(), vm);
-                    }
+                if !self.sessions.contains_key(&id) {
+                    let mut vm = SessionVm::new(session.clone());
+                    // A session we just created is empty and fully loaded.
+                    vm.history = HistoryState::Complete;
+                    self.sessions.insert(id.clone(), vm);
                 }
+                self.adopt_session(session);
                 if self.pending_create > 0 {
                     self.pending_create -= 1;
                     self.selected_session = Some(id);
                 }
             }
-            Event::SessionUpdated { session } => {
-                let id = session.id.clone();
-                match self.sessions.get_mut(&id) {
-                    Some(vm) => vm.session = session,
-                    None => {
-                        self.sessions.insert(id.clone(), SessionVm::new(session));
-                    }
-                }
-            }
+            Event::SessionUpdated { session } => self.adopt_session(session),
             Event::SessionArchived { session, archived } => {
                 // Pick the neighbour while the row is still in the visible order.
                 if archived && self.selected_session.as_ref() == Some(&session) {
