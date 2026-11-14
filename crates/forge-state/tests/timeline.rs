@@ -67,6 +67,8 @@ fn single_turn_flow() {
             reasoning: String::new(),
             streaming: false,
             stopped: false,
+            reasoning_started_ms: None,
+            reasoning_ms: None,
         })
     );
     assert_eq!(
@@ -195,7 +197,8 @@ fn ui_msg_01_generation_reset_leaves_only_final_text() {
         RunPhase::Retrying {
             attempt: 2,
             delay_ms: 2_000,
-            reason: "503".into()
+            reason: "503".into(),
+            next_at_ms: app.now_ms() + 2_000,
         }
     );
     feed(
@@ -298,10 +301,14 @@ fn failed_run_adds_error_item_with_kind() {
         ],
     );
     let s = app.selected().unwrap();
+    let mut failure = FailureVm::new(ErrorKind::Auth);
+    failure.retryable = false;
     assert!(s.timeline.contains(&TimelineItem::Error(ErrorVm {
         run_id: "r1".into(),
         kind: ErrorKind::Auth,
         detail: Some("auth".into()),
+        failure,
+        retry_at_ms: None,
     })));
     let announcements: Vec<_> = app.take_announcements();
     let last = announcements.last().unwrap();

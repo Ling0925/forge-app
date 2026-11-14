@@ -6,17 +6,23 @@
 mod app;
 pub mod i18n;
 pub mod ids;
+pub mod layout;
 mod onboarding;
+pub mod outcome;
 mod palette;
 mod quit;
 mod session;
 mod settings;
 mod sidebar;
+mod timeline;
 
 pub use app::*;
+pub use layout::*;
 pub use onboarding::*;
+pub use outcome::*;
 pub use palette::*;
 pub use quit::*;
 pub use session::*;
 pub use settings::*;
 pub use sidebar::*;
+pub use timeline::*;

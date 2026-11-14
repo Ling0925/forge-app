@@ -338,7 +338,7 @@ fn palette_hides_unavailable_actions_and_filters() {
     assert_eq!(labels(&app), vec!["显示/隐藏侧栏".to_owned()]);
     assert_eq!(app.palette_execute(), PaletteEffect::None);
     assert!(!app.palette.open);
-    assert!(!app.sidebar_visible);
+    assert!(!app.ui.sidebar_visible);
 }
 
 #[test]
