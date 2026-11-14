@@ -274,9 +274,13 @@ impl ForgeApp {
                 .update(cx, |input, cx| input.set_value(draft, window, cx));
         }
         // §6.9: placeholder follows the state (no key → "先在设置里添加 API Key").
-        let placeholder = match self.state.composer_mode() {
-            ComposerMode::Disabled(DisabledReason::NoKey) => t("composer.no_key"),
-            _ => t("composer.placeholder.idle"),
+        // No key wins even before a session exists (fresh install, §6.3).
+        let no_key = !self.state.has_api_key()
+            || self.state.composer_mode() == ComposerMode::Disabled(DisabledReason::NoKey);
+        let placeholder = if no_key {
+            t("composer.no_key")
+        } else {
+            t("composer.placeholder.idle")
         };
         if self.placeholder != placeholder {
             self.placeholder = placeholder;
