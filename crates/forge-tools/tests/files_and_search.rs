@@ -1338,7 +1338,7 @@ mod symlinks {
                 if let Ok(entries) = run(&tool, "d".into()).await {
                     escaped = entries
                         .iter()
-                        .any(|entry| entry.path != PathBuf::from("d/inside.txt"));
+                        .any(|entry| entry.path != Path::new("d/inside.txt"));
                 }
             }
             stop.store(true, Ordering::Relaxed);
