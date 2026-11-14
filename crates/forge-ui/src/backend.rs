@@ -181,3 +181,31 @@ impl Backend for OfflineBackend {
         Box::pin(async { None })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_protocol::PermissionMode;
+
+    #[test]
+    fn initial_settings_picks_default_model_and_providers() {
+        let settings = initial_settings();
+        assert_eq!(
+            settings.model,
+            forge_protocol::ModelSelection {
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+            }
+        );
+        assert_eq!(settings.permission_mode, PermissionMode::Ask);
+        let ids: Vec<&str> = settings
+            .providers
+            .iter()
+            .map(|provider| provider.id.0.as_str())
+            .collect();
+        assert_eq!(ids, ["openai", "anthropic"]);
+        // Anthropic requires max_output_tokens; OpenAI does not.
+        assert_eq!(settings.providers[0].max_output_tokens, None);
+        assert_eq!(settings.providers[1].max_output_tokens, Some(8_192));
+    }
+}

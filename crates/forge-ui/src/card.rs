@@ -222,3 +222,55 @@ impl ItemCard {
             .into_any_element()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokens::{DARK, LIGHT, contrast};
+
+    #[test]
+    fn every_tone_pairs_a_foreground_with_its_tint() {
+        // Every (fg, bg) pair is listed in §3.1 (fg2/subtle, info/infoBg,
+        // success/successBg, warning/warningBg, danger/dangerBg) at ≥4.5:1.
+        for palette in [&LIGHT, &DARK] {
+            for tone in [
+                Tone::Neutral,
+                Tone::Info,
+                Tone::Success,
+                Tone::Warning,
+                Tone::Danger,
+            ] {
+                let (fg, bg, _) = tone.colors(palette);
+                assert!(
+                    contrast(fg, bg) >= 4.5,
+                    "{tone:?}: {fg:#x} on {bg:#x} = {:.2}",
+                    contrast(fg, bg)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tones_map_to_expected_tokens() {
+        assert_eq!(
+            Tone::Neutral.colors(&LIGHT),
+            (LIGHT.fg2, LIGHT.subtle, LIGHT.border)
+        );
+        assert_eq!(
+            Tone::Info.colors(&LIGHT),
+            (LIGHT.info, LIGHT.info_bg, LIGHT.border)
+        );
+        assert_eq!(
+            Tone::Success.colors(&DARK),
+            (DARK.success, DARK.success_bg, DARK.border)
+        );
+        assert_eq!(
+            Tone::Warning.colors(&DARK),
+            (DARK.warning, DARK.warning_bg, DARK.warning)
+        );
+        assert_eq!(
+            Tone::Danger.colors(&DARK),
+            (DARK.danger, DARK.danger_bg, DARK.danger)
+        );
+    }
+}

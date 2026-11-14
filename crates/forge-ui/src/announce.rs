@@ -110,3 +110,40 @@ pub fn increase_contrast() -> bool {
         forced
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ns_priority_maps_to_appkit_levels() {
+        assert_eq!(ns_priority(AnnouncementPriority::Low), 10);
+        assert_eq!(ns_priority(AnnouncementPriority::Medium), 50);
+        assert_eq!(ns_priority(AnnouncementPriority::High), 90);
+    }
+
+    #[test]
+    fn recording_announcer_captures_text_and_priority() {
+        let announcer = RecordingAnnouncer::default();
+        announcer.announce("已停止", AnnouncementPriority::High);
+        announcer.announce("开始运行", AnnouncementPriority::Medium);
+        let spoken = announcer.spoken.borrow();
+        assert_eq!(
+            spoken.as_slice(),
+            [
+                ("已停止".to_owned(), AnnouncementPriority::High),
+                ("开始运行".to_owned(), AnnouncementPriority::Medium),
+            ]
+        );
+    }
+
+    #[test]
+    fn noop_announcer_accepts_everything() {
+        NoopAnnouncer.announce("任意文本", AnnouncementPriority::Low);
+    }
+
+    #[test]
+    fn platform_announcer_is_constructible() {
+        let _announcer = platform();
+    }
+}

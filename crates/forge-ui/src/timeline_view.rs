@@ -4,7 +4,7 @@
 use crate::card::{ItemCard, Tone};
 use crate::tokens::Palette;
 use crate::view::ForgeApp;
-use forge_state::i18n::t;
+use forge_state::i18n::{t, tf};
 use forge_state::{
     DividerIcon, ErrorAction, ErrorCardKind, ErrorCardVm, RetryButtonState, TimelineRowVm,
 };
@@ -99,7 +99,10 @@ pub fn render_row(row: &TimelineRowVm, app: &WeakEntity<ForgeApp>, cx: &mut App)
                             h_flex()
                                 .id(SharedString::from(format!("reasoning-{}", run_id.0)))
                                 .role(Role::Button)
-                                .aria_label(format!("{}，{}", t("a11y.reasoning"), reasoning.label))
+                                .aria_label(tf(
+                                    "a11y.reasoning.toggle",
+                                    &[("name", t("a11y.reasoning")), ("label", &reasoning.label)],
+                                ))
                                 .aria_expanded(reasoning.expanded)
                                 .gap_1()
                                 .cursor_pointer()
@@ -243,7 +246,10 @@ fn action_button(
     };
     // Visible "重试 ⌘R"; VoiceOver reads the plain label.
     let visible = match card.primary_shortcut.filter(|_| primary && !disabled) {
-        Some(shortcut) => format!("{label} {shortcut}"),
+        Some(shortcut) => tf(
+            "error.action.with_shortcut",
+            &[("label", &label), ("shortcut", shortcut)],
+        ),
         None => label.clone(),
     };
     let weak = app.clone();

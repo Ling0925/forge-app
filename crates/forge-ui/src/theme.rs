@@ -76,3 +76,57 @@ pub fn sync_appearance(window: Option<&mut Window>, cx: &mut App) {
         None => Theme::sync_system_appearance(window, cx),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokens::{DARK, LIGHT};
+
+    #[test]
+    fn bundled_json_declares_both_themes() {
+        let parsed: serde_json::Value = serde_json::from_str(THEME_JSON).unwrap();
+        let names: Vec<&str> = parsed["themes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|theme| theme["name"].as_str())
+            .collect();
+        assert_eq!(names, [LIGHT_NAME, DARK_NAME]);
+    }
+
+    #[test]
+    fn high_contrast_json_renames_and_restrengthens() {
+        let json = high_contrast_json();
+        assert!(json.contains(&format!("\"{LIGHT_HC_NAME}\"")));
+        assert!(json.contains(&format!("\"{DARK_HC_NAME}\"")));
+        assert!(!json.contains(&format!("\"{LIGHT_NAME}\"")));
+        assert!(!json.contains(&format!("\"{DARK_NAME}\"")));
+        // fg2/fg3 colours are gone: secondary text and hairlines move to the
+        // stronger fg / border_strong tokens.
+        for palette in [&LIGHT, &DARK] {
+            assert!(!json.contains(&format!("#{:06X}", palette.fg2)));
+            assert!(!json.contains(&format!("#{:06X}", palette.fg3)));
+            assert!(!json.contains(&format!("#{:06X}", palette.border)));
+            assert!(json.contains(&format!("#{:06X}", palette.fg)));
+            assert!(json.contains(&format!("#{:06X}", palette.border_strong)));
+        }
+        // Every secondary-text colour that moved is now fg: the fg hex count
+        // grows by the fg2 + fg3 occurrences.
+        let count = |src: &str, hex: u32| src.matches(&format!("#{hex:06X}")).count();
+        for palette in [&LIGHT, &DARK] {
+            let moved = count(THEME_JSON, palette.fg2) + count(THEME_JSON, palette.fg3);
+            assert_eq!(
+                count(&json, palette.fg),
+                count(THEME_JSON, palette.fg) + moved
+            );
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["themes"].as_array().unwrap().len(),
+            serde_json::from_str::<serde_json::Value>(THEME_JSON).unwrap()["themes"]
+                .as_array()
+                .unwrap()
+                .len()
+        );
+    }
+}
