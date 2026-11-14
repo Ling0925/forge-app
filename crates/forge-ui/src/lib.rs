@@ -8,7 +8,9 @@
 pub mod actions;
 pub mod announce;
 pub mod backend;
+pub mod clock;
 pub mod demo;
+pub mod style;
 pub mod theme;
 mod timeline_view;
 pub mod tokens;
@@ -68,7 +70,8 @@ pub fn open_main_window(
 pub fn open_demo_window(cx: &mut App, scene: demo::Scene) {
     open_with(cx, move |window, cx| {
         let mut app = ForgeApp::new(Rc::new(demo::DemoBackend), None, None, window, cx);
-        let now = demo::populate(&mut app.state, scene);
+        let base = clock::wall_now_ms().saturating_sub(100_000);
+        let now = demo::populate(&mut app.state, scene, base);
         app.set_clock_base(now);
         app.after_change(window, cx);
         app

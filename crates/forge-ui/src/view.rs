@@ -2,7 +2,7 @@
 
 use crate::actions::{
     COMPOSER_CONTEXT, CloseWindow, FocusComposer, Minimize, NewSession, NextSession, PrevSession,
-    Quit, ROOT_CONTEXT, Steer, StopRun, ToggleInspector, ToggleSidebar,
+    Quit, ROOT_CONTEXT, RetryLastRun, Steer, StopRun, ToggleInspector, ToggleSidebar,
 };
 use crate::announce::Announcer;
 use crate::backend::{Backend, EventReceiver, StartError};
@@ -140,6 +140,9 @@ impl ForgeApp {
                 .unwrap_or(true)
         });
 
+        state.set_utc_offset_ms(crate::clock::local_utc_offset_ms(
+            crate::clock::wall_now_ms(),
+        ));
         let focus = cx.focus_handle();
         let app = Self {
             state,
@@ -151,7 +154,7 @@ impl ForgeApp {
             rows_session: None,
             focus,
             started: Instant::now(),
-            clock_base_ms: 0,
+            clock_base_ms: crate::clock::wall_now_ms(),
             exiting: false,
             drag: None,
             _tasks: tasks,
@@ -427,6 +430,12 @@ impl ForgeApp {
 
     fn on_stop(&mut self, _: &StopRun, window: &mut Window, cx: &mut Context<Self>) {
         self.stop(window, cx);
+    }
+
+    fn on_retry_last(&mut self, _: &RetryLastRun, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.set_now_ms(self.now_ms());
+        self.state.retry_latest();
+        self.after_change(window, cx);
     }
 
     fn on_prev(&mut self, _: &PrevSession, window: &mut Window, cx: &mut Context<Self>) {
@@ -823,6 +832,7 @@ impl ForgeApp {
                 .child(t("onboarding.notify"))
                 .into_any_element(),
         };
+        let can_advance = self.state.onboarding_can_advance();
         let next_label = match vm.step {
             OnboardingStep::Welcome => t("onboarding.start"),
             OnboardingStep::Permissions => t("onboarding.done"),
@@ -870,16 +880,18 @@ impl ForgeApp {
                                             })),
                                     )
                                 })
-                                .child(
+                                .child(crate::style::disabled_readable(
                                     Button::new("onboarding-next")
                                         .label(next_label)
                                         .primary()
-                                        .disabled(!self.state.onboarding_can_advance())
+                                        .disabled(!can_advance)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.state.onboarding_next();
                                             this.after_change(window, cx);
                                         })),
-                                ),
+                                    !can_advance,
+                                    cx,
+                                )),
                         ),
                 )
                 .test_support()
@@ -935,6 +947,11 @@ impl ForgeApp {
             .state
             .selected()
             .and_then(|vm| vm.composer.error.clone());
+        let button_disabled = if busy {
+            mode == ComposerMode::Cancelling
+        } else {
+            !self.state.can_send()
+        };
         let button = if busy {
             Button::new("composer-stop")
                 .label(if mode == ComposerMode::Cancelling {
@@ -943,16 +960,16 @@ impl ForgeApp {
                     t("composer.stop")
                 })
                 .danger()
-                .disabled(mode == ComposerMode::Cancelling)
                 .tooltip("⌘.")
         } else {
             Button::new("composer-send")
                 .label(t("composer.send"))
                 .primary()
-                .disabled(!self.state.can_send())
                 .tooltip("↩")
         }
+        .disabled(button_disabled)
         .on_click(cx.listener(|this, _, window, cx| this.primary_button(window, cx)));
+        let button = crate::style::disabled_readable(button, button_disabled, cx);
 
         h_flex()
             .w_full()
@@ -1115,6 +1132,7 @@ impl Render for ForgeApp {
             .on_action(cx.listener(Self::on_new_session))
             .on_action(cx.listener(Self::on_focus_composer))
             .on_action(cx.listener(Self::on_stop))
+            .on_action(cx.listener(Self::on_retry_last))
             .on_action(cx.listener(Self::on_prev))
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_quit))

@@ -225,6 +225,7 @@ fn action_button(
     action: ErrorAction,
     primary: bool,
     app: &WeakEntity<ForgeApp>,
+    cx: &App,
 ) -> Button {
     let id = SharedString::from(format!(
         "error-{}-{}",
@@ -239,28 +240,35 @@ fn action_button(
         ErrorAction::Details if card.details_open => (t("error.details.hide").to_owned(), false),
         _ => (t(action.label_key()).to_owned(), false),
     };
+    // Visible "重试 ⌘R"; VoiceOver reads the plain label.
+    let visible = match card.primary_shortcut.filter(|_| primary && !disabled) {
+        Some(shortcut) => format!("{label} {shortcut}"),
+        None => label.clone(),
+    };
     let weak = app.clone();
     let run = card.run_id.clone();
     let button = Button::new(id)
-        .label(label)
+        .label(visible)
+        .accessibility_label(label)
         .small()
         .disabled(disabled)
         .on_click(move |_, window, cx| {
             weak.update(cx, |this, cx| this.error_action(&run, action, window, cx))
                 .ok();
         });
-    if primary {
+    let button = if primary {
         button.primary()
     } else {
         button.outline()
-    }
+    };
+    crate::style::disabled_readable(button, disabled, cx)
 }
 
 fn render_error_card(
     card: &ErrorCardVm,
     palette: &Palette,
     app: &WeakEntity<ForgeApp>,
-    _cx: &mut App,
+    cx: &mut App,
 ) -> AnyElement {
     let icon = match card.kind {
         ErrorCardKind::Interrupted | ErrorCardKind::RateLimitedWait => IconName::TriangleAlert,
@@ -299,8 +307,8 @@ fn render_error_card(
             h_flex()
                 .pl_6()
                 .gap_2()
-                .child(action_button(card, card.primary, true, app))
-                .child(action_button(card, card.secondary, false, app)),
+                .child(action_button(card, card.primary, true, app, cx))
+                .child(action_button(card, card.secondary, false, app, cx)),
         )
         .when(card.details_open, |el| {
             el.child(

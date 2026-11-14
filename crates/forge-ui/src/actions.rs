@@ -9,6 +9,7 @@ gpui_kit::actions!(
     [
         ToggleSidebar,
         ToggleInspector,
+        RetryLastRun,
         NewSession,
         FocusComposer,
         StopRun,
@@ -37,6 +38,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-n", NewSession, None),
         KeyBinding::new("cmd-l", FocusComposer, None),
         KeyBinding::new("cmd-.", StopRun, None),
+        KeyBinding::new("cmd-r", RetryLastRun, None),
         KeyBinding::new("cmd-[", PrevSession, None),
         KeyBinding::new("cmd-]", NextSession, None),
         KeyBinding::new("cmd-q", Quit, None),
@@ -78,6 +80,7 @@ pub fn menus() -> Vec<Menu> {
         Menu::new(t("menu.session")).items([
             MenuItem::action(t("menu.session.focus_composer"), FocusComposer),
             MenuItem::action(t("menu.session.stop"), StopRun),
+            MenuItem::action(t("menu.session.retry"), RetryLastRun),
             MenuItem::separator(),
             MenuItem::action(t("menu.session.prev"), PrevSession),
             MenuItem::action(t("menu.session.next"), NextSession),
