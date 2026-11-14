@@ -26,8 +26,10 @@ pub enum Scene {
     Empty,
     /// Two finished runs: Markdown, reasoning (one expanded), run dividers.
     Conversation,
-    /// Rate-limited failure with a retry countdown plus an earlier auth error.
+    /// Rate-limited failure (Retry-After 100 s) with its countdown.
     Error,
+    /// Run whose result could not be written (unknown + storage → 保存失败).
+    Storage,
 }
 
 impl Scene {
@@ -42,6 +44,7 @@ impl Scene {
             "nokey" => Some(Scene::NoKey),
             "conversation" | "timeline" => Some(Scene::Conversation),
             "error" => Some(Scene::Error),
+            "storage" => Some(Scene::Storage),
             _ => None,
         }
     }
@@ -52,6 +55,8 @@ struct Feeder<'a> {
     /// Wall-clock origin (UTC ms); scene times are offsets from it.
     base: u64,
     now: u64,
+    /// `input_id` of the last composer send (Core echoes it in `RunStarted`).
+    last_input: InputId,
 }
 
 impl Feeder<'_> {
@@ -78,17 +83,57 @@ impl Feeder<'_> {
     fn send(&mut self, text: &str) -> &mut Self {
         self.app.set_draft(text);
         self.app.composer_key(ComposerKey::Enter);
-        self.accept_all();
+        for out in self.app.take_outbox() {
+            if let Command::Send { input_id, .. } = &out.command {
+                self.last_input = input_id.clone();
+            }
+            self.app
+                .apply_result(out.token, CommandResult::Accepted { id: "demo".into() });
+        }
         self
+    }
+
+    /// `RunStarted` for `run` (stamped with the scene clock) answering the
+    /// last send, then `SessionUpdated` like Core.
+    fn start(&mut self, run_id: &str, session_id: &str, title: &str) -> &mut Self {
+        let input_id = std::mem::replace(&mut self.last_input, InputId::from("demo-in"));
+        let mut r = run(run_id, session_id);
+        r.started_at = self.now;
+        self.event(Event::RunStarted { run: r, input_id });
+        let mut s = session(session_id, title, self.now);
+        s.state = SessionState::Running;
+        self.event(Event::SessionUpdated { session: s })
+    }
+
+    fn finish(
+        &mut self,
+        run_id: &str,
+        session_id: &str,
+        title: &str,
+        outcome: RunOutcome,
+    ) -> &mut Self {
+        self.event(Event::RunFinished {
+            run: run_id.into(),
+            outcome,
+        });
+        let s = session(session_id, title, self.now);
+        self.event(Event::SessionUpdated { session: s })
+    }
+
+    fn create(&mut self, id: &str, title: &str) -> &mut Self {
+        let s = session(id, title, self.now);
+        self.event(Event::SessionCreated { session: s })
     }
 }
 
-fn settings(with_key: bool) -> Settings {
+fn settings() -> Settings {
     Settings {
+        ui_prefs: Default::default(),
         providers: vec![ProviderSettings {
             id: "openai".into(),
             endpoint: None,
-            keychain_reference: with_key.then(|| "forge-app.openai".to_owned()),
+            keychain_reference: None,
+            max_output_tokens: None,
         }],
         model: ModelSelection {
             provider: "openai".into(),
@@ -98,7 +143,7 @@ fn settings(with_key: bool) -> Settings {
     }
 }
 
-fn session(id: &str, title: &str) -> Session {
+fn session(id: &str, title: &str, at: u64) -> Session {
     Session {
         id: id.into(),
         workspace_id: "ws".into(),
@@ -111,6 +156,8 @@ fn session(id: &str, title: &str) -> Session {
         state: SessionState::Idle,
         archived: false,
         queue_state: QueueState::Active,
+        created_at: at,
+        updated_at: at,
     }
 }
 
@@ -120,7 +167,9 @@ fn run(id: &str, session: &str) -> Run {
         session_id: session.into(),
         queue_item_id: None,
         state: RunState::Running,
-        terminal_reason: None,
+        outcome: None,
+        started_at: 0,
+        finished_at: None,
         usage: Usage {
             input_tokens: 0,
             output_tokens: 0,
@@ -163,11 +212,19 @@ fn reasoning(run: &str, text: &str) -> Event {
     }
 }
 
-fn finished(run: &str, outcome: RunOutcome, reason: Option<&str>) -> Event {
-    Event::RunFinished {
-        run: run.into(),
-        outcome,
-        reason: reason.map(Into::into),
+fn failure(
+    kind: RunErrorKind,
+    status: Option<u16>,
+    retry_after_ms: Option<u64>,
+    retryable: bool,
+    message: &str,
+) -> RunOutcome {
+    RunOutcome::Failed {
+        kind,
+        message: message.into(),
+        http_status: status,
+        retry_after_ms,
+        retryable,
     }
 }
 
@@ -194,10 +251,16 @@ pub fn populate(app: &mut AppState, scene: Scene, base: u64) -> u64 {
         app,
         base,
         now: base,
+        last_input: InputId::from("demo-in"),
     };
     f.at(1_000);
-    f.app
-        .load_settings(settings(!matches!(scene, Scene::Onboarding | Scene::NoKey)));
+    f.app.load_settings(settings());
+    // P1: whether a key exists comes only from Core (`key_configured`).
+    let with_key = !matches!(scene, Scene::Onboarding | Scene::NoKey);
+    f.event(Event::ProviderKeyConfigured {
+        provider: "openai".into(),
+        configured: with_key,
+    });
     f.event(Event::WorkspaceAdded {
         workspace: Workspace {
             id: "ws".into(),
@@ -215,43 +278,35 @@ pub fn populate(app: &mut AppState, scene: Scene, base: u64) -> u64 {
     // Sidebar spread: 3 days ago (过去 7 天), yesterday with a failed run,
     // one still running (进行中), and the selected one today.
     const HOUR: i64 = 3_600_000;
-    f.at(-74 * HOUR).event(Event::SessionCreated {
-        session: session("s-old", "整理 README 目录"),
-    });
-    f.at(-26 * HOUR).event(Event::SessionCreated {
-        session: session("s-ci", "排查构建失败"),
-    });
-    f.event(Event::RunStarted {
-        run: run("r-ci", "s-ci"),
-    });
-    f.at(-26 * HOUR + 40_000).event(finished(
+    f.at(-74 * HOUR).create("s-old", "整理 README 目录");
+    f.at(-26 * HOUR).create("s-ci", "排查构建失败");
+    f.start("r-ci", "s-ci", "排查构建失败");
+    f.at(-26 * HOUR + 40_000).finish(
         "r-ci",
-        RunOutcome::Failed,
-        Some("network: connection reset"),
-    ));
-    f.at(-2 * HOUR).event(Event::SessionCreated {
-        session: session("s-docs", "更新 CHANGELOG"),
-    });
-    f.at(-42_000).event(Event::SessionCreated {
-        session: session("s-run", "跑一遍 clippy 并修警告"),
-    });
-    f.event(Event::RunStarted {
-        run: run("r-run", "s-run"),
-    });
-    f.at(1_000).event(Event::SessionCreated {
-        session: session("s1", "解释这个项目的结构"),
-    });
+        "s-ci",
+        "排查构建失败",
+        failure(RunErrorKind::Network, None, None, true, "connection reset"),
+    );
+    f.at(-2 * HOUR).create("s-docs", "更新 CHANGELOG");
+    f.at(-42_000).create("s-run", "跑一遍 clippy 并修警告");
+    f.start("r-run", "s-run", "跑一遍 clippy 并修警告");
+    const T1: &str = "解释这个项目的结构";
+    f.at(1_000).create("s1", T1);
     f.app.select_session(&"s1".into());
     f.accept_all();
+    // The demo has no Core: the (empty) first history page arrives at once.
+    f.event(Event::HistoryLoaded {
+        session: "s1".into(),
+        messages: vec![],
+        next_before: None,
+    });
     if scene == Scene::Empty {
         return f.now;
     }
 
     // Run 1: reasoning (collapsed) + Markdown answer, success.
     f.at(10_000).send("解释一下这个项目的结构，入口在哪？");
-    f.event(Event::RunStarted {
-        run: run("r1", "s1"),
-    });
+    f.start("r1", "s1", T1);
     f.at(11_000).event(reasoning(
         "r1",
         "先看 Cargo workspace 的成员，再找带 main 的 crate。",
@@ -263,47 +318,53 @@ pub fn populate(app: &mut AppState, scene: Scene, base: u64) -> u64 {
         .event(delta("r1", head))
         .event(delta("r1", tail));
     f.event(usage("r1", 12_340, 860, 0.0213));
-    f.at(57_000)
-        .event(finished("r1", RunOutcome::Succeeded, None));
+    f.at(57_000).finish("r1", "s1", T1, RunOutcome::Succeeded);
 
     // Run 2: reasoning expanded, success.
     f.at(70_000).send("侧栏宽度能拖动吗？给个实现顺序。");
-    f.event(Event::RunStarted {
-        run: run("r2", "s1"),
-    });
+    f.start("r2", "s1", T1);
     f.at(71_000).event(reasoning(
         "r2",
         "规格 §4：默认 240pt，范围 200–360，低于 160 折叠，双击恢复，命中区 8pt。",
     ));
     f.at(75_000).event(delta("r2", ANSWER_2));
     f.event(usage("r2", 13_020, 410, 0.0108));
-    f.at(83_000)
-        .event(finished("r2", RunOutcome::Succeeded, None));
+    f.at(83_000).finish("r2", "s1", T1, RunOutcome::Succeeded);
     f.app.toggle_reasoning(&"r2".into());
 
     if scene == Scene::Conversation {
         return f.now;
     }
 
-    // Run 3: rate limited with Retry-After 100 s (> 60 s, R7a) → error card + countdown.
     f.at(90_000).send("再把错误卡片也做了吧。");
-    f.event(Event::RunStarted {
-        run: run("r3", "s1"),
-    });
-    f.at(91_000).event(Event::ProviderRetrying {
-        run: "r3".into(),
-        n: 1,
-        delay_ms: 2_000,
-        reason: "rate_limited".into(),
-    });
-    f.at(98_000).event(finished(
-        "r3",
-        RunOutcome::Failed,
-        Some(
-            "rate_limited http_status=429 retry_after_ms=100000 retryable=true: \
-             Rate limit reached for gpt-5 (org-demo). Authorization: Bearer sk-demo1234567890abcdef",
-        ),
-    ));
+    f.start("r3", "s1", T1);
+    let outcome = if scene == Scene::Storage {
+        failure(
+            RunErrorKind::Unknown {
+                source: UnknownSource::Storage,
+            },
+            None,
+            None,
+            false,
+            "database is locked (SQLITE_BUSY) while saving message",
+        )
+    } else {
+        // Rate limited with Retry-After 100 s (> 60 s, R7a) → wait card + countdown.
+        f.at(91_000).event(Event::ProviderRetrying {
+            run: "r3".into(),
+            n: 1,
+            delay_ms: 2_000,
+            reason: "rate_limited".into(),
+        });
+        failure(
+            RunErrorKind::RateLimited,
+            Some(429),
+            Some(100_000),
+            true,
+            "Rate limit reached for gpt-5 (org-demo).\nAuthorization: Bearer sk-demo1234567890abcdef",
+        )
+    };
+    f.at(98_000).finish("r3", "s1", T1, outcome);
     f.app
         .error_action(&"r3".into(), forge_state::ErrorAction::Details);
     f.now

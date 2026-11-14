@@ -2,24 +2,24 @@
 
 use crate::actions::{
     COMPOSER_CONTEXT, CloseWindow, FocusComposer, InspectorChanges, InspectorOutput,
-    InspectorQueue, Minimize, NewSession, NextSession, PrevSession, Quit, ROOT_CONTEXT,
-    RetryLastRun, Steer, StopRun, ToggleInspector, ToggleSidebar,
+    InspectorQueue, Minimize, NewSession, NextSession, OpenSettings, PrevSession, Quit,
+    ROOT_CONTEXT, RetryLastRun, Steer, StopRun, ToggleInspector, ToggleSidebar,
 };
 use crate::announce::Announcer;
 use crate::backend::{Backend, EventReceiver, StartError};
 use crate::timeline_view::render_row;
 use crate::tokens::Palette;
-use forge_protocol::{EventEnvelope, RunId, SessionId};
+use forge_protocol::{EventEnvelope, ProviderId, RunId, SessionId};
 use forge_state::i18n::{t, tf};
 use forge_state::{
     AppState, BootState, ComposerKey, ComposerMode, DisabledReason, ErrorAction, ErrorEffect,
-    KeyOutcome, OnboardingStep, PanelLayout, QuitDecision, SessionRowVm, SidebarGroup,
-    SidebarResize, SidebarVm, StatusIcon, TimelineRowVm,
+    HistoryState, KeyOutcome, KeyStatus, OnboardingStep, PanelLayout, QuitDecision, SessionRowVm,
+    SidebarGroup, SidebarResize, SidebarVm, StatusIcon, TimelineRowVm,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -32,8 +32,12 @@ use gpui_kit::{
     px, rgb,
 };
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+/// Providers shown in the settings panel (Core's `HttpProviderFactory` set).
+const PROVIDERS: [(&str, &str); 2] = [("openai", "OpenAI"), ("anthropic", "Anthropic")];
 
 /// Sidebar divider hit area (§4 "命中区 8pt").
 const DIVIDER_HIT: f32 = 8.0;
@@ -59,6 +63,11 @@ pub struct ForgeApp {
     placeholder: &'static str,
     /// Inspector tab: 0 改动, 1 队列, 2 工具输出 (UI-only).
     inspector_tab: usize,
+    /// Settings panel key fields (masked), one per provider.
+    key_inputs: Vec<(ProviderId, Entity<InputState>)>,
+    /// `ui_prefs` as last loaded or sent; a change is persisted once the
+    /// drag ends (sidebar width / visibility, inspector).
+    persisted_prefs: Option<BTreeMap<String, String>>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -96,8 +105,31 @@ impl ForgeApp {
                 .submit_on_enter(true)
         });
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
+        let key_inputs = PROVIDERS
+            .iter()
+            .map(|(id, _)| {
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .masked(true)
+                        .placeholder(t("settings.key.placeholder"))
+                });
+                (ProviderId::from(*id), input)
+            })
+            .collect();
         let subscriptions = vec![
             cx.subscribe_in(&composer, window, Self::on_composer_event),
+            // Scrolled to the top of the timeline → next older history page.
+            cx.observe_in(&scroller, window, |this, scroller, window, cx| {
+                let at_top = scroller.read(cx).logical_scroll_top().item_ix == 0;
+                let has_more = this
+                    .state
+                    .selected()
+                    .is_some_and(|vm| vm.history == HistoryState::HasMore);
+                if at_top && has_more && !this.rows.borrow().is_empty() {
+                    this.state.load_older();
+                    this.after_change(window, cx);
+                }
+            }),
             cx.observe_window_appearance(window, |_, window, cx| {
                 crate::theme::sync_appearance(Some(window), cx);
             }),
@@ -114,6 +146,11 @@ impl ForgeApp {
             None => state.boot = BootState::Ready,
         }
 
+        // P1 boot: ask Core for the snapshot (sessions, settings, key flags,
+        // active runs); events below the snapshot's last_seq are dropped.
+        if events.is_some() && state.boot == BootState::Ready {
+            state.request_snapshot();
+        }
         let mut tasks = Vec::new();
         if let Some(mut events) = events {
             tasks.push(cx.spawn_in(window, async move |this, cx| {
@@ -149,7 +186,7 @@ impl ForgeApp {
             crate::clock::wall_now_ms(),
         ));
         let focus = cx.focus_handle();
-        let app = Self {
+        let mut app = Self {
             state,
             backend,
             announcer,
@@ -164,10 +201,13 @@ impl ForgeApp {
             drag: None,
             placeholder: t("composer.placeholder.idle"),
             inspector_tab: 0,
+            key_inputs,
+            persisted_prefs: None,
             _tasks: tasks,
             _subscriptions: subscriptions,
         };
         app.composer.read(cx).focus_handle(cx).focus(window, cx);
+        app.after_change(window, cx);
         app
     }
 
@@ -213,6 +253,7 @@ impl ForgeApp {
     /// Ships queued commands, routes announcements, mirrors the draft and the
     /// timeline into their gpui entities, exits if the quit flow finished.
     pub fn after_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.persist_prefs_if_changed();
         for outgoing in self.state.take_outbox() {
             let token = outgoing.token;
             let future = self.backend.execute(outgoing.command);
@@ -242,6 +283,32 @@ impl ForgeApp {
         cx.notify();
     }
 
+    /// `ui_prefs` go to Core through `UpdateSettings` once synced, never
+    /// mid-drag, and only when they differ from what Core last stored (and
+    /// from what was last sent, while Core's `SettingsUpdated` is pending).
+    fn persist_prefs_if_changed(&mut self) {
+        if !self.state.synced || self.drag.is_some() {
+            return;
+        }
+        let Some(settings) = self.state.settings.settings.as_ref() else {
+            return;
+        };
+        let normalize = |map: &BTreeMap<String, String>| {
+            let mut ui = forge_state::UiPrefs::default();
+            ui.apply_map(map);
+            let mut out = BTreeMap::new();
+            ui.write_map(&mut out);
+            out
+        };
+        let stored = normalize(&settings.ui_prefs);
+        let mut current = BTreeMap::new();
+        self.state.ui.write_map(&mut current);
+        if current != stored && self.persisted_prefs.as_ref() != Some(&current) {
+            self.persisted_prefs = Some(current);
+            self.state.persist_ui_prefs();
+        }
+    }
+
     fn sync_timeline(&mut self, cx: &mut Context<Self>) {
         let rows = self.state.timeline_rows();
         let session = self.state.selected_session.clone();
@@ -249,11 +316,20 @@ impl ForgeApp {
         let changed = *self.rows.borrow() != rows;
         let new_len = rows.len();
         let same_session = session == self.rows_session;
+        // An older history page lands at the top: the previous first row
+        // reappears `added` rows down. Prepend so the viewport stays put.
+        let prepended = same_session && new_len > old_len && old_len > 0 && {
+            let old = self.rows.borrow();
+            let added = new_len - old_len;
+            rows.get(added) == old.first() && rows.first() != old.first()
+        };
         *self.rows.borrow_mut() = rows;
         self.rows_session = session;
         self.scroller.update(cx, |scroller, cx| {
             if !same_session || new_len < old_len {
                 scroller.reset(new_len, cx);
+            } else if prepended {
+                scroller.prepend(new_len - old_len, cx);
             } else if new_len > old_len {
                 scroller.append(new_len - old_len, cx);
             }
@@ -396,8 +472,7 @@ impl ForgeApp {
             ErrorEffect::OpenInspectorChanges(_) => {
                 self.state.ui.inspector_visible = true;
             }
-            // The settings window lands with §6.13 UI; nothing to open yet.
-            ErrorEffect::OpenSettings => {}
+            ErrorEffect::OpenSettings => self.state.open_settings(),
         }
         self.after_change(window, cx);
     }
@@ -440,6 +515,50 @@ impl ForgeApp {
     fn show_inspector_tab(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.inspector_tab = tab;
         self.state.ui.inspector_visible = true;
+        self.after_change(window, cx);
+    }
+
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.open_settings();
+        self.after_change(window, cx);
+        if let Some((_, input)) = self.key_inputs.first() {
+            input.read(cx).focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.close_settings();
+        for (_, input) in &self.key_inputs {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.after_change(window, cx);
+        self.composer.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    /// "保存": the key goes to Core (`SetProviderKey`) and the field is
+    /// cleared at once; the UI never keeps it. `ProviderKeyConfigured`
+    /// flips the status.
+    fn save_key(
+        &mut self,
+        index: usize,
+        remove: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((provider, input)) = self.key_inputs.get(index).cloned() else {
+            return;
+        };
+        let key = if remove {
+            None
+        } else {
+            let value = input.read(cx).value().to_string();
+            if value.trim().is_empty() {
+                return;
+            }
+            Some(value)
+        };
+        input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.state.set_provider_key(provider, key);
         self.after_change(window, cx);
     }
 
@@ -836,7 +955,10 @@ impl ForgeApp {
                         Button::new("no-key-settings")
                             .label(t("composer.open_settings"))
                             .small()
-                            .outline(),
+                            .outline()
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
+                            ),
                     )
                     .test_support(),
             );
@@ -1039,32 +1161,58 @@ impl ForgeApp {
         } else {
             !self.state.can_send()
         };
-        // §6.9: "发送 ↩" (accent / onAccent) or "停止 ⌘." (dangerBtn outline).
-        let button = if busy {
+        // §6.9 + 2026-11-14 D1: "停止 ⌘." = transparent fill, `danger` text and
+        // 1pt `danger` border (light #C01F17, dark #FF7A70), `dangerBg` on
+        // hover; never `dangerBtn` (2.55:1 on dark). "发送 ↩" = accent / onAccent.
+        let button: AnyElement = if busy {
             let stopping = mode == ComposerMode::Cancelling;
-            Button::new("composer-stop")
-                .label(if stopping {
-                    t("composer.stopping")
-                } else {
-                    t("composer.stop_key")
-                })
-                .accessibility_label(if stopping {
+            let label = if stopping {
+                t("composer.stopping")
+            } else {
+                t("composer.stop_key")
+            };
+            div()
+                .id("composer-stop")
+                .role(Role::Button)
+                .aria_label(if stopping {
                     t("composer.stopping")
                 } else {
                     t("composer.stop")
                 })
-                .danger()
-                .outline()
+                .h(px(24.))
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .border_1()
+                .text_sm()
+                .when(stopping, |el| {
+                    el.border_color(rgb(palette.subtle))
+                        .bg(rgb(palette.subtle))
+                        .text_color(rgb(palette.fg3))
+                })
+                .when(!stopping, |el| {
+                    el.border_color(rgb(palette.danger))
+                        .text_color(rgb(palette.danger))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(palette.danger_bg)))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.primary_button(window, cx)),
+                        )
+                })
+                .child(label)
+                .test_support()
+                .into_any_element()
         } else {
-            Button::new("composer-send")
+            let button = Button::new("composer-send")
                 .label(t("composer.send_key"))
                 .accessibility_label(t("composer.send"))
                 .primary()
-        }
-        .small()
-        .disabled(button_disabled)
-        .on_click(cx.listener(|this, _, window, cx| this.primary_button(window, cx)));
-        let button = crate::style::disabled_readable(button, button_disabled, cx);
+                .small()
+                .disabled(button_disabled)
+                .on_click(cx.listener(|this, _, window, cx| this.primary_button(window, cx)));
+            crate::style::disabled_readable(button, button_disabled, cx).into_any_element()
+        };
 
         let focused = !disabled && self.composer.read(cx).focus_handle(cx).is_focused(window);
         let workspace = self
@@ -1148,7 +1296,10 @@ impl ForgeApp {
                     Button::new("composer-open-settings")
                         .label(t("composer.open_settings"))
                         .link()
-                        .xsmall(),
+                        .xsmall()
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
+                        ),
                 )
                 .into_any_element()
         } else {
@@ -1239,6 +1390,8 @@ impl ForgeApp {
                                 Tab::new()
                                     .label(t(key))
                                     .aria_label(format!("{}，{keys}", t(key)))
+                                    // 2026-11-14: shortcut as a Kbd-style chip in fg3.
+                                    .suffix(crate::style::kbd(keys, &palette))
                             }))
                             .on_click(cx.listener(|this, ix: &usize, window, cx| {
                                 this.show_inspector_tab(*ix, window, cx)
@@ -1259,24 +1412,212 @@ impl ForgeApp {
             .into_any_element()
     }
 
+    /// §6.12: a store that cannot be opened (Runtime::new / Store::open
+    /// failed) replaces the whole window: title, path + error code, and
+    /// 打开日志目录 / 在 Finder 中显示 / 退出.
     fn render_storage_error(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let BootState::StorageError { path, .. } = &self.state.boot else {
+        let BootState::StorageError { path, code } = &self.state.boot else {
             return None;
         };
         let theme = cx.theme().clone();
         let palette = *Palette::for_dark(theme.is_dark());
+        let reveal = path.clone();
+        let logs = path.join("logs");
         Some(
             v_flex()
                 .id("storage-error")
                 .role(Role::Alert)
-                .m_4()
-                .p_4()
-                .gap_1()
-                .rounded(px(8.))
-                .bg(rgb(palette.danger_bg))
+                .aria_label(t("storage.title"))
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .bg(theme.background)
                 .text_color(rgb(palette.fg))
-                .child(t("storage.title"))
-                .child(div().text_xs().child(path.display().to_string()))
+                .child(
+                    Icon::new(IconName::TriangleAlert)
+                        .size(px(32.))
+                        .text_color(rgb(palette.danger)),
+                )
+                .child(
+                    div()
+                        .text_size(px(22.))
+                        .line_height(px(28.))
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .child(t("storage.title")),
+                )
+                .child(
+                    div()
+                        .id("storage-error-detail")
+                        .max_w(px(520.))
+                        .text_sm()
+                        .text_color(rgb(palette.fg2))
+                        .child(tf(
+                            "storage.detail",
+                            &[("path", &path.display().to_string()), ("code", code)],
+                        ))
+                        .test_support(),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .pt_2()
+                        .child(
+                            Button::new("storage-logs")
+                                .label(t("storage.action.logs"))
+                                .outline()
+                                .on_click(move |_, _, cx| cx.reveal_path(&logs)),
+                        )
+                        .child(
+                            Button::new("storage-reveal")
+                                .label(t("storage.action.reveal"))
+                                .outline()
+                                .on_click(move |_, _, cx| cx.reveal_path(&reveal)),
+                        )
+                        .child(
+                            Button::new("storage-quit")
+                                .label(t("storage.action.quit"))
+                                .primary()
+                                .on_click(|_, _, cx| cx.quit()),
+                        ),
+                )
+                .test_support()
+                .into_any_element(),
+        )
+    }
+
+    /// "模型与 Key" (§6.13, P1 subset) as an in-window panel: one row per
+    /// provider with Core's `key_configured` status, a masked key field,
+    /// 保存 / 移除. Opened by ⌘,, "打开设置" on error cards and the no-key notice.
+    fn render_settings(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.state.settings.open {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let palette = *Palette::for_dark(theme.is_dark());
+        let mut rows = v_flex().gap_3();
+        for (index, ((id, name), (provider, input))) in
+            PROVIDERS.iter().zip(self.key_inputs.iter()).enumerate()
+        {
+            let configured = self.state.settings.has_key_for(provider);
+            let status = match self.state.settings.key_status.get(provider) {
+                Some(KeyStatus::SavedUnverified) => t("settings.key.status.saved").to_owned(),
+                Some(KeyStatus::Testing) => t("settings.key.status.testing").to_owned(),
+                Some(KeyStatus::Verified) => t("settings.key.status.verified").to_owned(),
+                Some(KeyStatus::Failed { message, .. }) => tf(
+                    "settings.key.status.failed",
+                    &[("reason", message.as_deref().unwrap_or(""))],
+                ),
+                _ if configured => t("settings.key.status.saved").to_owned(),
+                _ => t("settings.key.status.unconfigured").to_owned(),
+            };
+            rows = rows.child(
+                v_flex()
+                    .id(SharedString::from(format!("settings-key-{id}")))
+                    .role(Role::Group)
+                    .aria_label(format!("{name}，{status}"))
+                    .gap_1p5()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .child(*name),
+                            )
+                            .child(div().text_sm().text_color(rgb(palette.fg2)).child(status)),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().flex_1().child(Input::new(input).small()))
+                            .child(
+                                Button::new(SharedString::from(format!("settings-save-{id}")))
+                                    .label(t("settings.key.save"))
+                                    .primary()
+                                    .small()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.save_key(index, false, window, cx)
+                                    })),
+                            )
+                            .when(configured, |row| {
+                                row.child(
+                                    Button::new(SharedString::from(format!(
+                                        "settings-remove-{id}"
+                                    )))
+                                    .label(t("settings.key.remove"))
+                                    .outline()
+                                    .small()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.save_key(index, true, window, cx)
+                                    })),
+                                )
+                            }),
+                    )
+                    .test_support(),
+            );
+        }
+        let error = self.state.settings.error.clone();
+        Some(
+            div()
+                .id("settings-overlay")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui_kit::black().opacity(0.25))
+                .child(
+                    v_flex()
+                        .id("settings")
+                        .role(Role::Dialog)
+                        .aria_label(t("settings.page.keys"))
+                        .w(px(520.))
+                        .p_5()
+                        .gap_4()
+                        .rounded(px(12.))
+                        .bg(rgb(palette.surface))
+                        .border_1()
+                        .border_color(rgb(palette.border))
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .child(
+                                    div()
+                                        .text_size(px(17.))
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                        .child(t("settings.page.keys")),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    Button::new("settings-close")
+                                        .label(t("settings.close"))
+                                        .ghost()
+                                        .small()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_settings(window, cx)
+                                        })),
+                                ),
+                        )
+                        .child(rows)
+                        .when_some(error, |col, error| {
+                            col.child(
+                                div()
+                                    .id("settings-error")
+                                    .role(Role::Alert)
+                                    .text_sm()
+                                    .text_color(rgb(palette.danger))
+                                    .child(error),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(palette.fg2))
+                                .child(t("settings.key.note")),
+                        )
+                        .test_support(),
+                )
                 .into_any_element(),
         )
     }
@@ -1304,7 +1645,17 @@ impl Render for ForgeApp {
             PanelLayout::Overlay { width } => Some(self.render_inspector(width, true, cx)),
             PanelLayout::Hidden => None,
         };
-        let storage = self.render_storage_error(cx);
+        if let Some(page) = self.render_storage_error(cx) {
+            return div()
+                .id("forge-root")
+                .key_context(ROOT_CONTEXT)
+                .track_focus(&self.focus)
+                .on_action(cx.listener(Self::on_quit))
+                .size_full()
+                .child(page)
+                .into_any_element();
+        }
+        let settings = self.render_settings(cx);
         let header = self.render_header(cx);
         let timeline = self.render_timeline(cx);
         let composer = self.render_composer(window, cx);
@@ -1330,6 +1681,9 @@ impl Render for ForgeApp {
                 this.show_inspector_tab(2, window, cx)
             }))
             .on_action(cx.listener(Self::on_new_session))
+            .on_action(
+                cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
+            )
             .on_action(cx.listener(Self::on_focus_composer))
             .on_action(cx.listener(Self::on_stop))
             .on_action(cx.listener(Self::on_retry_last))
@@ -1341,7 +1695,12 @@ impl Render for ForgeApp {
             .on_mouse_move(cx.listener(Self::on_root_mouse_move))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| this.drag = None),
+                cx.listener(|this, _, window, cx| {
+                    // Drag ended: persist the new width (ui_prefs).
+                    if this.drag.take().is_some() {
+                        this.after_change(window, cx);
+                    }
+                }),
             )
             .relative()
             .size_full()
@@ -1357,11 +1716,12 @@ impl Render for ForgeApp {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .children(storage)
                     .children(header)
                     .child(timeline)
                     .child(composer),
             )
             .children(inspector)
+            .children(settings)
+            .into_any_element()
     }
 }

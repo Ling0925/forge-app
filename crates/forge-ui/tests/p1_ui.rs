@@ -44,7 +44,9 @@ fn run(id: &str) -> Run {
         session_id: "s1".into(),
         queue_item_id: None,
         state: RunState::Running,
-        terminal_reason: None,
+        outcome: None,
+        started_at: 0,
+        finished_at: None,
         usage: Usage {
             input_tokens: 0,
             output_tokens: 0,
@@ -99,16 +101,23 @@ impl Fixture {
                 providers: vec![ProviderSettings {
                     id: "openai".into(),
                     endpoint: None,
-                    keychain_reference: Some("forge-app.openai".into()),
+                    keychain_reference: None,
+                    max_output_tokens: None,
                 }],
                 model: model(),
                 permission_mode: PermissionMode::Ask,
+                ui_prefs: Default::default(),
             });
             let workspace = Workspace {
                 id: "ws".into(),
                 root: "/tmp/ws".into(),
                 name: "ws".into(),
             };
+            let key = Event::ProviderKeyConfigured {
+                provider: "openai".into(),
+                configured: true,
+            };
+            fixture_event(app, key, window, cx);
             fixture_event(app, Event::WorkspaceAdded { workspace }, window, cx);
             let session = Session {
                 id: "s1".into(),
@@ -119,6 +128,8 @@ impl Fixture {
                 state: SessionState::Idle,
                 archived: false,
                 queue_state: QueueState::Active,
+                created_at: 0,
+                updated_at: 0,
             };
             fixture_event(app, Event::SessionCreated { session }, window, cx);
             app.state.select_session(&"s1".into());
@@ -159,7 +170,8 @@ impl Fixture {
         cx.run_until_parked();
     }
 
-    /// Sends "hi" through the composer state and starts run `id`.
+    /// Sends "hi" through the composer state and starts run `id` (Core
+    /// echoes the send's `input_id` in `RunStarted`).
     fn start_run(&self, cx: &mut TestAppContext, id: &str) {
         self.update(cx, |app, window, cx| {
             app.state.set_draft("hi");
@@ -167,16 +179,63 @@ impl Fixture {
             app.after_change(window, cx);
         });
         cx.run_until_parked();
-        self.events(cx, vec![Event::RunStarted { run: run(id) }]);
+        let input_id = self
+            .backend
+            .take()
+            .into_iter()
+            .find_map(|c| match c {
+                Command::Send { input_id, .. } => Some(input_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| "in-x".into());
+        self.events(
+            cx,
+            vec![Event::RunStarted {
+                run: run(id),
+                input_id,
+            }],
+        );
     }
 
-    fn fail(&self, cx: &mut TestAppContext, id: &str, reason: &str) {
+    /// `"kind[ http_status=..][ retry_after_ms=..][: message]"` → P1 outcome.
+    fn fail(&self, cx: &mut TestAppContext, id: &str, spec: &str) {
+        let (head, message) = spec.split_once(": ").unwrap_or((spec, ""));
+        let mut parts = head.split_whitespace();
+        let kind = match parts.next().unwrap_or("") {
+            "network" => RunErrorKind::Network,
+            "rate_limited" => RunErrorKind::RateLimited,
+            "auth" => RunErrorKind::Auth,
+            "quota" => RunErrorKind::Quota,
+            "server" => RunErrorKind::Server,
+            "context_too_long" => RunErrorKind::ContextTooLong,
+            "interrupted" => RunErrorKind::Interrupted,
+            "storage" => RunErrorKind::Unknown {
+                source: UnknownSource::Storage,
+            },
+            _ => RunErrorKind::Unknown {
+                source: UnknownSource::Provider,
+            },
+        };
+        let (mut http_status, mut retry_after_ms) = (None, None);
+        for part in parts {
+            match part.split_once('=') {
+                Some(("http_status", v)) => http_status = v.parse().ok(),
+                Some(("retry_after_ms", v)) => retry_after_ms = v.parse().ok(),
+                _ => {}
+            }
+        }
+        let retryable = !matches!(kind, RunErrorKind::Auth | RunErrorKind::Quota);
         self.events(
             cx,
             vec![Event::RunFinished {
                 run: id.into(),
-                outcome: RunOutcome::Failed,
-                reason: Some(reason.into()),
+                outcome: RunOutcome::Failed {
+                    kind,
+                    message: message.into(),
+                    http_status,
+                    retry_after_ms,
+                    retryable,
+                },
             }],
         );
     }
@@ -279,7 +338,6 @@ fn timeline_renders_rows_and_reasoning_toggles(cx: &mut TestAppContext) {
             Event::RunFinished {
                 run: "r1".into(),
                 outcome: RunOutcome::Succeeded,
-                reason: None,
             },
         ],
     );
@@ -458,13 +516,11 @@ fn composer_toolbar_and_stop_button(cx: &mut TestAppContext) {
 fn no_key_shows_banner_and_settings_link(cx: &mut TestAppContext) {
     let f = Fixture::new(cx, 1280.);
     f.update(cx, |app, window, cx| {
-        app.state.load_settings(Settings {
-            providers: vec![],
-            model: model(),
-            permission_mode: PermissionMode::Ask,
-        });
-        app.state.settings.key_status.clear();
-        app.after_change(window, cx);
+        let key = Event::ProviderKeyConfigured {
+            provider: "openai".into(),
+            configured: false,
+        };
+        fixture_event(app, key, window, cx);
     });
     f.with_window(cx, |window, cx| {
         window.render_frame(cx);
@@ -527,4 +583,106 @@ fn inspector_tabs_switch_with_alt_cmd_digits(cx: &mut TestAppContext) {
             Some("没有排队的消息")
         );
     });
+}
+
+#[gpui_kit::test]
+fn open_settings_from_error_card_and_save_key(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.start_run(cx, "r1");
+    f.fail(
+        cx,
+        "r1",
+        "auth http_status=401: invalid api key: please check settings",
+    );
+    f.backend.take();
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("settings").is_none());
+        window.click("error-r1-primary", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("settings").is_some(),
+            "打开设置 opens the panel"
+        );
+        assert!(window.try_find("settings-key-openai").is_some());
+        assert!(window.try_find("settings-key-anthropic").is_some());
+    });
+    // Typing a key and pressing 保存 sends SetProviderKey; the field clears.
+    f.update(cx, |app, window, cx| {
+        app.state
+            .set_provider_key("openai".into(), Some("sk-new-key".into()));
+        app.after_change(window, cx);
+    });
+    cx.run_until_parked();
+    assert!(f.backend.take().iter().any(|c| matches!(
+        c,
+        Command::SetProviderKey { provider, key: Some(k) } if provider.0 == "openai" && k == "sk-new-key"
+    )));
+    f.with_window(cx, |window, cx| {
+        window.click("settings-close", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("settings").is_none());
+        window.press("cmd-,", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("settings").is_some(), "⌘, opens settings");
+    });
+}
+
+#[gpui_kit::test]
+fn storage_error_replaces_the_window(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.update(cx, |app, window, cx| {
+        app.state.boot = forge_state::BootState::StorageError {
+            code: "storage_unavailable".into(),
+            path: "/data/forge-app".into(),
+        };
+        app.after_change(window, cx);
+    });
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("storage-error").is_some());
+        assert!(window.try_find("sidebar").is_none(), "§6.12: whole window");
+        assert!(window.try_find("composer").is_none());
+        assert!(window.try_find("storage-reveal").is_some());
+        assert!(window.try_find("storage-logs").is_some());
+        assert!(window.try_find("storage-quit").is_some());
+        let detail = window.find("storage-error-detail");
+        let text = format!("{:?}", detail.label());
+        let _ = text;
+    });
+}
+
+#[gpui_kit::test]
+fn wait_card_body_switches_when_countdown_ends(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.update(cx, |app, _, _| app.set_clock_base(10_000));
+    f.start_run(cx, "r1");
+    f.fail(
+        cx,
+        "r1",
+        "rate_limited http_status=429 retry_after_ms=90000: slow",
+    );
+    f.update(cx, |app, window, cx| {
+        let now = app.now_ms();
+        app.set_clock_base(now + 91_000);
+        app.tick(window, cx);
+        let card = app
+            .rows()
+            .into_iter()
+            .find_map(|r| match r {
+                forge_state::TimelineRowVm::Error(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(card.body, "现在可以重试了。");
+    });
+    let spoken = f.spoken.spoken.borrow().clone();
+    assert_eq!(
+        spoken
+            .iter()
+            .filter(|(text, _)| text == "现在可以重试")
+            .count(),
+        1,
+        "{spoken:?}"
+    );
 }

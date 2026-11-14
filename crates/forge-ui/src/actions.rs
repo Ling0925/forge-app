@@ -25,6 +25,7 @@ gpui_kit::actions!(
         ShowAll,
         Minimize,
         CloseWindow,
+        OpenSettings,
     ]
 );
 
@@ -42,6 +43,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-cmd-2", InspectorQueue, None),
         KeyBinding::new("alt-cmd-3", InspectorOutput, None),
         KeyBinding::new("cmd-n", NewSession, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-l", FocusComposer, None),
         KeyBinding::new("cmd-.", StopRun, None),
         KeyBinding::new("cmd-r", RetryLastRun, None),
@@ -59,6 +61,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
 pub fn menus() -> Vec<Menu> {
     vec![
         Menu::new("Forge").items([
+            MenuItem::action(t("menu.app.settings"), OpenSettings),
+            MenuItem::separator(),
             MenuItem::action(t("menu.app.hide"), Hide),
             MenuItem::action(t("menu.app.hide_others"), HideOthers),
             MenuItem::action(t("menu.app.show_all"), ShowAll),

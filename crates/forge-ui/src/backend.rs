@@ -45,23 +45,45 @@ pub fn data_dir() -> PathBuf {
     }
 }
 
-/// P0 has no provider wiring yet; every request fails as a configuration error.
-struct UnconfiguredProvider;
+/// First-run settings (Core writes them only when the store has none). Core
+/// ships no model names; the UI picks the defaults. Anthropic requires
+/// `max_output_tokens`.
+pub fn initial_settings() -> forge_protocol::Settings {
+    use forge_protocol::*;
+    Settings {
+        ui_prefs: Default::default(),
+        providers: vec![
+            ProviderSettings {
+                id: "openai".into(),
+                endpoint: None,
+                keychain_reference: None,
+                max_output_tokens: None,
+            },
+            ProviderSettings {
+                id: "anthropic".into(),
+                endpoint: None,
+                keychain_reference: None,
+                max_output_tokens: Some(8_192),
+            },
+        ],
+        model: ModelSelection {
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+        },
+        permission_mode: PermissionMode::Ask,
+    }
+}
 
-impl forge_provider::Provider for UnconfiguredProvider {
-    fn request(
-        &self,
-        _request: forge_provider::ProviderRequest,
-    ) -> forge_provider::ProviderFuture<
-        '_,
-        Result<Box<dyn forge_provider::ProviderStream>, forge_provider::ProviderError>,
-    > {
-        Box::pin(async {
-            Err(forge_provider::ProviderError {
-                kind: forge_provider::ErrorKind::Configuration,
-                message: "no provider configured".into(),
-            })
-        })
+/// macOS Keychain; elsewhere (dev/CI on Linux) an in-memory store — Core has
+/// no persistent `SecretStore` off macOS, so keys last for one launch there.
+fn secret_store() -> Arc<dyn forge_core::secrets::SecretStore> {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(forge_core::secrets::KeychainSecretStore)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(forge_core::secrets::MemorySecretStore::default())
     }
 }
 
@@ -93,8 +115,9 @@ impl CoreBackend {
                         return;
                     }
                 };
+                // HTTP providers need the IO driver as well as timers.
                 let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
+                    .enable_all()
                     .build();
                 let runtime = match runtime {
                     Ok(runtime) => runtime,
@@ -103,15 +126,26 @@ impl CoreBackend {
                         return;
                     }
                 };
-                // P0: the store does not expose its last event seq yet; start at 0.
-                let (mut core, handle) = forge_core::Runtime::new(
-                    forge_core::RuntimeServices {
-                        clock: Arc::new(forge_tools::clock::RealClock::default()),
-                        store,
-                        provider: Arc::new(UnconfiguredProvider),
-                    },
-                    0,
-                );
+                // Core resumes from the store's own last seq.
+                let started = runtime.block_on(async {
+                    forge_core::Runtime::new(
+                        forge_core::RuntimeServices {
+                            clock: Arc::new(forge_tools::clock::RealClock),
+                            store,
+                            providers: Arc::new(forge_provider::HttpProviderFactory),
+                            secrets: secret_store(),
+                            initial_settings: initial_settings(),
+                        },
+                        0,
+                    )
+                });
+                let (mut core, handle) = match started {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(fail("storage_unavailable", error.to_string())));
+                        return;
+                    }
+                };
                 let events = handle.subscribe();
                 if ready_tx.send(Ok((handle, events))).is_err() {
                     return;

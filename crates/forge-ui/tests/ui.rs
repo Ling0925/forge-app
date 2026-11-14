@@ -46,6 +46,8 @@ fn session(id: &str) -> Session {
         state: SessionState::Idle,
         archived: false,
         queue_state: QueueState::Active,
+        created_at: 0,
+        updated_at: 0,
     }
 }
 
@@ -55,7 +57,9 @@ fn run(id: &str, session: &str) -> Run {
         session_id: session.into(),
         queue_item_id: None,
         state: RunState::Running,
-        terminal_reason: None,
+        outcome: None,
+        started_at: 0,
+        finished_at: None,
         usage: Usage {
             input_tokens: 0,
             output_tokens: 0,
@@ -105,16 +109,23 @@ impl Fixture {
                 providers: vec![ProviderSettings {
                     id: "openai".into(),
                     endpoint: None,
-                    keychain_reference: Some("forge-app.openai".into()),
+                    keychain_reference: None,
+                    max_output_tokens: None,
                 }],
                 model: model(),
                 permission_mode: PermissionMode::Ask,
+                ui_prefs: Default::default(),
             });
             let workspace = Workspace {
                 id: "ws".into(),
                 root: "/tmp/ws".into(),
                 name: "ws".into(),
             };
+            let key = Event::ProviderKeyConfigured {
+                provider: "openai".into(),
+                configured: true,
+            };
+            app.apply_event(event(app, key), window, cx);
             app.apply_event(event(app, Event::WorkspaceAdded { workspace }), window, cx);
             for id in ["s1", "s2"] {
                 let created = Event::SessionCreated {
@@ -327,6 +338,7 @@ fn enter_while_a_run_is_busy_is_ignored_in_p1(cx: &mut TestAppContext) {
     fixture.update(cx, |app, window, cx| {
         let started = Event::RunStarted {
             run: run("r1", "s1"),
+            input_id: "in-x".into(),
         };
         app.apply_event(event(app, started), window, cx);
         assert_eq!(app.state.composer_mode(), ComposerMode::Running);
@@ -357,6 +369,7 @@ fn cmd_period_sends_cancel_run_once(cx: &mut TestAppContext) {
     fixture.update(cx, |app, window, cx| {
         let started = Event::RunStarted {
             run: run("r1", "s1"),
+            input_id: "in-x".into(),
         };
         app.apply_event(event(app, started), window, cx);
     });
@@ -396,6 +409,7 @@ fn quit_with_an_active_run_confirms_then_sends_shutdown(cx: &mut TestAppContext)
     fixture.update(cx, |app, window, cx| {
         let started = Event::RunStarted {
             run: run("r1", "s1"),
+            input_id: "in-x".into(),
         };
         app.apply_event(event(app, started), window, cx);
     });

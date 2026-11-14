@@ -61,3 +61,21 @@ fn high_contrast_variants_raise_secondary_text_and_borders() {
         assert_eq!(colors["primary.background"], hex(palette.accent), "{name}");
     }
 }
+
+/// 2026-11-14 D1: "停止 ⌘." uses `danger` for text (≥ 4.5:1) and its 1pt
+/// border (≥ 3:1) on the composer surface and window, both themes; also on
+/// its `dangerBg` hover fill. `dangerBtn` text on dark was 2.55:1.
+#[test]
+fn stop_button_danger_contrast() {
+    use forge_ui::tokens::contrast;
+    for p in [&LIGHT, &DARK] {
+        for bg in [p.surface, p.window, p.danger_bg] {
+            let c = contrast(p.danger, bg);
+            assert!(c >= 4.5, "danger on {bg:06X}: {c:.2}");
+        }
+    }
+    assert!(
+        contrast(DARK.danger_btn, DARK.surface) < 4.5,
+        "why dangerBtn is not used"
+    );
+}
