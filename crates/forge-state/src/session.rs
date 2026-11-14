@@ -238,6 +238,9 @@ pub struct SessionVm {
     /// Monotonic activity stamp (event seq) used to order the sidebar; the
     /// protocol `Session` has no `updated_at` yet.
     pub last_activity: u64,
+    /// Wall-clock time (UTC ms) of the last event seen for this session, if
+    /// any arrived since launch.
+    pub last_activity_ms: Option<u64>,
     /// UI-only disclosure state: reasoning (`run id`) and error details.
     pub expanded_reasoning: BTreeSet<RunId>,
     pub expanded_details: BTreeSet<RunId>,
@@ -261,6 +264,7 @@ impl SessionVm {
             last_outcome: None,
             last_error: None,
             last_activity: activity,
+            last_activity_ms: None,
             expanded_reasoning: BTreeSet::new(),
             expanded_details: BTreeSet::new(),
             accepted_inputs: VecDeque::new(),

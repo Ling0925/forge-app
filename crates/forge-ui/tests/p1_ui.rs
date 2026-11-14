@@ -471,3 +471,30 @@ fn no_key_shows_banner_and_settings_link(cx: &mut TestAppContext) {
         assert_eq!(window.find("composer-send").disabled(), Some(true));
     });
 }
+
+#[gpui_kit::test]
+fn sidebar_rows_are_48pt_and_groups_show_counts(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let row = window.find("session-s1");
+        assert_eq!(row.bounds().size.height, px(48.));
+        let group = ["Today", "Yesterday", "Week", "Older", "InProgress"]
+            .into_iter()
+            .find_map(|k| window.try_find(format!("group-{k}")))
+            .expect("s1 sits in a group");
+        let label = group.label().unwrap().to_string();
+        assert!(label.ends_with("个会话"), "{label}");
+        let n: usize = label
+            .rsplit('，')
+            .next()
+            .unwrap()
+            .trim_end_matches(" 个会话")
+            .parse()
+            .unwrap();
+        assert!(n >= 1);
+        // ⌘N hint sits inside the left-aligned 新会话 button.
+        let button = window.find("new-session");
+        assert_eq!(button.label(), Some("新会话"));
+    });
+}

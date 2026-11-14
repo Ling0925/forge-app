@@ -141,6 +141,8 @@ pub enum AnnouncementKind {
     Approval,
     Retrying,
     QueuePaused,
+    /// "需要处理" group count changed (UI-REF-03).
+    SidebarCount,
     Other,
 }
 
@@ -232,6 +234,8 @@ pub struct AppState {
     pub(crate) now_ms: u64,
     /// Local time zone offset from UTC (host supplies it; wall-clock texts).
     pub(crate) utc_offset_ms: i64,
+    /// Last "需要处理" count read out, so changes are announced once.
+    attention_count: usize,
     pub(crate) announcements: Vec<Announcement>,
     /// When each kind was last handed to the screen reader (merge window).
     pub(crate) announced_at: HashMap<AnnouncementKind, u64>,
@@ -276,6 +280,7 @@ impl AppState {
             now_ms: 0,
             announcements: Vec::new(),
             utc_offset_ms: 0,
+            attention_count: 0,
             announced_at: HashMap::new(),
             outbox: Vec::new(),
             pending: HashMap::new(),
@@ -430,6 +435,34 @@ impl AppState {
         }
         self.last_seq = envelope.seq;
         self.apply_event(envelope.event, envelope.seq);
+        // Wall-clock stamp for sessions this event touched (relative time and
+        // day buckets in the sidebar). TODO(core-p1): use `Session.updated_at`
+        // once the protocol carries it, so restored sessions get a time too.
+        let now = self.now_ms;
+        for vm in self.sessions.values_mut() {
+            if vm.last_activity == envelope.seq {
+                vm.last_activity_ms = Some(now);
+            }
+        }
+        self.announce_attention_count();
+    }
+
+    /// UI-REF-03: read out the new "需要处理" count when it changes.
+    fn announce_attention_count(&mut self) {
+        let count = self.sidebar().needs_attention.len();
+        if count == self.attention_count {
+            return;
+        }
+        self.attention_count = count;
+        let text = crate::sidebar::SidebarVm::group_label(
+            crate::sidebar::SidebarGroup::NeedsAttention,
+            count,
+        );
+        self.announce(
+            AnnouncementKind::SidebarCount,
+            AnnouncementPriority::Low,
+            text,
+        );
     }
 
     /// Host finished re-fetching after a seq gap.
