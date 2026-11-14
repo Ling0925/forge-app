@@ -49,13 +49,15 @@ impl Scene {
 
 struct Feeder<'a> {
     app: &'a mut AppState,
+    /// Wall-clock origin (UTC ms); scene times are offsets from it.
+    base: u64,
     now: u64,
 }
 
 impl Feeder<'_> {
-    fn at(&mut self, ms: u64) -> &mut Self {
-        self.now = ms;
-        self.app.set_now_ms(ms);
+    fn at(&mut self, offset_ms: i64) -> &mut Self {
+        self.now = (self.base as i64 + offset_ms) as u64;
+        self.app.set_now_ms(self.now);
         self
     }
 
@@ -185,9 +187,14 @@ const ANSWER_2: &str = "可以。建议按下面的顺序：\n\n\
 3. 视图层只读 `layout(width)` 的结果。\n\n\
 这样拖动逻辑可以单元测试，不依赖窗口。";
 
-/// Builds `scene` into `app`; returns the fake clock at the end.
-pub fn populate(app: &mut AppState, scene: Scene) -> u64 {
-    let mut f = Feeder { app, now: 0 };
+/// Builds `scene` into `app` with scene time 0 at `base` (UTC ms); returns
+/// the clock at the end (≈ `base` + 100 s).
+pub fn populate(app: &mut AppState, scene: Scene, base: u64) -> u64 {
+    let mut f = Feeder {
+        app,
+        base,
+        now: base,
+    };
     f.at(1_000);
     f.app
         .load_settings(settings(!matches!(scene, Scene::Onboarding | Scene::NoKey)));
@@ -258,7 +265,7 @@ pub fn populate(app: &mut AppState, scene: Scene) -> u64 {
         return f.now;
     }
 
-    // Run 3: rate limited with Retry-After 40 s → error card + countdown.
+    // Run 3: rate limited with Retry-After 100 s (> 60 s, R7a) → error card + countdown.
     f.at(90_000).send("再把错误卡片也做了吧。");
     f.event(Event::RunStarted {
         run: run("r3", "s1"),
@@ -273,7 +280,7 @@ pub fn populate(app: &mut AppState, scene: Scene) -> u64 {
         "r3",
         RunOutcome::Failed,
         Some(
-            "rate_limited http_status=429 retry_after_ms=40000 retryable=true: \
+            "rate_limited http_status=429 retry_after_ms=100000 retryable=true: \
              Rate limit reached for gpt-5 (org-demo). Authorization: Bearer sk-demo1234567890abcdef",
         ),
     ));

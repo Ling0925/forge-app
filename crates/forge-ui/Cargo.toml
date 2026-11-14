@@ -23,6 +23,11 @@ gpui-kit = "=0.9.1"
 gpui-kit = { version = "=0.9.1", features = ["test-support"] }
 serde_json.workspace = true
 
+# Local UTC offset (localtime_r) for wall-clock texts; already in Cargo.lock
+# through gpui/tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # VoiceOver announcement bridge + Increase Contrast (§8). Same versions gpui
 # already links on macOS (no new crates in Cargo.lock).
 [target.'cfg(target_os = "macos")'.dependencies]

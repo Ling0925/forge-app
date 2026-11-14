@@ -309,13 +309,13 @@ fn error_card_countdown_disables_retry_until_ready(cx: &mut TestAppContext) {
     f.fail(
         cx,
         "r1",
-        "rate_limited http_status=429 retry_after_ms=30000: slow",
+        "rate_limited http_status=429 retry_after_ms=90000: slow",
     );
     f.backend.take();
     f.with_window(cx, |window, cx| {
         window.render_frame(cx);
         let card = window.find("error-r1");
-        assert_eq!(card.label(), Some("运行失败：请求太频繁"));
+        assert_eq!(card.label(), Some("运行失败：服务要求等待"));
         let retry = window.find("error-r1-primary");
         assert_eq!(retry.disabled(), Some(true));
         assert!(
@@ -324,9 +324,10 @@ fn error_card_countdown_disables_retry_until_ready(cx: &mut TestAppContext) {
             retry.label()
         );
         window.click("error-r1-primary", cx);
+        window.press("cmd-r", cx);
     });
     cx.run_until_parked();
-    assert_eq!(f.retries(), 0, "disabled while waiting");
+    assert_eq!(f.retries(), 0, "disabled while waiting (click and ⌘R)");
 
     // Details toggle.
     f.with_window(cx, |window, cx| {
@@ -340,7 +341,7 @@ fn error_card_countdown_disables_retry_until_ready(cx: &mut TestAppContext) {
     // while in flight does nothing new.
     f.update(cx, |app, window, cx| {
         let now = app.now_ms();
-        app.set_clock_base(now + 31_000);
+        app.set_clock_base(now + 91_000);
         app.tick(window, cx);
     });
     f.with_window(cx, |window, cx| {
@@ -387,4 +388,33 @@ fn announcements_reach_the_platform_bridge(cx: &mut TestAppContext) {
     let before = spoken.len();
     f.update(cx, |app, window, cx| app.tick(window, cx));
     assert_eq!(f.spoken.spoken.borrow().len(), before);
+}
+
+#[gpui_kit::test]
+fn short_rate_limit_retries_at_once_with_cmd_r(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.start_run(cx, "r1");
+    f.fail(
+        cx,
+        "r1",
+        "rate_limited http_status=429 retry_after_ms=20000: slow",
+    );
+    f.backend.take();
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("error-r1").label(),
+            Some("运行失败：请求太频繁")
+        );
+        let retry = window.find("error-r1-primary");
+        assert_ne!(retry.disabled(), Some(true), "Retry-After <= 60 s: enabled");
+        assert_eq!(retry.label(), Some("重试"));
+        window.press("cmd-r", cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        f.retries(),
+        1,
+        "⌘R sends RetryRun for the latest failed run"
+    );
 }
