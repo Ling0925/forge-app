@@ -228,6 +228,7 @@ impl AppState {
                     now,
                     &provider,
                     vm.expanded_details.contains(&error.run_id),
+                    self.utc_offset_ms,
                 ))),
                 TimelineItem::RunDivider { run_id, outcome } => {
                     let run = vm.runs.get(run_id);
@@ -263,6 +264,17 @@ impl AppState {
                     key: format!("notice-{index}"),
                     text: notice.text.clone(),
                 }),
+            }
+        }
+        // ⌘R / ⌘N act on the latest run only: older cards drop the hint.
+        let last_error = rows
+            .iter()
+            .rposition(|r| matches!(r, TimelineRowVm::Error(_)));
+        for (i, row) in rows.iter_mut().enumerate() {
+            if let TimelineRowVm::Error(card) = row
+                && Some(i) != last_error
+            {
+                card.primary_shortcut = None;
             }
         }
         if let Some(run) = vm.running() {
@@ -352,6 +364,24 @@ impl AppState {
             }),
             _ => None,
         })
+    }
+
+    /// ⌘R: retry the selected session's latest run if it ended with an error
+    /// card (same gating as the card's button).
+    pub fn retry_latest(&mut self) -> Option<crate::app::CommandToken> {
+        let vm = self.selected()?;
+        let last_run = vm.timeline.iter().rev().find_map(|item| match item {
+            TimelineItem::RunDivider { run_id, .. } => Some(run_id.clone()),
+            _ => None,
+        })?;
+        let failed = vm
+            .timeline
+            .iter()
+            .any(|item| matches!(item, TimelineItem::Error(e) if e.run_id == last_run));
+        if !failed {
+            return None;
+        }
+        self.retry_run(&last_run)
     }
 
     /// `RetryRun` (R8). Blocked while Retry-After has not passed, while a run is

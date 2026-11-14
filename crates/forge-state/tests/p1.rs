@@ -555,3 +555,92 @@ fn layout_rules() {
     assert_eq!(l.sidebar, PanelLayout::Hidden);
     assert_eq!(l.main_width, 700.0);
 }
+
+#[test]
+fn short_retry_after_is_retryable_immediately() {
+    let mut app = failed_app("rate_limited http_status=429 retry_after_ms=30000: slow");
+    let c = card(&app);
+    assert_eq!(c.kind, ErrorCardKind::RateLimited);
+    assert_eq!(c.retry, RetryButtonState::Ready);
+    assert_eq!(c.retry_label, "重试");
+    assert_eq!(c.primary_shortcut, Some("⌘R"));
+    assert_eq!(c.body, "服务要求稍后再试。");
+    assert!(
+        app.retry_run(&"r1".into()).is_some(),
+        "no countdown at <= 60 s"
+    );
+}
+
+#[test]
+fn long_retry_after_shows_clock_time_and_countdown() {
+    let mut app = app_with_session();
+    app.set_utc_offset_ms(8 * 3_600_000);
+    // 2026-11-14 06:03:20 UTC = 14:03:20 local; Retry-After 100 s → 14:05.
+    let t0 = 1_794_636_200_000;
+    app.set_now_ms(t0 - 4_000);
+    send(&mut app, "hi");
+    start(&mut app, "r1");
+    app.set_now_ms(t0);
+    fail(
+        &mut app,
+        "r1",
+        "rate_limited http_status=429 retry_after_ms=100000: wait",
+    );
+    let c = card(&app);
+    assert_eq!(c.kind, ErrorCardKind::RateLimitedWait);
+    assert_eq!(c.title, "服务要求等待");
+    assert_eq!(c.body, "可在 14:05 后重试（还要 1 分 40 秒）。");
+    assert_eq!(c.retry_label, "重试（1 分 40 秒）");
+}
+
+#[test]
+fn details_drop_credential_header_lines() {
+    let app = failed_app(
+        "auth http_status=401: invalid key\nAuthorization: Bearer sk-live-SENTINEL\nx-api-key: SENTINEL2\nrequest id req_1",
+    );
+    let c = card(&app);
+    let all = c.details.join("\n");
+    for leaked in ["Authorization", "Bearer", "SENTINEL", "x-api-key"] {
+        assert!(!all.contains(leaked), "{leaked} in {all}");
+    }
+    assert!(all.contains("invalid key\nrequest id req_1"), "{all}");
+    assert_eq!(c.details.last().unwrap(), "已移除 2 行请求头");
+}
+
+#[test]
+fn cmd_r_retries_latest_failed_run_only() {
+    let mut app = failed_app("network");
+    let token = app.retry_latest().expect("latest run failed");
+    assert_eq!(
+        single_command(&mut app).command,
+        Command::RetryRun { run: "r1".into() }
+    );
+    app.apply_result(token, accepted());
+    // A later successful run: ⌘R does nothing and the old card loses its hint.
+    send(&mut app, "again");
+    start(&mut app, "r2");
+    feed(
+        &mut app,
+        [Event::RunFinished {
+            run: "r2".into(),
+            outcome: RunOutcome::Succeeded,
+            reason: None,
+        }],
+    );
+    app.take_outbox();
+    assert_eq!(app.retry_latest(), None);
+    assert!(app.take_outbox().is_empty());
+    // Two failures: only the newest card keeps "⌘R".
+    send(&mut app, "third");
+    start(&mut app, "r3");
+    fail(&mut app, "r3", "server");
+    let shortcuts: Vec<_> = app
+        .timeline_rows()
+        .into_iter()
+        .filter_map(|r| match r {
+            TimelineRowVm::Error(c) => Some(c.primary_shortcut),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shortcuts, vec![None, Some("⌘R")]);
+}
