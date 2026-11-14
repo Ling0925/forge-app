@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 pub const SEND_BEFORE_COMMIT: &str = "send.before_commit";
 pub const SEND_AFTER_COMMIT: &str = "send.after_commit";
@@ -11,23 +11,43 @@ pub struct InjectedCrash {
     pub point: String,
 }
 
+#[derive(Clone, Copy)]
+pub enum Action {
+    Panic,
+    Abort,
+}
+
 #[derive(Default, Clone)]
 pub struct Failpoints {
-    enabled: BTreeSet<String>,
+    enabled: BTreeMap<String, Action>,
 }
 
 impl Failpoints {
     pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
-            enabled: names.into_iter().map(Into::into).collect(),
+            enabled: names
+                .into_iter()
+                .map(|name| (name.into(), Action::Panic))
+                .collect(),
+        }
+    }
+
+    pub fn with_actions(points: impl IntoIterator<Item = (impl Into<String>, Action)>) -> Self {
+        Self {
+            enabled: points
+                .into_iter()
+                .map(|(name, action)| (name.into(), action))
+                .collect(),
         }
     }
 
     pub fn hit(&self, name: &str) {
-        if self.enabled.contains(name) {
-            std::panic::panic_any(InjectedCrash {
+        match self.enabled.get(name) {
+            Some(Action::Panic) => std::panic::panic_any(InjectedCrash {
                 point: name.to_owned(),
-            });
+            }),
+            Some(Action::Abort) => std::process::abort(),
+            None => {}
         }
     }
 }
