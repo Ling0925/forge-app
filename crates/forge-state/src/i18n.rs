@@ -80,6 +80,7 @@ pub static ZH_CN: &[(&str, &str)] = &[
         "上次异常退出。已检查 {s} 个会话：{r} 个运行被中断，{u} 条排队消息状态不确定。",
     ),
     ("banner.recovery.view", "查看"),
+    ("composer.attach", "添加附件（即将支持）"),
     ("composer.hint.idle", "↩ 发送 · ⇧↩ 换行"),
     ("composer.hint.running", "↩ 加入队列 · ⌥↩ 插话 · ⌘. 停止"),
     (
@@ -91,7 +92,9 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("composer.open_settings", "打开设置"),
     ("composer.placeholder.idle", "描述你要做的事…"),
     ("composer.send", "发送"),
+    ("composer.send_key", "发送 ↩"),
     ("composer.stop", "停止"),
+    ("composer.stop_key", "停止 ⌘."),
     ("composer.stopping", "正在停止…"),
     (
         "context.tooltip",
@@ -116,6 +119,7 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("empty.example.1", "解释这个项目的结构"),
     ("empty.example.2", "找出并修复一个失败的测试"),
     ("empty.example.3", "给最近的改动写说明"),
+    ("empty.no_key", "还没有添加 API Key"),
     ("empty.title", "想让 Forge 做什么？"),
     ("error.action.details", "详情"),
     ("error.action.new", "新会话"),
@@ -145,6 +149,11 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("error.rate_limited_wait.title", "服务要求等待"),
     ("error.server.body", "服务暂时不可用，已重试 5 次。"),
     ("error.server.title", "模型服务出错"),
+    (
+        "error.storage.body",
+        "运行结果没能写入本地数据，详情里有原因。",
+    ),
+    ("error.storage.title", "保存失败"),
     ("error.unknown.body", "原因见详情。"),
     ("error.unknown.title", "运行失败"),
     ("error_kind.auth", "认证错误"),
