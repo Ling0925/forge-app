@@ -283,6 +283,17 @@ mod tests {
     }
 
     #[test]
+    fn missing_parent_swapped_to_in_zone_symlink_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("root/other")).unwrap();
+        let root = WorkspaceRoot::new(directory.path().join("root")).unwrap();
+        let write = root.resolve_write(Path::new("a/new")).unwrap();
+        symlink("other", directory.path().join("root/a")).unwrap();
+        assert!(write.write(b"created", None).is_err());
+        assert!(!directory.path().join("root/other/new").exists());
+    }
+
+    #[test]
     fn final_symlink_swap_cannot_redirect_reads_or_atomic_replacement() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("root")).unwrap();
