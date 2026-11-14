@@ -35,7 +35,7 @@ pub enum Event {
     },
     ProviderKeyConfigured {
         provider: ProviderId,
-        configured: bool,
+        key_status: KeyStatus,
     },
     HistoryLoaded {
         session: SessionId,
@@ -104,6 +104,8 @@ pub enum Event {
     RunFinished {
         run: RunId,
         outcome: RunOutcome,
+        #[serde(default)]
+        finished_at: u64,
     },
     SteerApplied {
         run: RunId,

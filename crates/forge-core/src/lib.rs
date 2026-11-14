@@ -148,6 +148,7 @@ impl Runtime {
                 run: run.id.clone(),
                 input_id: self.services.store.run_input_id(&run.id)?,
                 outcome: outcome.clone(),
+                started_at: run.started_at,
                 finished_at: now,
             });
             let events = self.commit(
@@ -158,6 +159,7 @@ impl Runtime {
                     Event::RunFinished {
                         run: run.id.clone(),
                         outcome,
+                        finished_at: now,
                     },
                 ],
                 |tx| {
@@ -436,11 +438,15 @@ impl Runtime {
                     None => self.services.secrets.delete(&provider),
                 }
                 .map_err(|e| reject(RejectCode::Unavailable, &e.to_string()))?;
-                let configured = key.as_ref().is_some_and(|key| !key.is_empty());
+                let key_status = if key.as_ref().is_some_and(|key| !key.is_empty()) {
+                    KeyStatus::Configured
+                } else {
+                    KeyStatus::Missing
+                };
                 let events = self.commit(
                     vec![Event::ProviderKeyConfigured {
                         provider: provider.clone(),
-                        configured,
+                        key_status,
                     }],
                     |_| Ok(()),
                 )?;
@@ -480,17 +486,15 @@ impl Runtime {
                 let providers = settings
                     .providers
                     .iter()
-                    .map(|s| {
-                        self.services
-                            .secrets
-                            .get(&s.id)
-                            .map(|key| ProviderKeyStatus {
-                                provider: s.id.clone(),
-                                key_configured: key.is_some_and(|key| !key.is_empty()),
-                            })
+                    .map(|s| ProviderKeyStatus {
+                        provider: s.id.clone(),
+                        key_status: match self.services.secrets.get(&s.id) {
+                            Ok(Some(key)) if !key.is_empty() => KeyStatus::Configured,
+                            Ok(_) => KeyStatus::Missing,
+                            Err(_) => KeyStatus::Unavailable,
+                        },
                     })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| reject(RejectCode::Unavailable, &e.to_string()))?;
+                    .collect();
                 let event = Event::Snapshot {
                     sessions: self.services.store.sessions()?,
                     workspaces: self.services.store.workspaces()?,
@@ -804,6 +808,7 @@ impl Runtime {
                 run: run.id.clone(),
                 input_id: Some(running.active.input_id),
                 outcome: outcome.clone(),
+                started_at: run.started_at,
                 finished_at: now,
             });
             session
@@ -814,7 +819,11 @@ impl Runtime {
                 session: session.clone(),
             });
         }
-        events.push(Event::RunFinished { run: id, outcome });
+        events.push(Event::RunFinished {
+            run: id,
+            outcome,
+            finished_at: now,
+        });
         let envelopes = self.envelopes(events.clone());
         if self
             .commit(events, |tx| {
@@ -867,6 +876,7 @@ impl Runtime {
             run: run.id.clone(),
             input_id: Some(running.active.input_id.clone()),
             outcome: outcome.clone(),
+            started_at: run.started_at,
             finished_at: now,
         });
         let message = Message {
@@ -899,6 +909,7 @@ impl Runtime {
             Event::RunFinished {
                 run: id.clone(),
                 outcome,
+                finished_at: now,
             },
         ]);
         let tx = self.services.store.write()?;

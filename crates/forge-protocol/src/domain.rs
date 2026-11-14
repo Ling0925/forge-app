@@ -198,6 +198,8 @@ pub struct FinishedRun {
     pub run: RunId,
     pub input_id: Option<InputId>,
     pub outcome: RunOutcome,
+    #[serde(default)]
+    pub started_at: u64,
     pub finished_at: u64,
 }
 
@@ -376,7 +378,15 @@ pub struct Settings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderKeyStatus {
     pub provider: ProviderId,
-    pub key_configured: bool,
+    pub key_status: KeyStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStatus {
+    Configured,
+    Missing,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

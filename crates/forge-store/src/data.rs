@@ -111,7 +111,7 @@ impl Store {
     }
     fn last_finished_run(&self, id: &SessionId) -> Result<Option<FinishedRun>, StoreError> {
         Ok(self.connection.query_row(
-            "SELECT id, outcome_json, finished_at,
+            "SELECT id, outcome_json, started_at, finished_at,
                 (SELECT input_id FROM messages WHERE run_id=runs.id AND input_id IS NOT NULL ORDER BY ordinal LIMIT 1) AS input_id
              FROM runs WHERE session_id=? AND finished_at IS NOT NULL
              ORDER BY finished_at DESC, rowid DESC LIMIT 1",
@@ -120,6 +120,7 @@ impl Store {
                 run: RunId(row.get("id")?),
                 input_id: row.get::<_, Option<String>>("input_id")?.map(InputId),
                 outcome: json(row, "outcome_json")?,
+                started_at: row.get::<_, i64>("started_at")? as u64,
                 finished_at: row.get::<_, i64>("finished_at")? as u64,
             }),
         ).optional()?)

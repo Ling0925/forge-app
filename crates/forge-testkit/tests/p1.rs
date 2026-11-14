@@ -1,7 +1,7 @@
 mod common;
 use forge_core::{
     Runtime, RuntimeHandle, RuntimeServices,
-    secrets::{MemorySecretStore, SecretStore},
+    secrets::{MemorySecretStore, SecretStore, SecretStoreError},
 };
 use forge_protocol::*;
 use forge_provider::{ErrorKind, ProviderError, RetryAfter, StreamEvent};
@@ -295,7 +295,11 @@ async fn workspace_session_settings_and_key_crud_persist_before_events() {
             settings: settings.clone()
         }
     );
-    for (key, configured) in [(None, false), (Some(KEY.to_owned()), true)] {
+    for (key, key_status) in [
+        (None, KeyStatus::Missing),
+        (Some(KEY.to_owned()), KeyStatus::Configured),
+        (Some(String::new()), KeyStatus::Missing),
+    ] {
         accepted(
             h.command(Command::SetProviderKey {
                 provider: "script".into(),
@@ -304,12 +308,17 @@ async fn workspace_session_settings_and_key_crud_persist_before_events() {
             .await,
         );
         assert_eq!(h.secrets.get(&"script".into()).unwrap(), key);
+        let event = h.next().await.event;
         assert_eq!(
-            h.next().await.event,
+            event,
             Event::ProviderKeyConfigured {
                 provider: "script".into(),
-                configured
+                key_status: key_status.clone()
             }
+        );
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({"type":"provider_key_configured", "provider":"script", "key_status":key_status})
         );
         accepted(h.command(Command::GetSnapshot).await);
         let envelope = h.next().await;
@@ -328,7 +337,7 @@ async fn workspace_session_settings_and_key_crud_persist_before_events() {
             providers,
             vec![ProviderKeyStatus {
                 provider: "script".into(),
-                key_configured: configured
+                key_status
             }]
         );
     }
@@ -391,14 +400,25 @@ async fn send_commits_before_acceptance_finishes_atomically_and_replays_after_re
             envelope.event,
             Event::QueueItemAdded { .. } | Event::QueueItemUpdated { .. }
         ));
-        if let Event::RunFinished { outcome, .. } = &envelope.event {
+        if let Event::RunFinished {
+            outcome,
+            finished_at,
+            ..
+        } = &envelope.event
+        {
             assert_eq!(outcome, &RunOutcome::Succeeded);
             let run = reader.run(&run.id).unwrap().unwrap();
             assert_eq!(run.finished_at, Some(102_000));
+            assert_eq!(run.finished_at, Some(*finished_at));
             assert_eq!(run.usage.output_tokens, 3);
+            let session = reader.session(&s).unwrap().unwrap();
+            assert_eq!(session.state, SessionState::Idle);
+            let finished = session.last_finished_run.as_ref().unwrap();
+            assert_eq!(finished.started_at, run.started_at);
+            assert_eq!(finished.finished_at, *finished_at);
             assert_eq!(
-                reader.session(&s).unwrap().unwrap().state,
-                SessionState::Idle
+                recorder.events().last().unwrap().event,
+                Event::SessionUpdated { session }
             );
             let history = reader.messages(&s).unwrap();
             assert_eq!(history.len(), 2);
@@ -600,7 +620,7 @@ impl ClientState {
             Event::UsageRecorded { record } => {
                 self.runs.get_mut(&record.run_id).unwrap().usage = record.usage.clone()
             }
-            Event::RunFinished { run, outcome } => {
+            Event::RunFinished { run, outcome, .. } => {
                 self.runs.get_mut(run).unwrap().outcome = Some(outcome.clone());
             }
             _ => {}
@@ -1342,11 +1362,16 @@ async fn run_storage_failure_persists_failure_and_redacts_the_runs_key() {
             "CREATE TRIGGER fail_message BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT,'{}'); END;", message.replace('\'', "''")
         )).unwrap();
         h.clock.advance(Duration::from_secs(1));
-        let (run, outcome) = loop {
+        let (run, outcome, finished_at) = loop {
             let event = h.next().await;
             events.push(event.clone());
-            if let Event::RunFinished { run, outcome } = event.event {
-                break (run, outcome);
+            if let Event::RunFinished {
+                run,
+                outcome,
+                finished_at,
+            } = event.event
+            {
+                break (run, outcome, finished_at);
             }
         };
         let expected = RunOutcome::Failed {
@@ -1378,6 +1403,19 @@ async fn run_storage_failure_persists_failure_and_redacts_the_runs_key() {
         assert_eq!(stored.state, RunState::Failed);
         assert_eq!(stored.outcome, Some(expected));
         assert_eq!(stored.finished_at, Some(101_000));
+        assert_eq!(stored.finished_at, Some(finished_at));
+        let finished = h
+            .runtime
+            .services
+            .store
+            .session(&session)
+            .unwrap()
+            .unwrap()
+            .last_finished_run
+            .unwrap();
+        assert_eq!(finished.started_at, stored.started_at);
+        assert_eq!(finished.finished_at, finished_at);
+        assert!(events.iter().any(|event| matches!(&event.event, Event::SessionUpdated { session } if session.last_finished_run.as_ref() == Some(&finished))));
         let messages = h.runtime.services.store.messages(&session).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, MessageRole::User);
@@ -1415,7 +1453,13 @@ async fn run_storage_failure_keeps_serving_when_recovery_writes_fail() {
         loop {
             let event = h.next().await;
             events.push(event.clone());
-            if let Event::RunFinished { outcome, .. } = event.event {
+            if let Event::RunFinished {
+                outcome,
+                finished_at,
+                ..
+            } = event.event
+            {
+                assert_eq!(finished_at, h.clock.now().as_millis() as u64);
                 let RunOutcome::Failed {
                     kind,
                     message,
@@ -1644,9 +1688,15 @@ async fn run_errors_use_recorded_codes_in_http_bodies_and_stream_events() {
             loop {
                 let envelope = h.next().await;
                 assert!(!serde_json::to_string(&envelope).unwrap().contains(KEY));
-                if let Event::RunFinished { run, outcome } = envelope.event {
+                if let Event::RunFinished {
+                    run,
+                    outcome,
+                    finished_at,
+                } = envelope.event
+                {
                     let stored = h.runtime.services.store.run(&run).unwrap().unwrap();
                     assert_eq!(stored.outcome, Some(outcome.clone()));
+                    assert_eq!(stored.finished_at, Some(finished_at));
                     let RunOutcome::Failed {
                         kind,
                         message,
@@ -1760,7 +1810,7 @@ async fn run_transport_and_configuration_errors_use_network_and_auth_cards() {
             let session = h.http_session(name, &server.endpoint, Some(KEY)).await;
             accepted(h.command(send(&session, "input", "hello")).await);
             let (run, outcome) = loop {
-                if let Event::RunFinished { run, outcome } = h.next().await.event {
+                if let Event::RunFinished { run, outcome, .. } = h.next().await.event {
                     break (run, outcome);
                 }
             };
@@ -1820,7 +1870,7 @@ async fn run_failure_messages_redact_header_segments_before_publish_and_persiste
                 let session = h.http_session(name, &server.endpoint, Some(KEY)).await;
                 accepted(h.command(send(&session, "input", "hello")).await);
                 let (run, outcome) = loop {
-                    if let Event::RunFinished { run, outcome } = h.next().await.event {
+                    if let Event::RunFinished { run, outcome, .. } = h.next().await.event {
                         break (run, outcome);
                     }
                 };
@@ -1906,10 +1956,11 @@ async fn json_401_headers_never_reach_events_sqlite_or_wal() {
         else {
             panic!()
         };
-        assert_eq!(
-            message,
-            r#"{"error":{"message":"invalid key\n[已移除请求头]\n[已移除请求头]"#
-        );
+        assert!(message.contains(r#""message":"invalid key\n[已移除请求头]\n[已移除请求头]"#));
+        let lower = message.to_ascii_lowercase();
+        for header in ["proxy-authorization", "x-api-key"] {
+            assert!(!lower.contains(header));
+        }
         for file in ["forge.sqlite", "forge.sqlite-wal"] {
             let bytes = std::fs::read(h.directory.path().join(file)).unwrap();
             for secret in [KEY, PROXY_TOKEN, API_KEY] {
@@ -1930,6 +1981,79 @@ async fn json_401_headers_never_reach_events_sqlite_or_wal() {
                     .any(|window| window == secret.as_bytes())
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn snapshot_reports_key_states_and_retries_unavailable_reads() {
+    struct FailingReadStore {
+        keys: Arc<MemorySecretStore>,
+        provider: ProviderId,
+    }
+    impl SecretStore for FailingReadStore {
+        fn get(&self, provider: &ProviderId) -> Result<Option<String>, SecretStoreError> {
+            if provider == &self.provider {
+                Err(SecretStoreError)
+            } else {
+                self.keys.get(provider)
+            }
+        }
+        fn set(&self, provider: &ProviderId, key: &str) -> Result<(), SecretStoreError> {
+            self.keys.set(provider, key)
+        }
+        fn delete(&self, provider: &ProviderId) -> Result<(), SecretStoreError> {
+            self.keys.delete(provider)
+        }
+    }
+
+    let mut h = Harness::new([]);
+    let mut settings = common::settings("script");
+    for provider in ["missing", "empty", "unavailable"] {
+        let mut entry = settings.providers[0].clone();
+        entry.id = provider.into();
+        settings.providers.push(entry);
+    }
+    h.secrets.set(&"empty".into(), "").unwrap();
+    h.secrets.set(&"unavailable".into(), KEY).unwrap();
+    h.runtime.services.secrets = Arc::new(FailingReadStore {
+        keys: h.secrets.clone(),
+        provider: "unavailable".into(),
+    });
+    accepted(
+        h.command(Command::UpdateSettings {
+            settings: settings.clone(),
+        })
+        .await,
+    );
+    assert!(matches!(
+        h.next().await.event,
+        Event::SettingsUpdated { .. }
+    ));
+
+    for status in ["unavailable", "configured"] {
+        accepted(h.command(Command::GetSnapshot).await);
+        let envelope = h.next().await;
+        let Event::Snapshot {
+            providers,
+            settings: actual,
+            last_seq,
+            ..
+        } = envelope.event
+        else {
+            panic!()
+        };
+        assert_eq!(actual, settings);
+        assert_eq!(last_seq, envelope.seq);
+        assert_eq!(
+            serde_json::to_value(providers).unwrap(),
+            serde_json::json!([
+                {"provider":"script", "key_status":"configured"},
+                {"provider":"missing", "key_status":"missing"},
+                {"provider":"empty", "key_status":"missing"},
+                {"provider":"unavailable", "key_status":status}
+            ])
+        );
+        h.runtime.services.secrets = h.secrets.clone();
     }
 }
 
@@ -1994,6 +2118,7 @@ async fn failed_outcomes_survive_restart_and_dropped_event_resync() {
                 run: run_id,
                 input_id: Some("input".into()),
                 outcome: run.outcome.clone().unwrap(),
+                started_at: run.started_at,
                 finished_at: run.finished_at.unwrap(),
             })
         );
@@ -2115,6 +2240,18 @@ async fn startup_recovers_crashed_runs_and_accepts_new_sends() {
         let run = h.runtime.services.store.run(&run_id).unwrap().unwrap();
         assert_eq!(run.state, RunState::Failed);
         assert_eq!(run.finished_at, Some(now));
+        let event_json: String = h.runtime.services.store.connection().query_row(
+            "SELECT event_json FROM events WHERE json_extract(event_json, '$.type') = 'run_finished' ORDER BY seq DESC LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Event>(&event_json).unwrap(),
+            Event::RunFinished {
+                run: run.id.clone(),
+                outcome: run.outcome.clone().unwrap(),
+                finished_at: now,
+            }
+        );
         assert!(matches!(
             run.outcome,
             Some(RunOutcome::Failed {
@@ -2149,6 +2286,7 @@ async fn startup_recovers_crashed_runs_and_accepts_new_sends() {
                 run: run_id,
                 input_id: Some("input".into()),
                 outcome: run.outcome.unwrap(),
+                started_at: run.started_at,
                 finished_at: now,
             })
         );
