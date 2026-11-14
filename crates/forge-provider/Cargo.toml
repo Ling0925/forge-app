@@ -1,0 +1,9 @@
+[package]
+name = "forge-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-protocol.workspace = true
+thiserror.workspace = true

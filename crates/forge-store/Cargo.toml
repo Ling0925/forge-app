@@ -1,0 +1,13 @@
+[package]
+name = "forge-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-protocol.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+tempfile.workspace = true
