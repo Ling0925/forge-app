@@ -7,8 +7,8 @@ use forge_ui::announce::RecordingAnnouncer;
 use forge_ui::backend::{Backend, CommandFuture};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AppContext, Bounds, Entity, Point, TestAppContext, WindowBounds, WindowHandle, WindowOptions,
-    base::Root, point, px, size,
+    AppContext, Bounds, Entity, Focusable, Point, TestAppContext, WindowBounds, WindowHandle,
+    WindowOptions, base::Root, point, px, size,
 };
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -686,4 +686,47 @@ fn wait_card_body_switches_when_countdown_ends(cx: &mut TestAppContext) {
         1,
         "{spoken:?}"
     );
+}
+
+#[gpui_kit::test]
+fn settings_cmd_comma_opens_and_escape_restores_focus(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.update(cx, |app, window, cx| {
+        assert!(
+            app.composer().read(cx).focus_handle(cx).is_focused(window),
+            "composer is focused before opening settings"
+        );
+    });
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.press("cmd-,", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("settings").is_some(), "⌘, opens settings");
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("settings").is_none(), "Esc closes settings");
+    });
+    f.update(cx, |app, window, cx| {
+        assert!(
+            app.composer().read(cx).focus_handle(cx).is_focused(window),
+            "focus returns to the composer"
+        );
+    });
+
+    // Close button also restores the focus captured at open.
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.press("cmd-,", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("settings").is_some());
+        window.click("settings-close", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("settings").is_none());
+    });
+    f.update(cx, |app, window, cx| {
+        assert!(
+            app.composer().read(cx).focus_handle(cx).is_focused(window),
+            "关闭 also restores the prior focus"
+        );
+    });
 }

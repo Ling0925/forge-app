@@ -1,9 +1,9 @@
 //! Root view. Rendering only: every decision comes from `forge_state::AppState`.
 
 use crate::actions::{
-    COMPOSER_CONTEXT, CloseWindow, FocusComposer, InspectorChanges, InspectorOutput,
+    COMPOSER_CONTEXT, CloseSettings, CloseWindow, FocusComposer, InspectorChanges, InspectorOutput,
     InspectorQueue, Minimize, NewSession, NextSession, OpenSettings, PrevSession, Quit,
-    ROOT_CONTEXT, RetryLastRun, Steer, StopRun, ToggleInspector, ToggleSidebar,
+    ROOT_CONTEXT, RetryLastRun, SETTINGS_CONTEXT, Steer, StopRun, ToggleInspector, ToggleSidebar,
 };
 use crate::announce::Announcer;
 use crate::backend::{Backend, EventReceiver, StartError};
@@ -19,7 +19,7 @@ use forge_state::{
 use gpui_kit::assets::IconName;
 use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -65,6 +65,8 @@ pub struct ForgeApp {
     inspector_tab: usize,
     /// Settings panel key fields (masked), one per provider.
     key_inputs: Vec<(ProviderId, Entity<InputState>)>,
+    /// Focus to restore when the settings panel closes (Esc or 关闭).
+    settings_return_focus: Option<FocusHandle>,
     /// `ui_prefs` as last loaded or sent; a change is persisted once the
     /// drag ends (sidebar width / visibility, inspector).
     persisted_prefs: Option<BTreeMap<String, String>>,
@@ -202,6 +204,7 @@ impl ForgeApp {
             placeholder: t("composer.placeholder.idle"),
             inspector_tab: 0,
             key_inputs,
+            settings_return_focus: None,
             persisted_prefs: None,
             _tasks: tasks,
             _subscriptions: subscriptions,
@@ -472,7 +475,7 @@ impl ForgeApp {
             ErrorEffect::OpenInspectorChanges(_) => {
                 self.state.ui.inspector_visible = true;
             }
-            ErrorEffect::OpenSettings => self.state.open_settings(),
+            ErrorEffect::OpenSettings => self.open_settings(window, cx),
         }
         self.after_change(window, cx);
     }
@@ -519,6 +522,9 @@ impl ForgeApp {
     }
 
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.settings.open {
+            self.settings_return_focus = window.focused(cx);
+        }
         self.state.open_settings();
         self.after_change(window, cx);
         if let Some((_, input)) = self.key_inputs.first() {
@@ -532,7 +538,34 @@ impl ForgeApp {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
         self.after_change(window, cx);
-        self.composer.read(cx).focus_handle(cx).focus(window, cx);
+        if let Some(handle) = self.settings_return_focus.take() {
+            handle.focus(window, cx);
+        } else {
+            self.composer.read(cx).focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    fn on_close_settings(
+        &mut self,
+        _: &CloseSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.settings.open {
+            self.close_settings(window, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
+    /// Escape from a settings key field (Input maps Esc to this action and
+    /// propagates when it has nothing of its own to dismiss).
+    fn on_settings_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.settings.open {
+            self.close_settings(window, cx);
+        } else {
+            cx.propagate();
+        }
     }
 
     /// "保存": the key goes to Core (`SetProviderKey`) and the field is
@@ -1561,6 +1594,9 @@ impl ForgeApp {
         Some(
             div()
                 .id("settings-overlay")
+                .key_context(SETTINGS_CONTEXT)
+                .on_action(cx.listener(Self::on_close_settings))
+                .on_action(cx.listener(Self::on_settings_escape))
                 .absolute()
                 .inset_0()
                 .flex()
@@ -1684,6 +1720,8 @@ impl Render for ForgeApp {
             .on_action(
                 cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
             )
+            .on_action(cx.listener(Self::on_close_settings))
+            .on_action(cx.listener(Self::on_settings_escape))
             .on_action(cx.listener(Self::on_focus_composer))
             .on_action(cx.listener(Self::on_stop))
             .on_action(cx.listener(Self::on_retry_last))

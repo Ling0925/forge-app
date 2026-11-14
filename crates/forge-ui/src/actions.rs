@@ -26,6 +26,7 @@ gpui_kit::actions!(
         Minimize,
         CloseWindow,
         OpenSettings,
+        CloseSettings,
     ]
 );
 
@@ -34,6 +35,8 @@ pub const ROOT_CONTEXT: &str = "ForgeApp";
 /// Key context around the composer textarea (⌥↩ steer lives here so it does not
 /// collide with the textarea's own enter / shift-enter bindings).
 pub const COMPOSER_CONTEXT: &str = "ForgeComposer";
+/// Key context of the in-window settings panel (Esc closes it).
+pub const SETTINGS_CONTEXT: &str = "ForgeSettings";
 
 pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
@@ -44,6 +47,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-cmd-3", InspectorOutput, None),
         KeyBinding::new("cmd-n", NewSession, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("escape", CloseSettings, Some(SETTINGS_CONTEXT)),
+        KeyBinding::new("escape", CloseSettings, Some(ROOT_CONTEXT)),
         KeyBinding::new("cmd-l", FocusComposer, None),
         KeyBinding::new("cmd-.", StopRun, None),
         KeyBinding::new("cmd-r", RetryLastRun, None),
