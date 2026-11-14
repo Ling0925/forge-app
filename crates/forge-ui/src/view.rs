@@ -11,9 +11,9 @@ use crate::tokens::Palette;
 use forge_protocol::{EventEnvelope, RunId, SessionId};
 use forge_state::i18n::{t, tf};
 use forge_state::{
-    AppState, BootState, ComposerKey, ComposerMode, ErrorAction, ErrorEffect, KeyOutcome,
-    OnboardingStep, PanelLayout, QuitDecision, SessionRowVm, SidebarGroup, SidebarResize,
-    SidebarVm, StatusIcon, TimelineRowVm,
+    AppState, BootState, ComposerKey, ComposerMode, DisabledReason, ErrorAction, ErrorEffect,
+    KeyOutcome, OnboardingStep, PanelLayout, QuitDecision, SessionRowVm, SidebarGroup,
+    SidebarResize, SidebarVm, StatusIcon, TimelineRowVm,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::base::TestSupportExt;
@@ -54,6 +54,7 @@ pub struct ForgeApp {
     clock_base_ms: u64,
     exiting: bool,
     drag: Option<SidebarDrag>,
+    placeholder: &'static str,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -157,6 +158,7 @@ impl ForgeApp {
             clock_base_ms: crate::clock::wall_now_ms(),
             exiting: false,
             drag: None,
+            placeholder: t("composer.placeholder.idle"),
             _tasks: tasks,
             _subscriptions: subscriptions,
         };
@@ -265,6 +267,17 @@ impl ForgeApp {
         if self.composer.read(cx).value().as_ref() != draft {
             self.composer
                 .update(cx, |input, cx| input.set_value(draft, window, cx));
+        }
+        // §6.9: placeholder follows the state (no key → "先在设置里添加 API Key").
+        let placeholder = match self.state.composer_mode() {
+            ComposerMode::Disabled(DisabledReason::NoKey) => t("composer.no_key"),
+            _ => t("composer.placeholder.idle"),
+        };
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder;
+            self.composer.update(cx, |input, cx| {
+                input.set_placeholder(placeholder, window, cx)
+            });
         }
     }
 
@@ -747,13 +760,14 @@ impl ForgeApp {
                     .bg(rgb(palette.info_bg))
                     .text_color(rgb(palette.fg))
                     .child(Icon::new(IconName::Info).text_color(rgb(palette.info)))
-                    .child(t("composer.no_key"))
+                    .child(t("empty.no_key"))
                     .child(
                         Button::new("no-key-settings")
                             .label(t("composer.open_settings"))
                             .small()
                             .outline(),
-                    ),
+                    )
+                    .test_support(),
             );
         }
         col.test_support().into_any_element()
@@ -937,10 +951,12 @@ impl ForgeApp {
             .into_any_element()
     }
 
-    fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = *Palette::for_dark(theme.is_dark());
         let mode = self.state.composer_mode();
         let disabled = matches!(mode, ComposerMode::Disabled(_));
+        let no_key = mode == ComposerMode::Disabled(DisabledReason::NoKey);
         let sending = mode == ComposerMode::Sending;
         let busy = matches!(mode, ComposerMode::Running | ComposerMode::Cancelling);
         let error = self
@@ -952,24 +968,123 @@ impl ForgeApp {
         } else {
             !self.state.can_send()
         };
+        // §6.9: "发送 ↩" (accent / onAccent) or "停止 ⌘." (dangerBtn outline).
         let button = if busy {
+            let stopping = mode == ComposerMode::Cancelling;
             Button::new("composer-stop")
-                .label(if mode == ComposerMode::Cancelling {
+                .label(if stopping {
+                    t("composer.stopping")
+                } else {
+                    t("composer.stop_key")
+                })
+                .accessibility_label(if stopping {
                     t("composer.stopping")
                 } else {
                     t("composer.stop")
                 })
                 .danger()
-                .tooltip("⌘.")
+                .outline()
         } else {
             Button::new("composer-send")
-                .label(t("composer.send"))
+                .label(t("composer.send_key"))
+                .accessibility_label(t("composer.send"))
                 .primary()
-                .tooltip("↩")
         }
+        .small()
         .disabled(button_disabled)
         .on_click(cx.listener(|this, _, window, cx| this.primary_button(window, cx)));
         let button = crate::style::disabled_readable(button, button_disabled, cx);
+
+        let focused = !disabled && self.composer.read(cx).focus_handle(cx).is_focused(window);
+        let workspace = self
+            .state
+            .active_workspace
+            .as_ref()
+            .and_then(|id| self.state.workspaces.iter().find(|w| &w.id == id))
+            .map(|w| w.name.clone());
+        let model = self
+            .state
+            .selected()
+            .map(|vm| vm.session.model.model.clone())
+            .or_else(|| {
+                self.state
+                    .settings
+                    .settings
+                    .as_ref()
+                    .map(|s| s.model.model.clone())
+            })
+            .unwrap_or_default();
+
+        // §6.9 / §3.1: surface fill + 1pt borderStrong whether enabled or not;
+        // focus adds the 2pt accent ring; disabled only changes the
+        // placeholder and drops the ring (no grey fill).
+        let field = v_flex()
+            .id("composer-box")
+            .w_full()
+            .rounded(px(12.))
+            .bg(rgb(palette.surface))
+            .border_1()
+            .border_color(rgb(palette.border_strong))
+            .when(focused, |el| {
+                el.border_2().border_color(rgb(palette.accent))
+            })
+            .px_3()
+            .pt_2()
+            .pb_1()
+            .gap_1()
+            .child(
+                Textarea::new(&self.composer)
+                    .aria_label(t("a11y.composer"))
+                    .appearance(false)
+                    // Not `.disabled()`: gpui-kit fades disabled text to 50%.
+                    // The input stays read-only and the send button is disabled.
+                    .readonly(sending || disabled),
+            )
+            .child(
+                h_flex()
+                    .id("composer-toolbar")
+                    .h(px(28.))
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .text_color(rgb(palette.fg2))
+                    .child(
+                        Button::new("composer-attach")
+                            .icon(gpui_kit::assets::IconName::Paperclip)
+                            .ghost()
+                            .xsmall()
+                            .accessibility_label(t("composer.attach"))
+                            .tooltip(t("composer.attach")),
+                    )
+                    .children(workspace.map(|name| {
+                        h_flex()
+                            .gap_1()
+                            .child(Icon::new(IconName::Folder).xsmall())
+                            .child(name)
+                    }))
+                    .child(div().flex_1())
+                    .child(div().child(model))
+                    .child(button)
+                    .test_support(),
+            )
+            .test_support();
+
+        let hint: AnyElement = if no_key {
+            h_flex()
+                .gap_1()
+                .child(t("composer.no_key"))
+                .child(
+                    Button::new("composer-open-settings")
+                        .label(t("composer.open_settings"))
+                        .link()
+                        .xsmall(),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .child(t(self.state.composer_hint_key()))
+                .into_any_element()
+        };
 
         h_flex()
             .w_full()
@@ -986,36 +1101,18 @@ impl ForgeApp {
                     .w_full()
                     .max_w(px(forge_state::CONTENT_MAX))
                     .gap_1()
-                    .child(
-                        h_flex()
-                            .items_end()
-                            .gap_2()
-                            .child(
-                                div().flex_1().child(
-                                    Textarea::new(&self.composer)
-                                        .aria_label(t("a11y.composer"))
-                                        .disabled(disabled)
-                                        .readonly(sending),
-                                ),
-                            )
-                            .child(button),
-                    )
+                    .child(field)
                     .when_some(error, |col, error| {
                         col.child(
                             div()
                                 .id("composer-error")
                                 .role(Role::Alert)
                                 .text_xs()
-                                .text_color(theme.danger)
+                                .text_color(rgb(palette.danger))
                                 .child(error),
                         )
                     })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(t(self.state.composer_hint_key())),
-                    ),
+                    .child(div().text_xs().text_color(rgb(palette.fg2)).child(hint)),
             )
             .into_any_element()
     }
@@ -1117,7 +1214,7 @@ impl Render for ForgeApp {
         let storage = self.render_storage_error(cx);
         let header = self.render_header(cx);
         let timeline = self.render_timeline(cx);
-        let composer = self.render_composer(cx);
+        let composer = self.render_composer(window, cx);
         let theme = cx.theme().clone();
         let (sidebar, divider) = match sidebar {
             Some((s, d)) => (Some(s), Some(d)),

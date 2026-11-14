@@ -256,10 +256,11 @@ fn action_button(
             weak.update(cx, |this, cx| this.error_action(&run, action, window, cx))
                 .ok();
         });
-    let button = if primary {
-        button.primary()
-    } else {
-        button.outline()
+    // §3.1: the error card's primary "重试" uses dangerBtn / onDanger.
+    let button = match (primary, action) {
+        (true, ErrorAction::Retry) => button.danger(),
+        (true, _) => button.primary(),
+        (false, _) => button.outline(),
     };
     crate::style::disabled_readable(button, disabled, cx)
 }
