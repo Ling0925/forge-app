@@ -221,15 +221,21 @@ impl AppState {
                         reasoning,
                     });
                 }
-                TimelineItem::Error(error) => rows.push(TimelineRowVm::Error(ErrorCardVm::build(
-                    &error.run_id,
-                    &error.failure,
-                    error.retry_at_ms,
-                    now,
-                    &provider,
-                    vm.expanded_details.contains(&error.run_id),
-                    self.utc_offset_ms,
-                ))),
+                TimelineItem::Error(error) => rows.push(TimelineRowVm::Error(
+                    ErrorCardVm::build(
+                        &error.run_id,
+                        &error.failure,
+                        error.retry_at_ms,
+                        now,
+                        &provider,
+                        vm.expanded_details.contains(&error.run_id),
+                        self.utc_offset_ms,
+                    )
+                    .with_time(
+                        vm.runs.get(&error.run_id).and_then(|r| r.finished_at_ms),
+                        self.utc_offset_ms,
+                    ),
+                )),
                 TimelineItem::RunDivider { run_id, outcome } => {
                     let run = vm.runs.get(run_id);
                     let (icon, key) = match outcome {

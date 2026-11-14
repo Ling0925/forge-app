@@ -368,6 +368,11 @@ fn auth_card_opens_settings_and_has_no_countdown(cx: &mut TestAppContext) {
         window.render_frame(cx);
         assert_eq!(window.find("error-r1-primary").label(), Some("打开设置"));
         assert_eq!(window.find("error-r1-secondary").label(), Some("重试"));
+        // UI-REF-01: shared card skeleton — status pill, ⋯ menu, labelled group.
+        assert!(window.try_find("error-r1-status").is_some());
+        assert_eq!(window.find("error-r1-more").label(), Some("更多操作"));
+        let card = window.find("error-r1");
+        assert_eq!(card.label(), Some("运行失败：API Key 无效或没有权限"));
     });
 }
 

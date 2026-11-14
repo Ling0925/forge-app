@@ -8,6 +8,7 @@
 pub mod actions;
 pub mod announce;
 pub mod backend;
+pub mod card;
 pub mod clock;
 pub mod demo;
 pub mod style;

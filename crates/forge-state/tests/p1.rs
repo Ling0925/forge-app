@@ -591,6 +591,15 @@ fn long_retry_after_shows_clock_time_and_countdown() {
     assert_eq!(c.title, "服务要求等待");
     assert_eq!(c.body, "可在 14:05 后重试（还要 1 分 40 秒）。");
     assert_eq!(c.retry_label, "重试（1 分 40 秒）");
+    // V1 meta: source · time the failure arrived; status pill text.
+    assert_eq!(c.status, "失败");
+    assert!(c.meta.ends_with(" · 14:03"), "{}", c.meta);
+    // Fake clock +1 s: remaining time ticks, the wall-clock time stays fixed.
+    app.set_now_ms(t0 + 1_000);
+    let c = card(&app);
+    assert_eq!(c.body, "可在 14:05 后重试（还要 1 分 39 秒）。");
+    app.set_now_ms(t0 + 41_000);
+    assert_eq!(card(&app).body, "可在 14:05 后重试（还要 59 秒）。");
 }
 
 #[test]

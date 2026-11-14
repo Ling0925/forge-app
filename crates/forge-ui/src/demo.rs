@@ -212,13 +212,33 @@ pub fn populate(app: &mut AppState, scene: Scene, base: u64) -> u64 {
     if scene == Scene::NoKey {
         return f.now;
     }
-    f.event(Event::SessionCreated {
+    // Sidebar spread: 3 days ago (过去 7 天), yesterday with a failed run,
+    // one still running (进行中), and the selected one today.
+    const HOUR: i64 = 3_600_000;
+    f.at(-74 * HOUR).event(Event::SessionCreated {
         session: session("s-old", "整理 README 目录"),
     });
-    f.event(Event::SessionCreated {
+    f.at(-26 * HOUR).event(Event::SessionCreated {
         session: session("s-ci", "排查构建失败"),
     });
-    f.event(Event::SessionCreated {
+    f.event(Event::RunStarted {
+        run: run("r-ci", "s-ci"),
+    });
+    f.at(-26 * HOUR + 40_000).event(finished(
+        "r-ci",
+        RunOutcome::Failed,
+        Some("network: connection reset"),
+    ));
+    f.at(-2 * HOUR).event(Event::SessionCreated {
+        session: session("s-docs", "更新 CHANGELOG"),
+    });
+    f.at(-42_000).event(Event::SessionCreated {
+        session: session("s-run", "跑一遍 clippy 并修警告"),
+    });
+    f.event(Event::RunStarted {
+        run: run("r-run", "s-run"),
+    });
+    f.at(1_000).event(Event::SessionCreated {
         session: session("s1", "解释这个项目的结构"),
     });
     f.app.select_session(&"s1".into());
