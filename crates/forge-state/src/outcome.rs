@@ -420,67 +420,71 @@ impl RetryMarkerVm {
     }
 }
 
-/// Credential header names matched exactly (case-insensitive).
-const SENSITIVE_HEADERS: [&str; 4] = [
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "set-cookie",
-];
-/// …and any single token ending in one of these (`x-api-key`, `token`,
-/// `client_secret`, `apikey`).
-const SENSITIVE_SUFFIXES: [&str; 5] = ["api-key", "api_key", "apikey", "token", "secret"];
-
-fn is_header_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '-' || c == '_'
+/// Mirror of Core's `remove_request_headers` (forge-core errors.rs @
+/// 3ea2965; Core is authoritative, this is the defensive second layer).
+/// Segments split at LF, CRLF and the literal two-char `\n` / four-char
+/// `\r\n`; separators are kept verbatim. In a segment, a credential header
+/// name (case-insensitive, optionally quoted / backslash-quoted, then
+/// optional spaces / closing quotes, then `:` or `=`) is replaced — from the
+/// name's first char to the segment end — by `[已移除请求头]`; text before it
+/// (including an opening quote) stays. Names are single words of letters,
+/// digits, `-`, `_`: authorization, proxy-authorization, cookie, set-cookie,
+/// or anything ending in api-key / api_key / apikey / token / secret.
+pub fn remove_request_headers(message: &str) -> String {
+    let mut redacted = String::new();
+    let mut start = 0;
+    for (index, _) in message.match_indices(['\r', '\n', '\\']) {
+        if index < start {
+            continue;
+        }
+        if let Some(boundary) = ["\r\n", "\n", r"\r\n", r"\n"]
+            .into_iter()
+            .find(|boundary| message[index..].starts_with(boundary))
+        {
+            redact_segment(&message[start..index], &mut redacted);
+            redacted.push_str(boundary);
+            start = index + boundary.len();
+        }
+    }
+    redact_segment(&message[start..], &mut redacted);
+    redacted
 }
 
-fn is_sensitive_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    !lower.is_empty()
-        && (SENSITIVE_HEADERS.contains(&lower.as_str())
-            || SENSITIVE_SUFFIXES.iter().any(|s| lower.ends_with(s)))
-}
-
-/// Byte offset where a credential header starts in `segment`: a sensitive
-/// name (optionally quoted / backslash-escaped) directly followed — spaces
-/// allowed — by `:` or `=`. `invalid api key: …` does not match: the token
-/// before `:` is just `key`.
-fn header_start(segment: &str) -> Option<usize> {
-    segment.match_indices([':', '=']).find_map(|(index, _)| {
+fn redact_segment(segment: &str, redacted: &mut String) {
+    for (index, _) in segment.match_indices([':', '=']) {
         let prefix = segment[..index]
-            .trim_end()
-            .trim_end_matches(['"', '\'', '\\']);
-        let start = prefix
-            .char_indices()
-            .rev()
-            .take_while(|(_, c)| is_header_char(*c))
-            .last()
-            .map(|(i, _)| i)?;
-        is_sensitive_name(&prefix[start..]).then_some(start)
-    })
+            .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'));
+        let name = prefix
+            .rsplit(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+            .next()
+            .unwrap_or("");
+        let lower = name.to_ascii_lowercase();
+        if !lower.is_empty()
+            && (matches!(
+                lower.as_str(),
+                "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+            ) || ["api-key", "api_key", "apikey", "token", "secret"]
+                .iter()
+                .any(|suffix| lower.ends_with(suffix)))
+        {
+            redacted.push_str(&segment[..prefix.len() - name.len()]);
+            redacted.push_str(crate::i18n::t("error.detail.header_redacted"));
+            return;
+        }
+    }
+    redacted.push_str(segment);
 }
 
-/// Error-details text for display (UI-ER-04, designer rule 2026-11-14; Core
-/// applies the same rule and is authoritative — this is a defensive layer).
-/// The text is split at real newlines and at literal `\n` / `\r\n` escapes
-/// (JSON bodies collapsed onto one line). In each segment a credential header
-/// (`Authorization:`, `{'Cookie': …`, `x-api-key=`, `token:` …) is replaced,
-/// from its name to the end of the segment, by `[已移除请求头]`; the text
-/// before it stays, so the result is never empty for a non-empty message.
-/// What remains goes through [`redact_secrets`].
+/// Error-details text for display (UI-ER-04): [`remove_request_headers`]
+/// (same rule as Core), then literal `\r\n` / `\n` escapes from one-line JSON
+/// bodies become real line breaks for reading, then [`redact_secrets`] per
+/// line. Never empty for a non-empty message.
 pub fn sanitize_details(text: &str) -> String {
-    let normalized = text.replace("\\r\\n", "\n").replace("\\n", "\n");
-    let placeholder = crate::i18n::t("error.detail.header_redacted");
-    normalized
+    remove_request_headers(text)
+        .replace(r"\r\n", "\n")
+        .replace(r"\n", "\n")
         .split('\n')
-        .map(|segment| {
-            let segment = segment.strip_suffix('\r').unwrap_or(segment);
-            match header_start(segment) {
-                Some(start) => format!("{}{placeholder}", redact_secrets(&segment[..start])),
-                None => redact_secrets(segment),
-            }
-        })
+        .map(|line| redact_secrets(line.strip_suffix('\r').unwrap_or(line)))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -527,6 +531,65 @@ fn redact_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Mirrors forge-core errors.rs tests @ 3ea2965.
+    #[test]
+    fn core_mirror_redacts_credential_headers_from_name_to_segment_end() {
+        for (message, expected) in [
+            ("Authorization: hidden", "[已移除请求头]"),
+            ("Authorization=Bearer tok_123", "[已移除请求头]"),
+            ("token: hidden", "[已移除请求头]"),
+            ("Cookie: hidden", "[已移除请求头]"),
+            ("Set-Cookie: hidden", "[已移除请求头]"),
+            ("x-auth-token: hidden", "[已移除请求头]"),
+            ("client_secret=hidden", "[已移除请求头]"),
+            ("API_KEY: hidden", "[已移除请求头]"),
+            ("X-ApiKey: hidden", "[已移除请求头]"),
+            (r#"{"x-api-key":"hidden"}"#, "{\"[已移除请求头]"),
+            (r#"\"Authorization\": \"Bearer qqq\""#, "\\\"[已移除请求头]"),
+            ("{'Authorization': 'Bearer qqq'}", "{'[已移除请求头]"),
+            (
+                "  上游错误 proxy-AUTHORIZATION = hidden",
+                "  上游错误 [已移除请求头]",
+            ),
+            (
+                "request headers: 'API-KEY' = hidden",
+                "request headers: '[已移除请求头]",
+            ),
+        ] {
+            assert_eq!(remove_request_headers(message), expected, "{message}");
+        }
+    }
+
+    #[test]
+    fn core_mirror_preserves_all_segment_boundaries() {
+        for boundary in ["\n", "\r\n", r"\n", r"\r\n"] {
+            let message = format!(
+                "details{boundary}Proxy-Authorization: Basic secret{boundary}prefix x-api-key: key{boundary}tail{boundary}"
+            );
+            assert_eq!(
+                remove_request_headers(&message),
+                format!(
+                    "details{boundary}[已移除请求头]{boundary}prefix [已移除请求头]{boundary}tail{boundary}"
+                )
+            );
+        }
+        assert_eq!(
+            remove_request_headers("token: a\nCookie: b\\nsecret=c\r\napi-key: d\\r\\ntail"),
+            "[已移除请求头]\n[已移除请求头]\\n[已移除请求头]\r\n[已移除请求头]\\r\\ntail"
+        );
+    }
+
+    #[test]
+    fn core_mirror_preserves_non_header_text_exactly() {
+        for message in [
+            "",
+            "invalid api key: please check settings",
+            "  上游错误\r\nauthorization failed\r\npreauthorization: pending\r\nx-api-key-info: unavailable\r\n",
+        ] {
+            assert_eq!(remove_request_headers(message), message);
+        }
+    }
 
     #[test]
     fn redacts_keys_and_tokens() {
