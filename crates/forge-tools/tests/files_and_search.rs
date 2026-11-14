@@ -9,7 +9,12 @@ use forge_tools::{
     workspace::WorkspaceRoot,
 };
 use sha2::{Digest, Sha256};
-use std::{fs, ops::RangeInclusive, path::PathBuf};
+use std::{
+    ffi::OsString,
+    fs,
+    ops::RangeInclusive,
+    path::{Path, PathBuf},
+};
 
 async fn run<T: Tool>(tool: &T, input: T::Request) -> Result<T::Output, ToolError> {
     let request = ToolRequest {
@@ -39,6 +44,15 @@ fn grep(path: impl Into<PathBuf>, pattern: &str) -> GrepRequest {
         pattern: pattern.into(),
         cancellation: CancellationToken::default(),
     }
+}
+
+fn entry_names(path: &Path) -> Vec<OsString> {
+    let mut names = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 #[test]
@@ -287,6 +301,221 @@ async fn write_file_hashes_original_bytes() {
     assert_eq!(change.before_sha256, Some(hash(before)));
     assert_eq!(change.after_sha256, hash(after));
     assert_eq!((change.lines_added, change.lines_removed), (1, 1));
+}
+
+#[tokio::test]
+async fn write_file_overwrite_leaves_exactly_the_new_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("file");
+    let tool = WriteFileTool::new(WorkspaceRoot::new(directory.path()).unwrap());
+    for (before, after) in [
+        ("x".repeat(8192), "tail".to_string()),
+        ("short".to_string(), "y".repeat(8192)),
+        ("z".repeat(4096), "q".repeat(4096)),
+        ("nonempty".to_string(), String::new()),
+    ] {
+        fs::write(&file, &before).unwrap();
+        run(
+            &tool,
+            WriteFileRequest {
+                path: "file".into(),
+                content: after.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read(&file).unwrap(), after.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn concurrent_reads_observe_only_complete_write_file_contents() {
+    use std::{
+        collections::HashSet,
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("file");
+    let tool = WriteFileTool::new(WorkspaceRoot::new(directory.path()).unwrap());
+    let versions = [
+        "initial\n".to_string(),
+        "a".repeat(1 << 16),
+        "b".repeat(1 << 17),
+    ];
+    fs::write(&file, &versions[0]).unwrap();
+    let allowed = Arc::new(
+        versions
+            .iter()
+            .map(|version| version.clone().into_bytes())
+            .collect::<HashSet<_>>(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let start = Arc::new(Barrier::new(2));
+    let reads = Arc::new(AtomicU64::new(0));
+    let torn = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let (allowed, stop, start, reads, torn, file) = (
+            allowed.clone(),
+            stop.clone(),
+            start.clone(),
+            reads.clone(),
+            torn.clone(),
+            file.clone(),
+        );
+        std::thread::spawn(move || {
+            start.wait();
+            while !stop.load(Ordering::Relaxed) && !torn.load(Ordering::Relaxed) {
+                if let Ok(bytes) = fs::read(&file) {
+                    reads.fetch_add(1, Ordering::Relaxed);
+                    if !allowed.contains(&bytes) {
+                        torn.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        })
+    };
+    start.wait();
+    for index in 0..40 {
+        run(
+            &tool,
+            WriteFileRequest {
+                path: "file".into(),
+                content: versions[1 + index % 2].clone(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    reader.join().unwrap();
+    assert!(reads.load(Ordering::Relaxed) > 0, "reader never ran");
+    assert!(
+        !torn.load(Ordering::Relaxed),
+        "partial or empty file observed during overwrite"
+    );
+    assert_eq!(fs::read(&file).unwrap(), versions[2].as_bytes());
+}
+
+#[tokio::test]
+async fn writes_leave_no_temp_files_after_success_or_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let tool = WriteFileTool::new(WorkspaceRoot::new(directory.path()).unwrap());
+    run(
+        &tool,
+        WriteFileRequest {
+            path: "file".into(),
+            content: "content".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(entry_names(directory.path()), ["file"]);
+    fs::create_dir(directory.path().join("blocked")).unwrap();
+    fs::write(directory.path().join("blocked/kept"), "original").unwrap();
+    for path in ["blocked", "file/child"] {
+        assert!(
+            run(
+                &tool,
+                WriteFileRequest {
+                    path: path.into(),
+                    content: "nope".into(),
+                }
+            )
+            .await
+            .is_err(),
+            "{path}"
+        );
+        assert_eq!(entry_names(directory.path()), ["blocked", "file"]);
+    }
+    assert_eq!(
+        fs::read_to_string(directory.path().join("blocked/kept")).unwrap(),
+        "original"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(directory.path().join("probe"), "x").is_err() {
+            assert!(
+                run(
+                    &tool,
+                    WriteFileRequest {
+                        path: "denied".into(),
+                        content: "nope".into(),
+                    }
+                )
+                .await
+                .is_err()
+            );
+        } else {
+            let _ = fs::remove_file(directory.path().join("probe"));
+        }
+        assert_eq!(entry_names(directory.path()), ["blocked", "file"]);
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn writes_racing_target_swaps_leave_no_temp_files() {
+    use std::{
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    let tool = WriteFileTool::new(WorkspaceRoot::new(directory.path()).unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let start = Arc::new(Barrier::new(2));
+    let swaps = Arc::new(AtomicU64::new(0));
+    let swapper = {
+        let (stop, start, swaps, target) =
+            (stop.clone(), start.clone(), swaps.clone(), target.clone());
+        std::thread::spawn(move || {
+            start.wait();
+            while !stop.load(Ordering::Relaxed) {
+                let _ = fs::remove_file(&target);
+                let _ = fs::remove_dir_all(&target);
+                swaps.fetch_add(fs::create_dir(&target).is_ok() as u64, Ordering::Relaxed);
+                let _ = fs::remove_dir_all(&target);
+                swaps.fetch_add(
+                    fs::write(&target, "swapped\n").is_ok() as u64,
+                    Ordering::Relaxed,
+                );
+            }
+        })
+    };
+    start.wait();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut attempts = 0;
+    while Instant::now() < deadline {
+        attempts += 1;
+        let _ = run(
+            &tool,
+            WriteFileRequest {
+                path: "target".into(),
+                content: format!("attempt {attempts}\n"),
+            },
+        )
+        .await;
+        assert!(
+            entry_names(directory.path())
+                .iter()
+                .all(|name| name == "target"),
+            "stray temp file left behind"
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    swapper.join().unwrap();
+    assert!(
+        attempts > 0 && swaps.load(Ordering::Relaxed) > 0,
+        "no race activity"
+    );
 }
 
 #[tokio::test]
@@ -935,7 +1164,46 @@ async fn write_file_rejects_parent_escapes_before_creating_directories() {
 #[cfg(unix)]
 mod symlinks {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::{
+        os::unix::fs::symlink,
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread::JoinHandle,
+        time::{Duration, Instant},
+    };
+
+    fn spawn_dir_swapper(
+        workspace: PathBuf,
+        outside: PathBuf,
+    ) -> (Arc<Barrier>, Arc<AtomicBool>, JoinHandle<usize>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(Barrier::new(2));
+        let thread = {
+            let stop = stop.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                let mut flips = 0;
+                start.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = fs::create_dir(workspace.join("d_real"));
+                    let _ = fs::write(workspace.join("d_real/inside.txt"), "inside\n");
+                    let _ = fs::rename(workspace.join("d_real"), workspace.join("d"));
+                    let _ = symlink(&outside, workspace.join("d_link"));
+                    let _ = fs::rename(workspace.join("d"), workspace.join("d_old"));
+                    if fs::rename(workspace.join("d_link"), workspace.join("d")).is_ok() {
+                        flips += 1;
+                    }
+                    let _ = fs::remove_dir_all(workspace.join("d_old"));
+                    let _ = fs::rename(workspace.join("d"), workspace.join("d_link_old"));
+                    let _ = fs::remove_file(workspace.join("d_link_old"));
+                }
+                flips
+            })
+        };
+        (start, stop, thread)
+    }
 
     #[tokio::test]
     async fn qa10_toctou_dir_swapped_to_external_symlink() {
@@ -1001,6 +1269,161 @@ mod symlinks {
                 "write escaped during directory swap in round {round}"
             );
             assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn qa10_toctou_read_never_returns_external_content() {
+        for round in 0..5 {
+            let directory = tempfile::tempdir().unwrap();
+            let workspace = directory.path().join("root");
+            let outside = directory.path().join("outside");
+            fs::create_dir(&workspace).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("inside.txt"), "outside-secret\n").unwrap();
+            let tool = ReadFileTool::new(WorkspaceRoot::new(&workspace).unwrap());
+            let (start, stop, flipper) = spawn_dir_swapper(workspace, outside.clone());
+            start.wait();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut attempts = 0;
+            let mut escaped = false;
+            while Instant::now() < deadline && !escaped {
+                attempts += 1;
+                if let Ok(content) = run(
+                    &tool,
+                    ReadFileRequest {
+                        path: "d/inside.txt".into(),
+                        lines: None,
+                    },
+                )
+                .await
+                {
+                    escaped = content != "inside\n";
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            let flips = flipper.join().unwrap();
+            assert!(
+                attempts > 0 && flips > 0,
+                "no race activity in round {round}"
+            );
+            assert!(
+                !escaped,
+                "read escaped during directory swap in round {round}"
+            );
+            assert_eq!(
+                fs::read_to_string(outside.join("inside.txt")).unwrap(),
+                "outside-secret\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn qa10_toctou_list_dir_never_lists_external_entries() {
+        for round in 0..5 {
+            let directory = tempfile::tempdir().unwrap();
+            let workspace = directory.path().join("root");
+            let outside = directory.path().join("outside");
+            fs::create_dir(&workspace).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("outside-secret.txt"), "outside-secret\n").unwrap();
+            let tool = ListDirTool::new(WorkspaceRoot::new(&workspace).unwrap());
+            let (start, stop, flipper) = spawn_dir_swapper(workspace, outside.clone());
+            start.wait();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut attempts = 0;
+            let mut escaped = false;
+            while Instant::now() < deadline && !escaped {
+                attempts += 1;
+                if let Ok(entries) = run(&tool, "d".into()).await {
+                    escaped = entries
+                        .iter()
+                        .any(|entry| entry.path != PathBuf::from("d/inside.txt"));
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            let flips = flipper.join().unwrap();
+            assert!(
+                attempts > 0 && flips > 0,
+                "no race activity in round {round}"
+            );
+            assert!(
+                !escaped,
+                "list escaped during directory swap in round {round}"
+            );
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn qa10_toctou_glob_never_matches_external_paths() {
+        for round in 0..5 {
+            let directory = tempfile::tempdir().unwrap();
+            let workspace = directory.path().join("root");
+            let outside = directory.path().join("outside");
+            fs::create_dir(&workspace).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("outside-secret.txt"), "outside-secret\n").unwrap();
+            let tool = GlobTool::new(WorkspaceRoot::new(&workspace).unwrap());
+            let (start, stop, flipper) = spawn_dir_swapper(workspace, outside.clone());
+            start.wait();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut attempts = 0;
+            let mut escaped = false;
+            while Instant::now() < deadline && !escaped {
+                attempts += 1;
+                if let Ok(matches) = run(&tool, glob("d", "d/*")).await {
+                    escaped = matches
+                        .iter()
+                        .any(|path| path != &PathBuf::from("d/inside.txt"));
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            let flips = flipper.join().unwrap();
+            assert!(
+                attempts > 0 && flips > 0,
+                "no race activity in round {round}"
+            );
+            assert!(
+                !escaped,
+                "glob escaped during directory swap in round {round}"
+            );
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn qa10_toctou_grep_never_matches_external_content() {
+        for round in 0..5 {
+            let directory = tempfile::tempdir().unwrap();
+            let workspace = directory.path().join("root");
+            let outside = directory.path().join("outside");
+            fs::create_dir(&workspace).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("outside-secret.txt"), "outside-secret\n").unwrap();
+            let tool = GrepTool::new(WorkspaceRoot::new(&workspace).unwrap());
+            let (start, stop, flipper) = spawn_dir_swapper(workspace, outside.clone());
+            start.wait();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut attempts = 0;
+            let mut escaped = false;
+            while Instant::now() < deadline && !escaped {
+                attempts += 1;
+                if let Ok(matches) = run(&tool, grep("d", "outside-secret")).await {
+                    escaped = !matches.is_empty();
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            let flips = flipper.join().unwrap();
+            assert!(
+                attempts > 0 && flips > 0,
+                "no race activity in round {round}"
+            );
+            assert!(
+                !escaped,
+                "grep escaped during directory swap in round {round}"
+            );
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
         }
     }
 
@@ -1400,6 +1823,87 @@ mod symlinks {
         let entries = run(&ListDirTool::new(root), ".".into()).await.unwrap();
         assert!(entries[0].file_type.is_symlink());
         assert!(entries[2].file_type.is_symlink());
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_absolute_external_symlink_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("root")).unwrap();
+        fs::create_dir(directory.path().join("outside")).unwrap();
+        fs::write(directory.path().join("outside/file"), "original").unwrap();
+        symlink(
+            directory.path().join("outside/file"),
+            directory.path().join("root/link"),
+        )
+        .unwrap();
+        symlink(
+            directory.path().join("outside"),
+            directory.path().join("root/parent"),
+        )
+        .unwrap();
+        let tool = WriteFileTool::new(WorkspaceRoot::new(directory.path().join("root")).unwrap());
+        for path in ["link", "parent", "parent/file", "parent/new"] {
+            assert!(
+                run(
+                    &tool,
+                    WriteFileRequest {
+                        path: path.into(),
+                        content: "changed".into(),
+                    }
+                )
+                .await
+                .is_err(),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(directory.path().join("outside/file")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            fs::read_dir(directory.path().join("outside"))
+                .unwrap()
+                .count(),
+            1
+        );
+        for name in ["link", "parent"] {
+            assert!(
+                fs::symlink_metadata(directory.path().join("root").join(name))
+                    .unwrap()
+                    .is_symlink()
+            );
+        }
+        assert_eq!(
+            entry_names(&directory.path().join("root")),
+            ["link", "parent"]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_through_in_root_final_symlink_replaces_target_not_link() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("real"), "original").unwrap();
+        symlink("real", directory.path().join("link")).unwrap();
+        let root = WorkspaceRoot::new(directory.path()).unwrap();
+        let change = run(
+            &WriteFileTool::new(root),
+            WriteFileRequest {
+                path: "link".into(),
+                content: "changed".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(change.path, PathBuf::from("real"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("real")).unwrap(),
+            "changed"
+        );
+        assert_eq!(
+            fs::read_link(directory.path().join("link")).unwrap(),
+            PathBuf::from("real")
+        );
+        assert_eq!(entry_names(directory.path()), ["link", "real"]);
     }
 }
 
