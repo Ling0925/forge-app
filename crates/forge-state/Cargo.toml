@@ -3,3 +3,14 @@ name = "forge-state"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+forge-protocol.workspace = true
+
+[dev-dependencies]
+forge-core.workspace = true
+forge-store.workspace = true
+forge-testkit = { path = "../forge-testkit" }
+forge-tools.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
