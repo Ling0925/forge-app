@@ -6,11 +6,18 @@ license.workspace = true
 
 [dependencies]
 forge-protocol.workspace = true
+globset = "0.4.21"
+ignore = "0.4.34"
+regex = "1.13.1"
+sha2.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [features]
 failpoints = []

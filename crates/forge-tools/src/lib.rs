@@ -1,8 +1,12 @@
+pub mod cancellation;
 pub mod clock;
 #[cfg(unix)]
 pub mod command;
 #[cfg(feature = "failpoints")]
 pub mod failpoints;
+pub mod files;
+pub mod search;
+pub mod workspace;
 
 use forge_protocol::ToolCallId;
 use std::{future::Future, pin::Pin};
@@ -21,6 +25,8 @@ pub struct ToolResult<T> {
 pub enum ToolError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Task(#[from] tokio::task::JoinError),
     #[error("{0}")]
     InvalidArguments(String),
     #[error("tool cancelled")]
@@ -38,6 +44,17 @@ pub trait Tool: Send + Sync {
         &self,
         request: ToolRequest<Self::Request>,
     ) -> ToolFuture<'_, ToolResult<Self::Output>>;
+}
+
+async fn blocking<I: Send + 'static, O: Send + 'static>(
+    request: ToolRequest<I>,
+    run: impl FnOnce(I) -> Result<O, ToolError> + Send + 'static,
+) -> Result<ToolResult<O>, ToolError> {
+    let output = tokio::task::spawn_blocking(move || run(request.input)).await??;
+    Ok(ToolResult {
+        call: request.call,
+        output,
+    })
 }
 
 #[cfg(feature = "failpoints")]
