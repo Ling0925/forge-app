@@ -29,6 +29,9 @@ pub struct FailureVm {
     pub retryable: bool,
     /// Provider/raw message. Shown only under "详情", always via [`redact_secrets`].
     pub raw_message: String,
+    /// Where an Unknown/Server failure came from (`storage`, `provider`, …);
+    /// lets the card swap its title (§6.7 mapping, 2026-11-14).
+    pub source: Option<String>,
 }
 
 impl FailureVm {
@@ -39,6 +42,7 @@ impl FailureVm {
             retry_after_ms: None,
             retryable: default_retryable(category),
             raw_message: String::new(),
+            source: None,
         }
     }
 }
@@ -120,19 +124,30 @@ fn parse_p0_reason(reason: &str) -> FailureVm {
         None => (reason, ""),
     };
     let mut words = head.split_whitespace();
-    let category = words.next().map(|w| ErrorKind::from_reason(Some(w)));
-    let Some(category) = category.filter(|c| *c != ErrorKind::Unknown || head.trim() == "unknown")
+    let first = words.next();
+    let category = first.map(|w| ErrorKind::from_reason(Some(w)));
+    let Some(category) = category.filter(|c| *c != ErrorKind::Unknown || first == Some("unknown"))
     else {
         let mut failure = FailureVm::new(ErrorKind::Unknown);
         failure.raw_message = reason.trim().to_owned();
         return failure;
     };
+    // Design mapping (2026-11-14, final table lives in Core's PROTOCOL.md):
+    // `provider` (no HTTP status, bad response/stream) → Server card;
+    // `storage` during a run → Unknown card titled "保存失败".
+    let (category, source) = match category {
+        ErrorKind::Provider => (ErrorKind::Server, Some("provider")),
+        ErrorKind::Storage => (ErrorKind::Unknown, Some("storage")),
+        other => (other, None),
+    };
     let mut failure = FailureVm::new(category);
+    failure.source = source.map(str::to_owned);
     for word in words {
         match word.split_once('=') {
             Some(("http_status", v)) => failure.http_status = v.parse().ok(),
             Some(("retry_after_ms", v)) => failure.retry_after_ms = v.parse().ok(),
             Some(("retryable", v)) => failure.retryable = v == "true",
+            Some(("source", v)) => failure.source = Some(v.to_owned()),
             _ => {}
         }
     }
@@ -184,6 +199,15 @@ impl ErrorCardKind {
             ErrorKind::ContextTooLong => Self::ContextTooLong,
             ErrorKind::Interrupted => Self::Interrupted,
             ErrorKind::Provider | ErrorKind::Storage | ErrorKind::Unknown => Self::Unknown,
+        }
+    }
+
+    /// Title/body keys, with the source override (Unknown + `storage` →
+    /// "保存失败").
+    pub fn keys_for(self, failure: &FailureVm) -> (&'static str, &'static str) {
+        match (self, failure.source.as_deref()) {
+            (Self::Unknown, Some("storage")) => ("error.storage.title", "error.storage.body"),
+            _ => self.keys(),
         }
     }
 
@@ -283,7 +307,7 @@ impl ErrorCardVm {
         utc_offset_ms: i64,
     ) -> Self {
         let kind = ErrorCardKind::for_failure(failure);
-        let (title_key, body_key) = kind.keys();
+        let (title_key, body_key) = kind.keys_for(failure);
         // §6.7: only Retry-After > 60 s ("服务要求等待") gates the button; a
         // shorter Retry-After is already spent by Core's own retries.
         let retry = match retry_at_ms {
@@ -374,6 +398,11 @@ fn category_code(kind: ErrorKind) -> &'static str {
         ErrorKind::Interrupted => "interrupted",
         ErrorKind::Unknown => "unknown",
     }
+}
+
+/// Card title for a failure (also used by the "运行失败：<标题>" announcement).
+pub fn card_title(failure: &FailureVm) -> &'static str {
+    t(ErrorCardKind::for_failure(failure).keys_for(failure).0)
 }
 
 /// Local wall-clock "HH:MM" for a UTC-ms instant.

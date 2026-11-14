@@ -875,6 +875,7 @@ impl AppState {
         }
         let failure = outcome_vm.failure();
         let error_kind = failure.as_ref().map(|f| f.category);
+        let failure_title = failure.as_ref().map(crate::outcome::card_title);
         // §6.7: the error card sits after the run's content, before the divider.
         if let Some(failure) = failure {
             vm.timeline.push(TimelineItem::Error(ErrorVm {
@@ -912,9 +913,12 @@ impl AppState {
                 &[("duration", &crate::i18n::format_elapsed(elapsed_secs))],
             ),
             (RunOutcome::Cancelled, _) => t("announce.run.cancelled").into(),
-            (_, kind) => tf(
+            (_, _) => tf(
                 "announce.run.failed",
-                &[("title", t(kind.unwrap_or(ErrorKind::Unknown).title_key()))],
+                &[(
+                    "title",
+                    failure_title.unwrap_or_else(|| t(ErrorKind::Unknown.title_key())),
+                )],
             ),
         };
         let priority = if error_kind.is_some() {

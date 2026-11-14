@@ -644,3 +644,36 @@ fn cmd_r_retries_latest_failed_run_only() {
         .collect();
     assert_eq!(shortcuts, vec![None, Some("⌘R")]);
 }
+
+#[test]
+fn provider_maps_to_server_card_and_storage_to_save_failed() {
+    let c = card(&failed_app("provider: stream ended early"));
+    assert_eq!(c.kind, ErrorCardKind::Server);
+    assert_eq!(c.title, "模型服务出错");
+    assert_eq!(
+        (c.primary, c.primary_shortcut),
+        (ErrorAction::Retry, Some("⌘R"))
+    );
+
+    let mut app = failed_app("storage: disk full");
+    let c = card(&app);
+    assert_eq!(c.kind, ErrorCardKind::Unknown);
+    assert_eq!(c.title, "保存失败");
+    assert_eq!(c.body, "运行结果没能写入本地数据，详情里有原因。");
+    assert_eq!(c.a11y_label, "运行失败：保存失败");
+    assert!(
+        app.take_announcements()
+            .iter()
+            .any(|a| a.text == "运行失败：保存失败"),
+        "announcement uses the overridden title"
+    );
+
+    // P1 shape: Unknown with an explicit source field.
+    let c = card(&failed_app("unknown source=storage: write failed"));
+    assert_eq!(
+        (c.kind, c.title.as_str()),
+        (ErrorCardKind::Unknown, "保存失败")
+    );
+    // Plain Unknown keeps the default title.
+    assert_eq!(card(&failed_app("weird")).title, "运行失败");
+}
