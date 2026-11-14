@@ -213,7 +213,7 @@ impl AppState {
                 .then_with(|| a.session.id.cmp(&b.session.id))
         });
         let mut vm = SidebarVm {
-            visible: self.sidebar_visible,
+            visible: self.ui.sidebar_visible,
             needs_attention: Vec::new(),
             in_progress: Vec::new(),
             recent: Vec::new(),

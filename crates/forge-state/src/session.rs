@@ -28,6 +28,10 @@ pub struct AssistantMessageVm {
     pub streaming: bool,
     /// Run was cancelled: keep received text and render the "（已停止）" suffix.
     pub stopped: bool,
+    /// UI clock when the first reasoning delta arrived.
+    pub reasoning_started_ms: Option<u64>,
+    /// How long the model reasoned ("思考了 12 秒"); set when text starts.
+    pub reasoning_ms: Option<u64>,
 }
 
 /// Error classification for error cards / sidebar (§5.1 `ErrorVm.kind`).
@@ -99,8 +103,11 @@ impl ErrorKind {
 pub struct ErrorVm {
     pub run_id: RunId,
     pub kind: ErrorKind,
-    /// Raw detail, shown only under "详情".
+    /// Raw P0 reason string (unredacted; render only via `ErrorCardVm`).
     pub detail: Option<String>,
+    pub failure: crate::outcome::FailureVm,
+    /// UI clock (ms) before which retry stays disabled (Retry-After, R7a).
+    pub retry_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +146,8 @@ pub enum RunPhase {
         attempt: u32,
         delay_ms: u64,
         reason: String,
+        /// UI clock (ms) of the next attempt, for the countdown.
+        next_at_ms: u64,
     },
     Cancelling,
     Finished(RunOutcome),
@@ -164,6 +173,8 @@ pub struct RunVm {
     pub finished_at_ms: Option<u64>,
     /// `CancelRun` already sent for this run; ⌘. must not send it again (UI-CP-04).
     pub cancel_requested: bool,
+    /// Structured outcome once finished (P0 adapter today, see `outcome.rs`).
+    pub outcome: Option<crate::outcome::RunOutcomeVm>,
 }
 
 /// Composer in-flight request (§6.9 "发送中").
@@ -227,6 +238,9 @@ pub struct SessionVm {
     /// Monotonic activity stamp (event seq) used to order the sidebar; the
     /// protocol `Session` has no `updated_at` yet.
     pub last_activity: u64,
+    /// UI-only disclosure state: reasoning (`run id`) and error details.
+    pub expanded_reasoning: BTreeSet<RunId>,
+    pub expanded_details: BTreeSet<RunId>,
     /// Accepted `Send`s whose run has not started yet (input id, text, direct?).
     pub(crate) accepted_inputs: VecDeque<(InputId, String, bool)>,
 }
@@ -247,6 +261,8 @@ impl SessionVm {
             last_outcome: None,
             last_error: None,
             last_activity: activity,
+            expanded_reasoning: BTreeSet::new(),
+            expanded_details: BTreeSet::new(),
             accepted_inputs: VecDeque::new(),
         }
     }
@@ -314,6 +330,8 @@ impl SessionVm {
                     reasoning: String::new(),
                     streaming: true,
                     stopped: false,
+                    reasoning_started_ms: None,
+                    reasoning_ms: None,
                 }));
         }
         self.assistant_mut(run)

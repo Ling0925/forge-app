@@ -68,6 +68,7 @@ pub(crate) enum Pending {
         previous: PermissionMode,
     },
     AddWorkspace,
+    Retry,
     Shutdown,
 }
 
@@ -131,11 +132,33 @@ pub enum AnnouncementPriority {
     High,
 }
 
+/// Announcement category; same-kind announcements within
+/// [`ANNOUNCE_MERGE_MS`] are merged (§8.2 "同一类 2 秒内合并").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnnouncementKind {
+    RunStarted,
+    RunFinished,
+    Approval,
+    Retrying,
+    QueuePaused,
+    Other,
+}
+
+pub const ANNOUNCE_MERGE_MS: u64 = 2_000;
+
 /// VoiceOver announcement (§8.2). The host forwards these to the AppKit bridge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Announcement {
+    pub kind: AnnouncementKind,
     pub priority: AnnouncementPriority,
     pub text: String,
+    pub at_ms: u64,
+}
+
+impl PartialEq<&str> for Announcement {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,7 +218,8 @@ pub struct AppState {
     pub active_workspace: Option<WorkspaceId>,
     pub sessions: BTreeMap<SessionId, SessionVm>,
     pub selected_session: Option<SessionId>,
-    pub sidebar_visible: bool,
+    /// Column widths / visibility (§4); persisted via `Settings.ui_prefs` later.
+    pub ui: crate::layout::UiPrefs,
     pub show_archived: bool,
     pub settings: SettingsVm,
     pub onboarding: Option<OnboardingVm>,
@@ -207,6 +231,8 @@ pub struct AppState {
     pub resync: ResyncState,
     pub(crate) now_ms: u64,
     pub(crate) announcements: Vec<Announcement>,
+    /// When each kind was last handed to the screen reader (merge window).
+    pub(crate) announced_at: HashMap<AnnouncementKind, u64>,
     pub(crate) outbox: Vec<Outgoing>,
     pub(crate) pending: HashMap<CommandToken, (Pending, Command)>,
     next_token: u64,
@@ -235,7 +261,7 @@ impl AppState {
             active_workspace: None,
             sessions: BTreeMap::new(),
             selected_session: None,
-            sidebar_visible: true,
+            ui: crate::layout::UiPrefs::default(),
             show_archived: false,
             settings: SettingsVm::default(),
             onboarding: None,
@@ -247,6 +273,7 @@ impl AppState {
             resync: ResyncState::Idle,
             now_ms: 0,
             announcements: Vec::new(),
+            announced_at: HashMap::new(),
             outbox: Vec::new(),
             pending: HashMap::new(),
             next_token: 0,
@@ -273,8 +300,28 @@ impl AppState {
         std::mem::take(&mut self.outbox)
     }
 
+    /// Announcements ready to speak now. A kind spoken less than
+    /// [`ANNOUNCE_MERGE_MS`] ago stays queued (and keeps merging newer text of
+    /// the same kind) until the window passes; the host polls every second.
     pub fn take_announcements(&mut self) -> Vec<Announcement> {
-        std::mem::take(&mut self.announcements)
+        let now = self.now_ms;
+        let mut ready = Vec::new();
+        let mut held = Vec::new();
+        for announcement in std::mem::take(&mut self.announcements) {
+            let recent = announcement.kind != AnnouncementKind::Other
+                && self
+                    .announced_at
+                    .get(&announcement.kind)
+                    .is_some_and(|at| now.saturating_sub(*at) < ANNOUNCE_MERGE_MS);
+            if recent {
+                held.push(announcement);
+            } else {
+                self.announced_at.insert(announcement.kind, now);
+                ready.push(announcement);
+            }
+        }
+        self.announcements = held;
+        ready
     }
 
     pub fn has_pending(&self, token: CommandToken) -> bool {
@@ -299,8 +346,32 @@ impl AppState {
         token
     }
 
-    pub(crate) fn announce(&mut self, priority: AnnouncementPriority, text: String) {
-        self.announcements.push(Announcement { priority, text });
+    pub(crate) fn announce(
+        &mut self,
+        kind: AnnouncementKind,
+        priority: AnnouncementPriority,
+        text: String,
+    ) {
+        let now = self.now_ms;
+        // Merge into a still-queued announcement of the same kind (latest text
+        // wins, highest priority kept) instead of queueing a second one.
+        if let Some(queued) = self
+            .announcements
+            .iter_mut()
+            .rev()
+            .find(|a| a.kind == kind && kind != AnnouncementKind::Other)
+        {
+            queued.text = text;
+            queued.priority = queued.priority.max(priority);
+            queued.at_ms = now;
+            return;
+        }
+        self.announcements.push(Announcement {
+            kind,
+            priority,
+            text,
+            at_ms: now,
+        });
     }
 
     pub fn selected(&self) -> Option<&SessionVm> {
@@ -434,7 +505,19 @@ impl AppState {
             }
             Event::QueuePaused { session, reason } => {
                 if let Some(vm) = self.sessions.get_mut(&session) {
-                    vm.queue_paused = Some(reason);
+                    vm.queue_paused = Some(reason.clone());
+                    let reason_key = match reason {
+                        QueuePauseReason::User => "queue.pause.user",
+                        QueuePauseReason::Failed => "queue.pause.failed",
+                        QueuePauseReason::Cancelled => "queue.pause.cancelled",
+                        QueuePauseReason::Interrupted => "queue.pause.interrupted",
+                        QueuePauseReason::Uncertain => "queue.pause.uncertain",
+                    };
+                    self.announce(
+                        AnnouncementKind::QueuePaused,
+                        AnnouncementPriority::Medium,
+                        tf("announce.queue_paused", &[("reason", t(reason_key))]),
+                    );
                 }
             }
             Event::QueueResumed { session } => {
@@ -453,6 +536,7 @@ impl AppState {
                 // Steer bubbles land in P3 (§11 phase mapping).
             }
             Event::TextDelta { run, text } => {
+                let now = self.now_ms;
                 if let Some((vm, run)) = self.run_mut(&run) {
                     if let Some(r) = vm.runs.get_mut(&run)
                         && !r.phase.is_terminal()
@@ -460,17 +544,26 @@ impl AppState {
                     {
                         r.phase = RunPhase::Streaming;
                     }
-                    vm.ensure_assistant(&run).text.push_str(&text);
+                    let message = vm.ensure_assistant(&run);
+                    if let Some(start) = message.reasoning_started_ms
+                        && message.reasoning_ms.is_none()
+                    {
+                        message.reasoning_ms = Some(now.saturating_sub(start));
+                    }
+                    message.text.push_str(&text);
                 }
             }
             Event::ReasoningDelta { run, text } => {
+                let now = self.now_ms;
                 if let Some((vm, run)) = self.run_mut(&run) {
                     if let Some(r) = vm.runs.get_mut(&run)
                         && matches!(r.phase, RunPhase::Starting | RunPhase::Retrying { .. })
                     {
                         r.phase = RunPhase::Thinking;
                     }
-                    vm.ensure_assistant(&run).reasoning.push_str(&text);
+                    let message = vm.ensure_assistant(&run);
+                    message.reasoning_started_ms.get_or_insert(now);
+                    message.reasoning.push_str(&text);
                 }
             }
             Event::ProviderAttempt { .. } => {}
@@ -480,6 +573,8 @@ impl AppState {
                 delay_ms,
                 reason,
             } => {
+                let now = self.now_ms;
+                let mut announce = false;
                 if let Some((vm, run)) = self.run_mut(&run)
                     && let Some(r) = vm.runs.get_mut(&run)
                     && !r.phase.is_terminal()
@@ -488,7 +583,17 @@ impl AppState {
                         attempt: n,
                         delay_ms,
                         reason,
+                        next_at_ms: now + delay_ms,
                     };
+                    // §8.2 / UI-VO-03: only the first and the last retry speak.
+                    announce = n == 1 || n == crate::outcome::RETRY_MAX_ATTEMPTS;
+                }
+                if announce {
+                    self.announce(
+                        AnnouncementKind::Retrying,
+                        AnnouncementPriority::Low,
+                        tf("announce.retrying", &[("n", &n.to_string())]),
+                    );
                 }
             }
             Event::GenerationReset { run } => {
@@ -656,11 +761,16 @@ impl AppState {
                 started_at_ms: now,
                 finished_at_ms: None,
                 cancel_requested: false,
+                outcome: None,
             },
         );
         vm.active_run = Some(run.id);
         vm.last_activity = seq;
-        self.announce(AnnouncementPriority::Low, t("announce.run.started").into());
+        self.announce(
+            AnnouncementKind::RunStarted,
+            AnnouncementPriority::Low,
+            t("announce.run.started").into(),
+        );
     }
 
     fn on_run_state(&mut self, run: RunId, state: RunState) {
@@ -704,6 +814,7 @@ impl AppState {
                     attempt: 0,
                     delay_ms: 0,
                     reason: String::new(),
+                    next_at_ms: 0,
                 },
             },
             RunState::Cancelling => RunPhase::Cancelling,
@@ -715,6 +826,7 @@ impl AppState {
     /// ignored.
     fn finish_run(&mut self, run: &RunId, outcome: RunOutcome, reason: Option<String>, seq: u64) {
         let now = self.now_ms;
+        let shutting_down = matches!(self.quit, crate::QuitState::ShuttingDown { .. });
         let Some((vm, run)) = self.run_mut(run) else {
             return;
         };
@@ -724,8 +836,15 @@ impl AppState {
         if r.phase.is_terminal() {
             return;
         }
+        let outcome_vm = crate::outcome::outcome_from_p0(
+            outcome.clone(),
+            reason.as_deref(),
+            r.cancel_requested,
+            shutting_down,
+        );
         r.phase = RunPhase::Finished(outcome.clone());
         r.finished_at_ms = Some(now);
+        r.outcome = Some(outcome_vm.clone());
         if reason.is_some() {
             r.reason = reason.clone();
         }
@@ -736,23 +855,28 @@ impl AppState {
         if let Some(message) = vm.assistant_mut(&run) {
             message.streaming = false;
             message.stopped = outcome == RunOutcome::Cancelled;
+            if let Some(start) = message.reasoning_started_ms
+                && message.reasoning_ms.is_none()
+            {
+                message.reasoning_ms = Some(now.saturating_sub(start));
+            }
+        }
+        let failure = outcome_vm.failure();
+        let error_kind = failure.as_ref().map(|f| f.category);
+        // §6.7: the error card sits after the run's content, before the divider.
+        if let Some(failure) = failure {
+            vm.timeline.push(TimelineItem::Error(ErrorVm {
+                run_id: run.clone(),
+                kind: failure.category,
+                detail: reason,
+                retry_at_ms: failure.retry_after_ms.map(|ms| now + ms),
+                failure,
+            }));
         }
         vm.timeline.push(TimelineItem::RunDivider {
             run_id: run.clone(),
             outcome: outcome.clone(),
         });
-        let error_kind = match outcome {
-            RunOutcome::Failed => Some(ErrorKind::from_reason(reason.as_deref())),
-            RunOutcome::Interrupted => Some(ErrorKind::Interrupted),
-            _ => None,
-        };
-        if let Some(kind) = error_kind {
-            vm.timeline.push(TimelineItem::Error(ErrorVm {
-                run_id: run.clone(),
-                kind,
-                detail: reason,
-            }));
-        }
         vm.last_error = error_kind;
         vm.last_outcome = Some(outcome.clone());
         vm.last_activity = seq.max(vm.last_activity);
@@ -782,7 +906,7 @@ impl AppState {
         } else {
             AnnouncementPriority::Medium
         };
-        self.announce(priority, text);
+        self.announce(AnnouncementKind::RunFinished, priority, text);
     }
 
     fn on_approval_requested(&mut self, approval: Approval, seq: u64) {
@@ -804,6 +928,7 @@ impl AppState {
         self.approvals
             .insert(approval.id, (session, approval.tool_call_id));
         self.announce(
+            AnnouncementKind::Approval,
             AnnouncementPriority::High,
             tf("announce.approval", &[("action", &tool)]),
         );
@@ -879,7 +1004,10 @@ impl AppState {
                     self.toast_rejected(&code, &message);
                 }
             }
-            Pending::Archive { .. } | Pending::Delete { .. } | Pending::AddWorkspace => {
+            Pending::Archive { .. }
+            | Pending::Delete { .. }
+            | Pending::AddWorkspace
+            | Pending::Retry => {
                 if let Some((code, message)) = rejected {
                     self.toast_rejected(&code, &message);
                 }
@@ -1116,7 +1244,7 @@ impl AppState {
     }
 
     pub fn toggle_sidebar(&mut self) {
-        self.sidebar_visible = !self.sidebar_visible;
+        self.ui.sidebar_visible = !self.ui.sidebar_visible;
     }
 
     pub fn set_show_archived(&mut self, show: bool) {
