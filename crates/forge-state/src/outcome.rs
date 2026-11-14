@@ -259,6 +259,9 @@ pub struct ErrorCardVm {
     pub body: String,
     pub primary: ErrorAction,
     pub secondary: ErrorAction,
+    /// Shortcut hint shown on the primary button ("重试 ⌘R"); only the latest
+    /// card of a session keeps it (the shortcut acts on the latest run).
+    pub primary_shortcut: Option<&'static str>,
     pub retry: RetryButtonState,
     /// Localised label for the retry button ("重试" / "重试（1 分 40 秒）").
     pub retry_label: String,
@@ -277,14 +280,23 @@ impl ErrorCardVm {
         now_ms: u64,
         provider: &str,
         details_open: bool,
+        utc_offset_ms: i64,
     ) -> Self {
         let kind = ErrorCardKind::for_failure(failure);
         let (title_key, body_key) = kind.keys();
+        // §6.7: only Retry-After > 60 s ("服务要求等待") gates the button; a
+        // shorter Retry-After is already spent by Core's own retries.
         let retry = match retry_at_ms {
-            Some(at) if at > now_ms => RetryButtonState::Waiting {
-                remaining_ms: at - now_ms,
-            },
+            Some(at) if at > now_ms && kind == ErrorCardKind::RateLimitedWait => {
+                RetryButtonState::Waiting {
+                    remaining_ms: at - now_ms,
+                }
+            }
             _ => RetryButtonState::Ready,
+        };
+        let until = match (retry, retry_at_ms) {
+            (RetryButtonState::Waiting { .. }, Some(at)) => clock_time(at, utc_offset_ms),
+            _ => String::new(),
         };
         let remaining = match retry {
             RetryButtonState::Waiting { remaining_ms } => format_remaining(remaining_ms),
@@ -293,7 +305,11 @@ impl ErrorCardVm {
         let title = t(title_key).to_owned();
         let body = tf(
             body_key,
-            &[("provider", provider), ("remaining", remaining.as_str())],
+            &[
+                ("provider", provider),
+                ("remaining", remaining.as_str()),
+                ("time", until.as_str()),
+            ],
         );
         let retry_label = match retry {
             RetryButtonState::Ready => t("error.action.retry").to_owned(),
@@ -311,10 +327,25 @@ impl ErrorCardVm {
             &[("code", category_code(failure.category))],
         ));
         if !failure.raw_message.is_empty() {
-            details.push(redact_secrets(&failure.raw_message));
+            let (text, removed) = sanitize_details(&failure.raw_message);
+            if !text.is_empty() {
+                details.push(text);
+            }
+            if removed > 0 {
+                details.push(tf(
+                    "error.detail.headers_removed",
+                    &[("n", &removed.to_string())],
+                ));
+            }
         }
         let (primary, secondary) = kind.actions();
+        let primary_shortcut = match primary {
+            ErrorAction::Retry => Some("⌘R"),
+            ErrorAction::NewSession => Some("⌘N"),
+            _ => None,
+        };
         Self {
+            primary_shortcut,
             run_id: run_id.clone(),
             kind,
             a11y_label: tf("announce.run.failed", &[("title", title.as_str())]),
@@ -343,6 +374,13 @@ fn category_code(kind: ErrorKind) -> &'static str {
         ErrorKind::Interrupted => "interrupted",
         ErrorKind::Unknown => "unknown",
     }
+}
+
+/// Local wall-clock "HH:MM" for a UTC-ms instant.
+pub fn clock_time(utc_ms: u64, utc_offset_ms: i64) -> String {
+    let local = utc_ms as i64 + utc_offset_ms;
+    let minutes = local.div_euclid(60_000).rem_euclid(24 * 60);
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 /// "1 分 40 秒" / "40 秒" (rounded up so it never shows 0 while waiting).
@@ -390,9 +428,75 @@ impl RetryMarkerVm {
     }
 }
 
+/// Header names whose whole line is dropped from error details (UI-ER-04):
+/// anything that names credentials or session state.
+const SENSITIVE_HEADER_PARTS: [&str; 8] = [
+    "auth",
+    "key",
+    "token",
+    "secret",
+    "cookie",
+    "session",
+    "password",
+    "organization",
+];
+
+/// `Name:` / `"name":` at the start of `word` → the lower-cased header name.
+fn header_name(word: &str) -> Option<String> {
+    let word = word.trim_start_matches(['"', '\'', '{', ',', '[']);
+    let (name, _) = word.split_once(':')?;
+    let name = name.trim_end_matches(['"', '\'']);
+    let valid = !name.is_empty()
+        && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    valid.then(|| name.to_ascii_lowercase())
+}
+
+fn is_sensitive_header(word: &str) -> bool {
+    header_name(word).is_some_and(|name| SENSITIVE_HEADER_PARTS.iter().any(|p| name.contains(p)))
+}
+
+/// Error-details text for display (UI-ER-04). Request-header lines that carry
+/// credentials (`Authorization:`, `x-api-key:`, `Cookie:` …) are removed
+/// entirely — a header that starts mid-line cuts the rest of that line — and
+/// whatever remains goes through [`redact_secrets`]. Returns the text and the
+/// number of header lines removed.
+pub fn sanitize_details(text: &str) -> (String, usize) {
+    let mut removed = 0;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let cut = line
+            .split_whitespace()
+            .find(|word| is_sensitive_header(word))
+            // Byte offset of this word inside `line`.
+            .map(|word| word.as_ptr() as usize - line.as_ptr() as usize);
+        let kept = match cut {
+            Some(offset) => {
+                removed += 1;
+                line[..offset].trim_end()
+            }
+            None => line,
+        };
+        if !kept.trim().is_empty() {
+            lines.push(redact_secrets(kept));
+        }
+    }
+    (lines.join("\n"), removed)
+}
+
 /// UI-ER-04: no API key may reach the card. Masks `sk-…`-style keys, bearer
-/// tokens, `api_key=` values and any long opaque token (≥ 32 chars).
+/// tokens, `api_key=` values and any long opaque token (≥ 32 chars), line by
+/// line (whitespace is preserved).
 pub fn redact_secrets(text: &str) -> String {
+    text.split('\n')
+        .map(redact_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn redact_line(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut mask_next = false;
     for (i, piece) in text.split(' ').enumerate() {
@@ -441,6 +545,39 @@ mod tests {
         }
         assert!(red.starts_with("401 invalid key ••••"));
         assert!(red.ends_with(" ok"));
+    }
+
+    #[test]
+    fn header_lines_are_removed_not_masked() {
+        let raw = "429 Too Many Requests\nAuthorization: Bearer abc\nx-api-key: hunter2\n\
+                   Cookie: sid=1\nrate limit reached. Authorization: Bearer sk-x\ncontent-type: json";
+        let (text, removed) = sanitize_details(raw);
+        assert_eq!(removed, 4);
+        assert_eq!(
+            text,
+            "429 Too Many Requests\nrate limit reached.\ncontent-type: json"
+        );
+        for gone in [
+            "Authorization",
+            "Bearer",
+            "hunter2",
+            "Cookie",
+            "sid=1",
+            "sk-x",
+        ] {
+            assert!(!text.contains(gone), "{gone} in {text}");
+        }
+        // JSON-ish header dumps too.
+        let (text, removed) = sanitize_details(r#"{"error": "bad", "authorization": "Bearer t"}"#);
+        assert_eq!((text.as_str(), removed), (r#"{"error": "bad","#, 1));
+    }
+
+    #[test]
+    fn clock_time_uses_offset() {
+        // 2026-11-14 06:05 UTC = 14:05 in UTC+8.
+        let utc = 1_794_636_300_000;
+        assert_eq!(clock_time(utc, 0), "06:05");
+        assert_eq!(clock_time(utc, 8 * 3_600_000), "14:05");
     }
 
     #[test]

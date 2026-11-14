@@ -230,6 +230,8 @@ pub struct AppState {
     pub last_seq: u64,
     pub resync: ResyncState,
     pub(crate) now_ms: u64,
+    /// Local time zone offset from UTC (host supplies it; wall-clock texts).
+    pub(crate) utc_offset_ms: i64,
     pub(crate) announcements: Vec<Announcement>,
     /// When each kind was last handed to the screen reader (merge window).
     pub(crate) announced_at: HashMap<AnnouncementKind, u64>,
@@ -273,6 +275,7 @@ impl AppState {
             resync: ResyncState::Idle,
             now_ms: 0,
             announcements: Vec::new(),
+            utc_offset_ms: 0,
             announced_at: HashMap::new(),
             outbox: Vec::new(),
             pending: HashMap::new(),
@@ -286,6 +289,15 @@ impl AppState {
     }
 
     // ---------------------------------------------------------------- plumbing
+
+    /// Local UTC offset used for "可在 14:05 后重试" and day buckets.
+    pub fn set_utc_offset_ms(&mut self, offset_ms: i64) {
+        self.utc_offset_ms = offset_ms;
+    }
+
+    pub fn utc_offset_ms(&self) -> i64 {
+        self.utc_offset_ms
+    }
 
     pub fn set_now_ms(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
@@ -869,7 +881,11 @@ impl AppState {
                 run_id: run.clone(),
                 kind: failure.category,
                 detail: reason,
-                retry_at_ms: failure.retry_after_ms.map(|ms| now + ms),
+                // Only a long Retry-After (> 60 s, R7a) gates the retry button.
+                retry_at_ms: failure
+                    .retry_after_ms
+                    .filter(|ms| *ms > crate::outcome::LONG_RETRY_AFTER_MS)
+                    .map(|ms| now + ms),
                 failure,
             }));
         }
