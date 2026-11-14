@@ -3,11 +3,22 @@ use forge_protocol::{Event, EventEnvelope, RunId};
 #[derive(Default)]
 pub struct EventRecorder {
     events: Vec<EventEnvelope>,
+    drop_seq: Option<u64>,
 }
 
 impl EventRecorder {
-    pub fn record(&mut self, envelope: EventEnvelope) {
-        self.events.push(envelope);
+    pub fn dropping_seq(seq: u64) -> Self {
+        Self {
+            events: Vec::new(),
+            drop_seq: Some(seq),
+        }
+    }
+    pub fn record(&mut self, envelope: EventEnvelope) -> Option<EventEnvelope> {
+        if self.drop_seq == Some(envelope.seq) {
+            return None;
+        }
+        self.events.push(envelope.clone());
+        Some(envelope)
     }
     pub fn events(&self) -> &[EventEnvelope] {
         &self.events

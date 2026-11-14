@@ -42,6 +42,7 @@ async fn records_each_request_and_preserves_http_errors_and_retry_after() {
             )),
         ] {
             errors.push(ProviderError {
+                code: None,
                 kind: ErrorKind::Http {
                     status,
                     retry_after,
@@ -104,6 +105,7 @@ async fn streams_fragments_delays_and_disconnects() {
 #[tokio::test]
 async fn stream_error_ends_stream_and_exhaustion_is_not_retryable() {
     let error = ProviderError {
+        code: None,
         kind: ErrorKind::Http {
             status: 503,
             retry_after: Some(RetryAfter::Delay(Duration::from_secs(3))),

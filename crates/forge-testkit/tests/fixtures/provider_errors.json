@@ -1,0 +1,19 @@
+[
+  {"provider":"anthropic","error":{"type":"authentication_error","message":"Request failed"},"code":"authentication_error","kind":"auth","retryable":false,"stream_kind":"auth","stream_retryable":false},
+  {"provider":"anthropic","error":{"type":"permission_error","code":"overloaded_error","message":"Request failed"},"code":"permission_error","kind":"auth","retryable":false,"stream_kind":"auth","stream_retryable":false},
+  {"provider":"openai","error":{"type":"invalid_request_error","code":"invalid_api_key","message":"Request failed"},"code":"invalid_api_key","kind":"auth","retryable":false,"stream_kind":"auth","stream_retryable":false},
+  {"provider":"openai","error":{"type":"invalid_request_error","code":"insufficient_quota","message":"Request failed"},"code":"insufficient_quota","kind":"quota","retryable":false,"stream_kind":"quota","stream_retryable":false},
+  {"provider":"openai","error":{"type":"billing_error","code":null,"message":"Request failed"},"code":"billing_error","kind":"quota","retryable":false,"stream_kind":"quota","stream_retryable":false},
+  {"provider":"anthropic","error":{"type":"rate_limit_error","message":"Request failed"},"code":"rate_limit_error","kind":"rate_limited","retryable":true,"stream_kind":"rate_limited","stream_retryable":true},
+  {"provider":"openai","error":{"type":"invalid_request_error","code":"rate_limit_exceeded","message":"Request failed"},"code":"rate_limit_exceeded","kind":"rate_limited","retryable":true,"stream_kind":"rate_limited","stream_retryable":true},
+  {"provider":"anthropic","error":{"type":"overloaded_error","message":"Request failed"},"code":"overloaded_error","kind":"server","retryable":true,"stream_kind":"server","stream_retryable":true},
+  {"provider":"anthropic","error":{"type":"api_error","message":"Request failed"},"code":"api_error","kind":"server","retryable":true,"stream_kind":"server","stream_retryable":true},
+  {"provider":"openai","error":{"type":"server_error","message":"Request failed"},"code":"server_error","kind":"server","retryable":true,"stream_kind":"server","stream_retryable":true},
+  {"provider":"openai","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Request failed"},"code":"context_length_exceeded","kind":"context_too_long","retryable":false,"stream_kind":"context_too_long","stream_retryable":false},
+  {"provider":"anthropic","error":{"type":"invalid_request_error","message":"prompt is too long: reduce input"},"code":"invalid_request_error","kind":"context_too_long","retryable":true,"stream_kind":"context_too_long","stream_retryable":false},
+  {"provider":"openai","error":{"type":"invalid_request_error","message":"prompt is too long: reduce input"},"code":"invalid_request_error","kind":{"unknown":{"source":"provider"}},"retryable":true,"stream_kind":"server","stream_retryable":true},
+  {"provider":"anthropic","error":{"type":"invalid_request_error","message":"quota context_length_exceeded rate_limit_error authentication_error overloaded_error"},"code":"invalid_request_error","kind":{"unknown":{"source":"provider"}},"retryable":true,"stream_kind":"server","stream_retryable":true},
+  {"provider":"openai","error":{"type":"overloaded_error","code":"unknown_error","message":"rate_limit_error quota api_error server_error context_length_exceeded"},"code":"unknown_error","kind":{"unknown":{"source":"provider"}},"retryable":true,"stream_kind":"server","stream_retryable":true},
+  {"provider":"openai","error":{"message":"authentication_error quota rate_limit_error overloaded_error prompt is too long"},"code":null,"kind":{"unknown":{"source":"provider"}},"retryable":true,"stream_kind":"server","stream_retryable":true},
+  {"provider":"anthropic","error":{"code":"rate_limit_error","message":"overloaded_error"},"code":null,"kind":{"unknown":{"source":"provider"}},"retryable":true,"stream_kind":"server","stream_retryable":true}
+]

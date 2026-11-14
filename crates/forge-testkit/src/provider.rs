@@ -65,6 +65,7 @@ impl Provider for ScriptedProvider {
                 }) as Box<dyn ProviderStream>),
                 Some(Script::Error(error)) => Err(error),
                 None => Err(ProviderError {
+                    code: None,
                     kind: ErrorKind::Configuration,
                     message: "provider script exhausted".into(),
                 }),
@@ -92,6 +93,7 @@ impl ProviderStream for ScriptedStream {
                     Step::Disconnect => {
                         self.steps.clear();
                         return Some(Err(ProviderError {
+                            code: None,
                             kind: ErrorKind::Disconnected,
                             message: "scripted stream disconnected".into(),
                         }));
@@ -100,5 +102,16 @@ impl ProviderStream for ScriptedStream {
             }
             None
         })
+    }
+}
+
+pub struct FixedProviderFactory(pub Arc<dyn Provider>);
+impl forge_provider::ProviderFactory for FixedProviderFactory {
+    fn create(
+        &self,
+        _settings: &forge_protocol::ProviderSettings,
+        _key: Option<String>,
+    ) -> Result<Arc<dyn Provider>, ProviderError> {
+        Ok(self.0.clone())
     }
 }

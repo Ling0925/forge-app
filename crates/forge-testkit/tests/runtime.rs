@@ -1,11 +1,9 @@
+mod common;
 use forge_core::*;
-use forge_protocol::{
-    ApprovalDecision, ApprovalScope, Content, ModelSelection, PermissionMode, Settings,
-    UncertainAction,
-};
+use forge_protocol::{ApprovalDecision, ApprovalScope, Content, PermissionMode, UncertainAction};
 use forge_protocol::{Command, CommandResult, Event};
 use forge_protocol::{CommandId, NoticeLevel, RejectCode};
-use forge_testkit::provider::ScriptedProvider;
+use forge_testkit::provider::{FixedProviderFactory, ScriptedProvider};
 use forge_tools::clock::FakeClock;
 use std::sync::Arc;
 
@@ -40,11 +38,13 @@ async fn events_share_one_sequence_across_subscribers() {
     let closed = handle.subscribe();
     drop(closed);
     for seq in [8, 9] {
-        let envelope = runtime.publish(Event::Notice {
-            level: NoticeLevel::Info,
-            code: "test".into(),
-            message: "event".into(),
-        });
+        let envelope = runtime
+            .publish(Event::Notice {
+                level: NoticeLevel::Info,
+                code: "test".into(),
+                message: "event".into(),
+            })
+            .unwrap();
         assert_eq!(envelope.seq, seq);
         assert_eq!(first.recv().await.unwrap(), envelope);
         assert_eq!(second.recv().await.unwrap(), envelope);
@@ -64,53 +64,14 @@ async fn closed_runtime_is_reported() {
 }
 
 #[tokio::test]
-async fn p0_dispatch_rejects_every_unimplemented_command_without_events() {
+async fn p1_dispatch_rejects_every_unimplemented_command_without_events() {
     let (mut runtime, handle, _directory) = runtime(0);
     let mut events = handle.subscribe();
     let content = Content {
         text: "input".into(),
         attachments: vec![],
     };
-    let model = ModelSelection {
-        provider: "provider".into(),
-        model: "fixture".into(),
-    };
     for command in [
-        Command::AddWorkspace {
-            path: "/project".into(),
-        },
-        Command::RemoveWorkspace {
-            workspace: "workspace".into(),
-        },
-        Command::TestProviderKey {
-            provider: "provider".into(),
-        },
-        Command::CreateSession {
-            workspace: "workspace".into(),
-            title: "session".into(),
-            model: model.clone(),
-            permission_mode: PermissionMode::Ask,
-        },
-        Command::RenameSession {
-            session: "session".into(),
-            title: "renamed".into(),
-        },
-        Command::ArchiveSession {
-            session: "session".into(),
-            archived: true,
-        },
-        Command::DeleteSession {
-            session: "session".into(),
-        },
-        Command::LoadHistory {
-            session: "session".into(),
-            before_seq: None,
-        },
-        Command::Send {
-            session: "session".into(),
-            input_id: "input".into(),
-            content: content.clone(),
-        },
         Command::Steer {
             run: "run".into(),
             steer_id: "steer".into(),
@@ -156,13 +117,6 @@ async fn p0_dispatch_rejects_every_unimplemented_command_without_events() {
             checkpoint: "checkpoint".into(),
             overwrite: vec![],
         },
-        Command::UpdateSettings {
-            settings: Settings {
-                providers: vec![],
-                model,
-                permission_mode: PermissionMode::Ask,
-            },
-        },
         Command::Shutdown,
     ] {
         let (response, dispatched) = tokio::join!(handle.execute(command), runtime.dispatch_next());
@@ -171,7 +125,7 @@ async fn p0_dispatch_rejects_every_unimplemented_command_without_events() {
             response.unwrap(),
             CommandResult::Rejected {
                 code: RejectCode::NotImplemented,
-                message: "command is not implemented in P0".into(),
+                message: "command is not implemented in P1".into(),
             }
         );
         assert!(matches!(
@@ -191,9 +145,15 @@ fn runtime(last_seq: u64) -> (Runtime, RuntimeHandle, tempfile::TempDir) {
         RuntimeServices {
             clock: clock.clone(),
             store,
-            provider: Arc::new(ScriptedProvider::new(clock, [])),
+            providers: Arc::new(FixedProviderFactory(Arc::new(ScriptedProvider::new(
+                clock,
+                [],
+            )))),
+            secrets: Arc::new(forge_core::secrets::MemorySecretStore::default()),
+            initial_settings: common::settings("script"),
         },
         last_seq,
-    );
+    )
+    .unwrap();
     (runtime, handle, directory)
 }

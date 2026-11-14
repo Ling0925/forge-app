@@ -7,7 +7,6 @@ fn finished(seq: u64) -> EventEnvelope {
         event: Event::RunFinished {
             run: "run".into(),
             outcome: RunOutcome::Succeeded,
-            reason: None,
         },
     }
 }
