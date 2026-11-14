@@ -733,3 +733,113 @@ fn session_updated_before_run_finished_places_the_card_once() {
     assert_eq!(dividers, 1);
     assert_eq!(app.selected().unwrap().last_error, Some(ErrorKind::Server));
 }
+
+#[test]
+fn seq_gap_resync_reloads_history_and_restores_both_gap_failures() {
+    // Designer acceptance: during a seq gap the same open session fails
+    // twice; after Snapshot + LoadHistory both error cards are present,
+    // without duplicates or announcements (restore is history, not live).
+    let mut app = app_with_session();
+    feed(&mut app, [history("s1", page(1..=2), None)]);
+    app.take_outbox();
+    app.take_announcements();
+    let held = app.last_seq;
+
+    let server = RunOutcome::Failed {
+        kind: RunErrorKind::Server,
+        message: "502 bad gateway".into(),
+        http_status: Some(502),
+        retry_after_ms: None,
+        retryable: true,
+    };
+    let auth = RunOutcome::Failed {
+        kind: RunErrorKind::Auth,
+        message: "401 invalid key".into(),
+        http_status: Some(401),
+        retry_after_ms: None,
+        retryable: false,
+    };
+
+    // Snapshot only carries the latest finished run; the earlier failure
+    // arrives with HistoryLoaded.runs.
+    let mut s1 = session_at("s1", 8_000);
+    s1.last_finished_run = Some(FinishedRun {
+        run: "r3".into(),
+        input_id: Some("in5".into()),
+        outcome: auth.clone(),
+        finished_at: 8_000,
+    });
+    at(
+        &mut app,
+        held + 5,
+        snapshot(vec![s1], true, vec![], held + 5),
+    );
+
+    let reload: Vec<_> = app.take_outbox().into_iter().map(|o| o.command).collect();
+    assert!(
+        reload.contains(&Command::LoadHistory {
+            session: "s1".into(),
+            before: None,
+            limit: HISTORY_PAGE,
+        }),
+        "resync must re-issue LoadHistory for the open session: {reload:?}"
+    );
+    // last_finished_run updates the sidebar immediately; no card yet for r2.
+    assert_eq!(app.selected().unwrap().last_error, Some(ErrorKind::Auth));
+    assert!(error_cards(&app).is_empty());
+    app.take_announcements();
+
+    let r2 = failed_run("r2", server.clone(), 3_000, 4_000);
+    feed(
+        &mut app,
+        [Event::HistoryLoaded {
+            session: "s1".into(),
+            messages: {
+                let mut messages = page(1..=2);
+                messages.extend(page(3..=6));
+                messages
+            },
+            next_before: None,
+            runs: vec![r2, failed_run("r3", auth.clone(), 7_000, 8_000)],
+        }],
+    );
+
+    let cards = error_cards(&app);
+    assert_eq!(
+        cards.iter().map(|(_, c)| c.kind).collect::<Vec<_>>(),
+        [ErrorCardKind::Server, ErrorCardKind::Auth],
+        "{cards:?}"
+    );
+    let spoken = app.take_announcements();
+    assert!(
+        spoken.iter().all(
+            |a| a.kind != AnnouncementKind::RunFinished && a.kind != AnnouncementKind::Retrying
+        ),
+        "restore must not announce: {spoken:?}"
+    );
+
+    // The same page again must not duplicate cards or speak.
+    feed(
+        &mut app,
+        [Event::HistoryLoaded {
+            session: "s1".into(),
+            messages: {
+                let mut messages = page(1..=2);
+                messages.extend(page(3..=6));
+                messages
+            },
+            next_before: None,
+            runs: vec![
+                failed_run("r2", server, 3_000, 4_000),
+                failed_run("r3", auth, 7_000, 8_000),
+            ],
+        }],
+    );
+    assert_eq!(error_cards(&app).len(), 2);
+    assert!(
+        app.take_announcements()
+            .iter()
+            .all(|a| a.kind != AnnouncementKind::RunFinished),
+        "repeat HistoryLoaded must stay silent"
+    );
+}

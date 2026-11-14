@@ -68,9 +68,11 @@ impl AppState {
 
         // Active runs: the snapshot is authoritative. Error cards already in
         // memory are kept for runs the snapshot does not contradict (the
-        // timeline is not cleared); TODO(core): restore them from the
-        // snapshot once it carries finished-run outcomes
-        // (see `restore_finished_run`).
+        // timeline is not cleared). Runs that finished during a seq gap are
+        // restored after this snapshot: the selected session reloads its
+        // newest page, and `HistoryLoaded.runs` supplies each run's outcome
+        // (`restore_finished_run`). `Session.last_finished_run` only covers
+        // the latest one (sidebar / R-1).
         let active: BTreeSet<RunId> = active_runs.iter().map(|a| a.run.id.clone()).collect();
         for vm in self.sessions.values_mut() {
             let Some(id) = vm.active_run.clone() else {
@@ -107,9 +109,12 @@ impl AppState {
             self.select_session(&id);
         }
         {
-            // Resync: messages may have been persisted during the gap. The
-            // selected session reloads its newest page now (merged, no
-            // duplicates); the others reload when next opened.
+            // Resync / first snapshot: messages may have been persisted
+            // during a gap. The selected session reloads its newest page now
+            // (merged, no duplicates) so `HistoryLoaded.runs` can restore
+            // every finished run's outcome — not just `last_finished_run`.
+            // Other sessions reload when next opened. A page already in
+            // flight is left alone.
             let selected = self.selected_session.clone();
             for (id, vm) in self.sessions.iter_mut() {
                 if Some(id) != selected.as_ref()
@@ -118,11 +123,14 @@ impl AppState {
                     vm.history = HistoryState::NotLoaded;
                 }
             }
-            if let Some(id) = selected
-                && let Some(vm) = self.sessions.get_mut(&id)
-                && !matches!(vm.history, HistoryState::NotLoaded | HistoryState::Loading)
-            {
-                self.reload_newest(&id);
+            if let Some(id) = selected {
+                let reload = self
+                    .sessions
+                    .get(&id)
+                    .is_some_and(|vm| vm.history != HistoryState::Loading);
+                if reload {
+                    self.reload_newest(&id);
+                }
             }
         }
     }
