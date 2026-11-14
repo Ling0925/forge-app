@@ -11,6 +11,11 @@ pub enum Command {
     RemoveWorkspace {
         workspace: WorkspaceId,
     },
+    GetSnapshot,
+    SetProviderKey {
+        provider: ProviderId,
+        key: Option<String>,
+    },
     TestProviderKey {
         provider: ProviderId,
     },
@@ -33,7 +38,8 @@ pub enum Command {
     },
     LoadHistory {
         session: SessionId,
-        before_seq: Option<u64>,
+        before: Option<u64>,
+        limit: u32,
     },
     Send {
         session: SessionId,
