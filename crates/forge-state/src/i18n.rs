@@ -40,14 +40,11 @@ pub fn format_elapsed(total_secs: u64) -> String {
 /// the ordering and uniqueness.
 pub static ZH_CN: &[(&str, &str)] = &[
     ("a11y.composer", "消息"),
-    ("a11y.composer.hint.idle", "回车发送，Shift 回车换行"),
-    (
-        "a11y.composer.hint.running",
-        "回车加入队列，Option 回车插话",
-    ),
     ("a11y.divider", "运行{outcome}"),
-    ("a11y.error_card", "运行失败：{title}"),
+    ("a11y.inspector.tab", "{label}，{keys}"),
     ("a11y.reasoning", "思考过程"),
+    ("a11y.reasoning.toggle", "{name}，{label}"),
+    ("a11y.settings.row", "{name}，{status}"),
     ("a11y.sidebar", "会话"),
     ("a11y.sidebar.group", "{group}，{n} 个会话"),
     ("a11y.sidebar.resize", "调整侧栏宽度"),
@@ -71,19 +68,9 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("announce.run.succeeded", "运行完成，用时 {duration}"),
     ("announce.run.succeeded_unknown", "运行完成"),
     ("app.title", "Forge"),
-    ("approval.allow", "允许"),
-    ("approval.always", "本会话总是允许"),
-    ("approval.deny", "拒绝"),
-    ("approval.dock", "{n} 个请求等待批准：{action}"),
-    ("approval.dock.view", "查看"),
     ("assistant.reasoning", "思考了 {secs} 秒"),
     ("assistant.stopped_suffix", "（已停止）"),
     ("assistant.thinking", "思考中… {elapsed}"),
-    (
-        "banner.recovery",
-        "上次异常退出。已检查 {s} 个会话：{r} 个运行被中断，{u} 条排队消息状态不确定。",
-    ),
-    ("banner.recovery.view", "查看"),
     ("card.more", "更多操作"),
     ("card.status.failed", "失败"),
     ("composer.attach", "添加附件（即将支持）"),
@@ -102,22 +89,6 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("composer.stop", "停止"),
     ("composer.stop_key", "停止 ⌘."),
     ("composer.stopping", "正在停止…"),
-    (
-        "context.tooltip",
-        "上下文已用 {pct}%（{used} / {limit} tokens）",
-    ),
-    (
-        "context.warning",
-        "上下文已用 {pct}%，接近上限时会自动压缩较早内容",
-    ),
-    (
-        "delete.confirm.body",
-        "会话记录会被删除，已改动的文件不受影响。",
-    ),
-    ("delete.confirm.cancel", "取消"),
-    ("delete.confirm.ok", "删除"),
-    ("delete.confirm.title", "删除“{title}”？"),
-    ("demo.badge", "演示数据"),
     ("divider.cost", "约 ${cost}"),
     ("divider.elapsed", "用时 {elapsed}"),
     ("divider.tokens", "输入 {input} / 输出 {output} tokens"),
@@ -133,6 +104,7 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("error.action.retry_wait", "重试（{remaining}）"),
     ("error.action.settings", "打开设置"),
     ("error.action.view_changes", "查看改动"),
+    ("error.action.with_shortcut", "{label} {shortcut}"),
     ("error.auth.body", "请在设置里检查 {provider} 的 Key。"),
     ("error.auth.title", "API Key 无效或没有权限"),
     ("error.context.body", "已无法再压缩，建议新开会话继续。"),
@@ -183,8 +155,6 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("inspector.tab.output", "工具输出"),
     ("inspector.tab.queue", "队列"),
     ("inspector.title", "Inspector"),
-    ("menu.app.about", "关于 Forge"),
-    ("menu.app.check_updates", "检查更新…"),
     ("menu.app.hide", "隐藏 Forge"),
     ("menu.app.hide_others", "隐藏其他"),
     ("menu.app.quit", "退出 Forge"),
@@ -207,29 +177,11 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("menu.session.retry", "重试上一次运行"),
     ("menu.session.stop", "停止运行"),
     ("menu.view", "显示"),
-    ("menu.view.command_palette", "命令面板…"),
     ("menu.view.toggle_inspector", "显示/隐藏 Inspector"),
     ("menu.view.toggle_sidebar", "显示/隐藏侧栏"),
     ("menu.window", "窗口"),
     ("menu.window.minimize", "最小化"),
-    ("mode.ask", "询问"),
-    ("mode.ask.desc", "修改文件和运行命令前先问你（推荐）"),
-    ("mode.read_only", "只读"),
-    (
-        "mode.read_only.desc",
-        "只能读取和搜索，不会修改文件或运行命令",
-    ),
-    ("mode.unrestricted", "不受限"),
-    (
-        "mode.unrestricted.confirm.body",
-        "Forge 将直接修改文件和运行命令，不再逐个询问。只在你信任当前任务时使用。",
-    ),
-    ("mode.unrestricted.confirm.cancel", "取消"),
-    ("mode.unrestricted.confirm.ok", "切换"),
-    ("mode.unrestricted.confirm.title", "切换到“不受限”？"),
-    ("mode.unrestricted.desc", "直接执行，不再询问"),
     ("notice.compacted", "已压缩较早的上下文"),
-    ("notice.permission", "已切换权限模式：{mode}"),
     ("onboarding.back", "上一步"),
     ("onboarding.done", "完成"),
     ("onboarding.key.later", "稍后再说"),
@@ -255,11 +207,8 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("onboarding.workspace.ok", "可以读写"),
     ("onboarding.workspace.pick", "选择项目文件夹…"),
     ("onboarding.workspace.title", "选择工作区"),
-    ("palette.group.actions", "操作"),
-    ("palette.group.sessions", "会话"),
     ("palette.new_session", "新会话"),
     ("palette.open_settings", "打开设置"),
-    ("palette.placeholder", "搜索会话或操作…"),
     ("palette.stop", "停止"),
     ("palette.toggle_inspector", "显示/隐藏 Inspector"),
     ("palette.toggle_sidebar", "显示/隐藏侧栏"),
@@ -272,7 +221,6 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("quit.confirm.cancel", "取消"),
     ("quit.confirm.ok", "停止并退出"),
     ("quit.confirm.title", "有 {n} 个运行进行中"),
-    ("quit.stopping", "正在停止运行…"),
     ("reject.already_finished", "运行已经结束"),
     ("reject.approval_closed", "该请求已关闭"),
     ("reject.conflict", "内容和已提交的不一致"),
@@ -287,7 +235,6 @@ pub static ZH_CN: &[(&str, &str)] = &[
         "retry.marker",
         "连接中断（{reason}），{secs} 秒后第 {n} 次重试（共 5 次）",
     ),
-    ("retry.now", "立即重试"),
     ("retry.stop", "停止"),
     ("row.cancelled", "已停止"),
     ("row.cancelling", "正在停止…"),
@@ -306,7 +253,6 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("run.succeeded", "完成"),
     ("session.default_title", "新会话"),
     ("settings.close", "关闭"),
-    ("settings.key.base_url_hint", "留空使用官方地址"),
     (
         "settings.key.note",
         "Key 只保存在本机钥匙串里，不写入数据库或日志。",
@@ -329,12 +275,8 @@ pub static ZH_CN: &[(&str, &str)] = &[
         "settings.keychain_denied",
         "无法访问钥匙串，请在弹出的系统对话框中允许",
     ),
-    ("settings.page.general", "通用"),
     ("settings.page.keys", "模型与 Key"),
-    ("settings.page.permissions", "权限"),
-    ("settings.page.usage", "用量"),
-    ("settings.usage.empty", "还没有用量记录"),
-    ("sidebar.archived", "归档（{n}）"),
+    ("sidebar.archived", "归档"),
     ("sidebar.bucket.older", "更早"),
     ("sidebar.bucket.today", "今天"),
     ("sidebar.bucket.week", "过去 7 天"),
@@ -349,7 +291,6 @@ pub static ZH_CN: &[(&str, &str)] = &[
     ("storage.action.reveal", "在 Finder 中显示"),
     ("storage.detail", "数据位置：{path}（错误码 {code}）"),
     ("storage.title", "无法打开 Forge 的数据"),
-    ("sync.resyncing", "正在同步…"),
     ("time.days_ago", "{n} 天前"),
     ("time.hours_ago", "{n} 小时前"),
     ("time.just_now", "刚刚"),
@@ -363,6 +304,10 @@ pub static ZH_CN: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn table_is_sorted_and_unique() {
@@ -388,5 +333,223 @@ mod tests {
         assert_eq!(format_elapsed(0), "0:00");
         assert_eq!(format_elapsed(83), "1:23");
         assert_eq!(format_elapsed(3725), "1:02:05");
+    }
+
+    /// Key-shaped literals that are not i18n keys: `ui_prefs` setting names.
+    const NON_KEY_LITERALS: &[&str] = &[
+        "inspector.visible",
+        "inspector.width",
+        "sidebar.visible",
+        "sidebar.width",
+    ];
+
+    #[test]
+    fn production_keys_all_exist() {
+        let (referenced, templates) = referenced_literals();
+        let keys: BTreeSet<&str> = ZH_CN.iter().map(|(key, _)| *key).collect();
+        for lit in referenced {
+            assert!(
+                keys.contains(lit.as_str()),
+                "production code references {lit:?}, which is not in ZH_CN"
+            );
+        }
+        for tpl in templates {
+            assert!(
+                ZH_CN.iter().any(|(key, _)| template_covers(&tpl, key)),
+                "key template {tpl:?} matches no ZH_CN key"
+            );
+        }
+    }
+
+    #[test]
+    fn no_dead_keys() {
+        let (referenced, templates) = referenced_literals();
+        for (key, _) in ZH_CN {
+            let used =
+                referenced.contains(*key) || templates.iter().any(|tpl| template_covers(tpl, key));
+            assert!(used, "ZH_CN key {key:?} is never referenced");
+        }
+    }
+
+    /// Every key-shaped string literal in the production sources of
+    /// forge-state and forge-ui, split into plain references and `{x}` key
+    /// templates (e.g. `"empty.example.{i}"`). `#[cfg(test)]` modules,
+    /// comments, `ui_prefs` names, and the gpui-kit colour-name mapping table
+    /// do not count as references.
+    fn referenced_literals() -> (BTreeSet<String>, BTreeSet<String>) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut referenced = BTreeSet::new();
+        let mut templates = BTreeSet::new();
+        for dir in [root.join("src"), root.join("../forge-ui/src")] {
+            let mut files = Vec::new();
+            rs_files(&dir, &mut files);
+            for file in files {
+                if file.file_name() == Some(OsStr::new("i18n.rs")) {
+                    continue;
+                }
+                let mut src = fs::read_to_string(&file).unwrap();
+                if let Some(i) = src.find("#[cfg(test)]") {
+                    src.truncate(i);
+                }
+                if let Some(i) = src.find("GPUI_KIT_MAPPING") {
+                    let end = src[i..].find("];").map(|j| i + j + 2).unwrap_or(src.len());
+                    src.replace_range(i..end, "");
+                }
+                for lit in string_literals(&src) {
+                    if !is_key_literal(&lit) || NON_KEY_LITERALS.contains(&lit.as_str()) {
+                        continue;
+                    }
+                    if lit.contains('{') {
+                        templates.insert(lit);
+                    } else {
+                        referenced.insert(lit);
+                    }
+                }
+            }
+        }
+        (referenced, templates)
+    }
+
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension() == Some(OsStr::new("rs")) {
+                out.push(path);
+            }
+        }
+    }
+
+    /// `key` matches `template` when they have the same segments and every
+    /// `{x}` segment in the template stands in for the real segment.
+    fn template_covers(template: &str, key: &str) -> bool {
+        let t: Vec<&str> = template.split('.').collect();
+        let k: Vec<&str> = key.split('.').collect();
+        t.len() == k.len()
+            && t.iter()
+                .zip(&k)
+                .all(|(t, k)| *t == *k || (t.starts_with('{') && t.ends_with('}')))
+    }
+
+    /// Dotted lowercase segments: `composer.send`, `a11y.sidebar.row`,
+    /// `empty.example.{i}` (a `{x}` segment marks a format template).
+    fn is_key_literal(s: &str) -> bool {
+        s.contains('.')
+            && s.split('.').all(|seg| {
+                if let Some(inner) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                    !inner.is_empty()
+                        && inner
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                } else {
+                    seg.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+                        && seg
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                }
+            })
+    }
+
+    /// Collects `"…"` literal contents, skipping `//` and `/* */` comments,
+    /// `'…'` char literals (so e.g. `'"'` does not unbalance the scan) and
+    /// `r"…"`/`r#"…"#`/`b"…"`/`br"…"` raw or byte strings.
+    fn string_literals(src: &str) -> Vec<String> {
+        fn at(cs: &[char], i: usize) -> Option<char> {
+            cs.get(i).copied()
+        }
+        let cs: Vec<char> = src.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < cs.len() {
+            match cs[i] {
+                '/' if at(&cs, i + 1) == Some('/') => {
+                    while i < cs.len() && cs[i] != '\n' {
+                        i += 1;
+                    }
+                }
+                '/' if at(&cs, i + 1) == Some('*') => {
+                    i += 2;
+                    while i + 1 < cs.len() && !(cs[i] == '*' && cs[i + 1] == '/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(cs.len());
+                }
+                '\'' => {
+                    // 'c' | '\\x' | '\u{..}' — a lifetime has no closing quote.
+                    let mut close = 0;
+                    if at(&cs, i + 1) == Some('\\') {
+                        if at(&cs, i + 2) == Some('u') && at(&cs, i + 3) == Some('{') {
+                            let mut j = i + 4;
+                            while j < cs.len() && cs[j] != '}' {
+                                j += 1;
+                            }
+                            if at(&cs, j + 1) == Some('\'') {
+                                close = j + 1;
+                            }
+                        } else if at(&cs, i + 3) == Some('\'') {
+                            close = i + 3;
+                        }
+                    } else if at(&cs, i + 2) == Some('\'') {
+                        close = i + 2;
+                    }
+                    i = if close > 0 { close + 1 } else { i + 1 };
+                }
+                'r' | 'b' => {
+                    let mut j = i;
+                    if cs[j] == 'b' {
+                        j += 1;
+                        if cs.get(j) == Some(&'r') {
+                            j += 1;
+                        }
+                    } else {
+                        j += 1;
+                    }
+                    let mut hashes = 0;
+                    while cs.get(j) == Some(&'#') {
+                        j += 1;
+                        hashes += 1;
+                    }
+                    if cs.get(j) != Some(&'"') {
+                        i += 1;
+                        continue;
+                    }
+                    // A raw/byte string ends at `"` + the same # run; escapes
+                    // apply only to b"…" (hashes == 0 && starts with b).
+                    let escaped = hashes == 0 && cs[i] == 'b';
+                    let start = j + 1;
+                    let mut k = start;
+                    while k < cs.len() {
+                        if escaped && cs[k] == '\\' {
+                            k += 2;
+                            continue;
+                        }
+                        if cs[k] == '"' && (0..hashes).all(|h| cs.get(k + 1 + h) == Some(&'#')) {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    out.push(cs[start..k.min(cs.len())].iter().collect());
+                    i = (k + 1 + hashes).min(cs.len());
+                }
+                '"' => {
+                    let mut buf = String::new();
+                    let mut j = i + 1;
+                    while j < cs.len() && cs[j] != '"' {
+                        if cs[j] == '\\' {
+                            j += 1;
+                        }
+                        buf.push(cs[j]);
+                        j += 1;
+                    }
+                    out.push(buf);
+                    i = j + 1;
+                }
+                _ => i += 1,
+            }
+        }
+        out
     }
 }

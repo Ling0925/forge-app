@@ -860,10 +860,10 @@ impl ForgeApp {
                 continue;
             }
             let count = rows.len();
-            let name = t(label_key).replace("（{n}）", "");
+            let name = t(label_key);
             let label = tf(
                 "a11y.sidebar.group",
-                &[("group", &name), ("n", &count.to_string())],
+                &[("group", name), ("n", &count.to_string())],
             );
             let mut section = v_flex()
                 .id(SharedString::from(format!("group-{key}")))
@@ -1532,7 +1532,10 @@ impl ForgeApp {
                             .children(tabs.iter().map(|(key, keys)| {
                                 Tab::new()
                                     .label(t(key))
-                                    .aria_label(format!("{}，{keys}", t(key)))
+                                    .aria_label(tf(
+                                        "a11y.inspector.tab",
+                                        &[("label", t(key)), ("keys", *keys)],
+                                    ))
                                     // 2026-11-14: shortcut as a Kbd-style chip in fg3.
                                     .suffix(crate::style::kbd(keys, &palette))
                             }))
@@ -1660,7 +1663,10 @@ impl ForgeApp {
                 v_flex()
                     .id(SharedString::from(format!("settings-key-{id}")))
                     .role(Role::Group)
-                    .aria_label(format!("{name}，{status}"))
+                    .aria_label(tf(
+                        "a11y.settings.row",
+                        &[("name", name), ("status", &status)],
+                    ))
                     .w_full()
                     .min_w_0()
                     .gap_1p5()

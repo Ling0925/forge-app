@@ -383,6 +383,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn token_lookup_covers_every_field() {
+        let names = [
+            "window",
+            "sidebar",
+            "surface",
+            "subtle",
+            "selected",
+            "fg",
+            "fg2",
+            "fg3",
+            "border",
+            "borderStrong",
+            "accent",
+            "onAccent",
+            "success",
+            "successBg",
+            "warning",
+            "warningBg",
+            "danger",
+            "dangerBg",
+            "dangerBtn",
+            "onDanger",
+            "info",
+            "infoBg",
+            "addBg",
+            "delBg",
+        ];
+        for name in names {
+            assert!(LIGHT.token(name).is_some(), "{name} missing");
+        }
+        for bad in ["", "fg4", "borderstrong", "Border", "accentBg"] {
+            assert_eq!(LIGHT.token(bad), None, "{bad}");
+        }
+        // Every gpui-kit mapping value must resolve to a real token.
+        for (key, token) in GPUI_KIT_MAPPING {
+            assert!(
+                LIGHT.token(token).is_some(),
+                "{key} maps to unknown token {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_selection_and_scrim() {
+        assert_eq!(Palette::for_dark(true), &DARK);
+        assert_eq!(Palette::for_dark(false), &LIGHT);
+        assert_eq!(scrim(true), SCRIM_DARK);
+        assert_eq!(scrim(false), SCRIM_LIGHT);
+        // Scrim: black at 30% / 50% alpha (0xRRGGBBAA).
+        assert_eq!(SCRIM_LIGHT & 0xFF, 0x4D);
+        assert_eq!(SCRIM_DARK & 0xFF, 0x80);
+        assert_eq!(SCRIM_LIGHT >> 8, 0);
+        assert_eq!(SCRIM_DARK >> 8, 0);
+    }
+
+    /// §3.3 type scale and §3.4 spacing grid, pinned so a stray edit fails
+    /// loudly (these flow into every rendered px() call).
+    #[test]
+    fn type_scale_and_spacing_match_spec() {
+        let roles = [
+            (TITLE1, 22.0, 28.0),
+            (TITLE2, 17.0, 22.0),
+            (TITLE3, 15.0, 20.0),
+            (BODY, 13.0, 20.0),
+            (CALLOUT, 14.0, 21.0),
+            (FOOTNOTE, 12.0, 16.0),
+            (CAPTION, 11.0, 14.0),
+            (MONO, 12.0, 18.0),
+        ];
+        for (role, size, line_height) in roles {
+            let (size, line_height): (f32, f32) = (size, line_height);
+            assert_eq!(role.size.to_bits(), size.to_bits());
+            assert_eq!(role.line_height.to_bits(), line_height.to_bits());
+            assert!(role.line_height > role.size);
+        }
+        let spacing = [
+            SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5, SPACE_6, SPACE_7, SPACE_8, SPACE_9,
+            SPACE_10,
+        ];
+        let spec: [f32; 10] = [2.0, 4.0, 6.0, 8.0, 12.0, 16.0, 20.0, 24.0, 32.0, 48.0];
+        assert_eq!(
+            spacing.map(f32::to_bits).as_slice(),
+            spec.map(f32::to_bits).as_slice()
+        );
+        assert!(spacing.windows(2).all(|w| w[0] < w[1]));
+    }
+
     /// Every gpui-kit foreground/background pairing the mapping creates (text
     /// colour on its own background key) is one of the listed §3.1 pairs.
     #[test]

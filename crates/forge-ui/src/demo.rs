@@ -396,3 +396,183 @@ pub fn populate(app: &mut AppState, scene: Scene, base: u64) -> u64 {
         .error_action(&"r3".into(), forge_state::ErrorAction::Details);
     f.now
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_state::{ComposerMode, DividerIcon, RetryButtonState, TimelineRowVm};
+
+    const BASE: u64 = 1_700_000_000_000;
+
+    fn populated(scene: Scene) -> (AppState, u64) {
+        let mut app = AppState::default();
+        let now = populate(&mut app, scene, BASE);
+        (app, now)
+    }
+
+    #[test]
+    fn scene_parse_accepts_documented_names() {
+        for (name, scene) in [
+            ("onboarding", Scene::Onboarding),
+            ("empty", Scene::Empty),
+            ("nokey", Scene::NoKey),
+            ("conversation", Scene::Conversation),
+            ("timeline", Scene::Conversation),
+            ("error", Scene::Error),
+            ("storage", Scene::Storage),
+            ("running", Scene::Running),
+            ("keychain", Scene::Keychain),
+        ] {
+            assert_eq!(Scene::parse(name), Some(scene), "{name}");
+        }
+        for name in ["", "CONVERSATION", "all", "demo"] {
+            assert_eq!(Scene::parse(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn onboarding_stops_at_the_wizard() {
+        let (app, now) = populated(Scene::Onboarding);
+        assert_eq!(now, BASE + 1_000);
+        assert!(app.onboarding.is_some());
+        assert!(!app.has_api_key());
+        assert!(app.selected().is_none());
+    }
+
+    #[test]
+    fn nokey_reports_missing_key() {
+        let (app, now) = populated(Scene::NoKey);
+        assert_eq!(now, BASE + 1_000);
+        assert!(!app.has_api_key());
+        assert!(app.onboarding.is_none());
+        assert!(app.selected().is_none());
+    }
+
+    #[test]
+    fn empty_scene_selects_a_fresh_session() {
+        let (app, now) = populated(Scene::Empty);
+        assert_eq!(now, BASE + 1_000);
+        assert!(app.has_api_key());
+        let session = app.selected().expect("a session is selected");
+        assert_eq!(session.session.id.0, "s1");
+        assert!(app.timeline_rows().is_empty());
+    }
+
+    #[test]
+    fn conversation_has_two_finished_runs() {
+        let (app, now) = populated(Scene::Conversation);
+        assert_eq!(now, BASE + 83_000);
+        let rows = app.timeline_rows();
+        let success_dividers = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row,
+                    TimelineRowVm::Divider {
+                        icon: DividerIcon::Success,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(success_dividers, 2);
+        let assistants: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                TimelineRowVm::Assistant {
+                    run_id, reasoning, ..
+                } => Some((run_id.0.as_str(), reasoning)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants.len(), 2);
+        // r1's reasoning is collapsed; r2's was toggled open by the fixture.
+        assert_eq!(assistants[0].0, "r1");
+        assert!(!assistants[0].1.as_ref().unwrap().expanded);
+        assert_eq!(assistants[1].0, "r2");
+        assert!(assistants[1].1.as_ref().unwrap().expanded);
+        for row in &rows {
+            let label = match row {
+                TimelineRowVm::User { a11y_label, .. }
+                | TimelineRowVm::Assistant { a11y_label, .. }
+                | TimelineRowVm::Divider { a11y_label, .. } => a11y_label,
+                _ => continue,
+            };
+            assert!(!label.is_empty());
+        }
+    }
+
+    #[test]
+    fn running_scene_shows_running_composer_and_row() {
+        let (app, now) = populated(Scene::Running);
+        assert_eq!(now, BASE + 98_000);
+        assert_eq!(app.composer_mode(), ComposerMode::Running);
+        // The demo caps lack queue_when_busy → the P1 hint, not ⌥↩ 插话.
+        assert_eq!(app.composer_hint_key(), "composer.hint.running_p1");
+        assert!(
+            app.timeline_rows()
+                .iter()
+                .any(|row| matches!(row, TimelineRowVm::Running { .. }))
+        );
+    }
+
+    #[test]
+    fn error_scene_waits_out_retry_after() {
+        let (app, now) = populated(Scene::Error);
+        assert_eq!(now, BASE + 98_000);
+        let card = app
+            .timeline_rows()
+            .into_iter()
+            .find_map(|row| match row {
+                TimelineRowVm::Error(card) => Some(card),
+                _ => None,
+            })
+            .expect("error scene has an error card");
+        assert_eq!(card.kind, forge_state::ErrorCardKind::RateLimitedWait);
+        assert_eq!(
+            card.retry,
+            RetryButtonState::Waiting {
+                remaining_ms: 100_000
+            }
+        );
+        assert_eq!(card.retry_label, "重试（1 分 40 秒）");
+        assert_eq!(card.a11y_label, "运行失败：服务要求等待");
+        assert_eq!(card.status, "失败");
+        assert!(card.details_open);
+        assert!(card.details.iter().any(|line| line == "HTTP 429"));
+        assert!(
+            card.details.iter().all(|line| !line.contains("sk-demo")),
+            "fixture secret must be redacted: {:?}",
+            card.details
+        );
+        assert!(
+            card.details
+                .iter()
+                .any(|line| line.contains("[已移除请求头]"))
+        );
+    }
+
+    #[test]
+    fn storage_scene_uses_storage_card_copy() {
+        let (app, _) = populated(Scene::Storage);
+        let card = app
+            .timeline_rows()
+            .into_iter()
+            .find_map(|row| match row {
+                TimelineRowVm::Error(card) => Some(card),
+                _ => None,
+            })
+            .expect("storage scene has an error card");
+        assert_eq!(card.kind, forge_state::ErrorCardKind::Unknown);
+        assert_eq!(card.title, "保存失败");
+    }
+
+    #[test]
+    fn keychain_scene_marks_key_unavailable() {
+        let (app, now) = populated(Scene::Keychain);
+        assert_eq!(now, BASE + 1_000);
+        assert!(!app.has_api_key());
+        assert!(app.settings.key_unavailable(&"openai".into()));
+        assert!(app.selected().is_some());
+    }
+}

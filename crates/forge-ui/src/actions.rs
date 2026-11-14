@@ -65,7 +65,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
 
 pub fn menus() -> Vec<Menu> {
     vec![
-        Menu::new("Forge").items([
+        Menu::new(t("app.title")).items([
             MenuItem::action(t("menu.app.settings"), OpenSettings),
             MenuItem::separator(),
             MenuItem::action(t("menu.app.hide"), Hide),
@@ -112,4 +112,52 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Hide, cx: &mut App| cx.hide());
     cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx: &mut App| cx.unhide_other_apps());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn action_names(menu: &Menu) -> Vec<String> {
+        menu.items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action { name, .. } => Some(name.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn menus_have_resolved_labels() {
+        let menus = menus();
+        let names: Vec<String> = menus.iter().map(|menu| menu.name.to_string()).collect();
+        assert_eq!(names, ["Forge", "文件", "编辑", "显示", "会话", "窗口"]);
+        for menu in &menus {
+            for name in action_names(menu) {
+                // A missing key would leak the dotted key itself as the label.
+                assert!(
+                    forge_state::i18n::lookup(&name).is_none(),
+                    "unresolved i18n key as menu label: {name}"
+                );
+                assert!(!name.is_empty());
+            }
+        }
+        assert!(action_names(&menus[0]).contains(&"退出 Forge".to_owned()));
+        assert!(action_names(&menus[1]).contains(&"新会话".to_owned()));
+        assert!(action_names(&menus[2]).contains(&"拷贝".to_owned()));
+    }
+
+    #[test]
+    fn key_bindings_bind_expected_actions() {
+        let bindings = key_bindings();
+        assert_eq!(bindings.len(), 20);
+        for binding in &bindings {
+            assert!(!binding.keystrokes().is_empty());
+            assert!(binding.action().name().starts_with("forge::"));
+        }
+        assert!(bindings[5].action().partial_eq(&NewSession));
+        assert!(bindings[9].action().partial_eq(&FocusComposer));
+        assert!(bindings[14].action().partial_eq(&Quit));
+    }
 }

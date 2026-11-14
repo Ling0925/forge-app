@@ -31,3 +31,34 @@ pub fn local_utc_offset_ms(utc_ms: u64) -> i64 {
         0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    #[test]
+    fn wall_now_ms_tracks_system_time() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let now = wall_now_ms();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(before <= now && now <= after);
+    }
+
+    #[test]
+    fn local_offset_is_sane() {
+        // No time zone is more than ±14 h from UTC.
+        for ms in [0, BASE, wall_now_ms()] {
+            let offset = local_utc_offset_ms(ms);
+            assert!(offset.abs() <= 14 * 3_600_000, "{ms} → {offset}");
+        }
+    }
+
+    const BASE: u64 = 1_700_000_000_000;
+}
