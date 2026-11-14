@@ -7,8 +7,8 @@ use forge_ui::announce::RecordingAnnouncer;
 use forge_ui::backend::{Backend, CommandFuture};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AppContext, Bounds, Entity, Focusable, Point, TestAppContext, WindowBounds, WindowHandle,
-    WindowOptions, base::Root, point, px, size,
+    AppContext, Bounds, Entity, Focusable, Point, ScrollDelta, TestAppContext, WindowBounds,
+    WindowHandle, WindowOptions, base::Root, point, px, size,
 };
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -877,4 +877,275 @@ fn keychain_unavailable_shows_retry_not_missing_and_keeps_focus(cx: &mut TestApp
         1,
         "{spoken:?}"
     );
+}
+
+/// Every control of the settings panel lies inside the panel's bounds.
+fn assert_settings_controls_inside(
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::App,
+    case: &str,
+) {
+    window.render_frame(cx);
+    let panel = window.find("settings").bounds();
+    let ids = [
+        "settings-close",
+        "settings-status-openai",
+        "settings-retry-openai",
+        "settings-input-openai",
+        "settings-save-openai",
+        "settings-remove-openai",
+        "settings-status-anthropic",
+        "settings-input-anthropic",
+        "settings-save-anthropic",
+        "settings-remove-anthropic",
+    ];
+    let mut seen = 0;
+    for id in ids {
+        let Some(el) = window.try_find(id) else {
+            continue;
+        };
+        seen += 1;
+        let b = el.bounds();
+        assert!(
+            b.origin.x >= panel.origin.x
+                && b.origin.y >= panel.origin.y
+                && b.origin.x + b.size.width <= panel.origin.x + panel.size.width
+                && b.origin.y + b.size.height <= panel.origin.y + panel.size.height,
+            "{case}: {id} {b:?} outside panel {panel:?}"
+        );
+    }
+    assert!(seen >= 5, "{case}: only {seen} controls found");
+}
+
+#[gpui_kit::test]
+fn settings_rows_fit_panel_in_every_key_state(cx: &mut TestAppContext) {
+    for width in [960., 1280.] {
+        for (case, openai) in [
+            ("unavailable", KeyStatus::Unavailable),
+            ("missing", KeyStatus::Missing),
+            ("configured", KeyStatus::Configured),
+        ] {
+            let f = Fixture::new(cx, width);
+            f.update(cx, |app, window, cx| {
+                let event = key_snapshot(app, openai);
+                fixture_event(app, event, window, cx);
+                app.open_settings(window, cx);
+            });
+            cx.run_until_parked();
+            f.with_window(cx, |window, cx| {
+                assert_settings_controls_inside(window, cx, &format!("{case} @{width}"))
+            });
+            if case == "configured" {
+                // Saving: a key typed and 保存 pressed (Pending::SetKey).
+                f.update(cx, |app, window, cx| {
+                    app.state
+                        .set_provider_key("openai".into(), Some("sk-x".into()));
+                    app.state.test_provider_key("openai".into());
+                    app.after_change(window, cx);
+                });
+                f.with_window(cx, |window, cx| {
+                    assert_settings_controls_inside(window, cx, &format!("saving @{width}"))
+                });
+            }
+        }
+    }
+}
+
+fn long_conversation(f: &Fixture, cx: &mut TestAppContext) {
+    let text = "一行回答。\n\n".repeat(12);
+    for i in 1..=12 {
+        let id = format!("r{i}");
+        f.start_run(cx, &id);
+        f.events(
+            cx,
+            vec![
+                Event::TextDelta {
+                    run: id.as_str().into(),
+                    text: text.clone(),
+                },
+                Event::RunFinished {
+                    run: id.as_str().into(),
+                    outcome: RunOutcome::Succeeded,
+                    finished_at: 0,
+                },
+            ],
+        );
+    }
+    f.with_window(cx, |window, cx| window.render_frame(cx));
+}
+
+#[gpui_kit::test]
+fn settings_scrim_blocks_scroll_and_clicks_behind_and_does_not_close(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    long_conversation(&f, cx);
+    let scroll_up = ScrollDelta::Pixels(point(px(0.), px(600.)));
+
+    // Control: without the panel, the wheel scrolls the timeline.
+    let before = f.update(cx, |app, _, cx| app.timeline_scroll_top(cx));
+    f.with_window(cx, |window, cx| {
+        window.scroll("timeline", scroll_up, cx);
+        window.render_frame(cx);
+    });
+    let after = f.update(cx, |app, _, cx| app.timeline_scroll_top(cx));
+    assert_ne!(
+        before, after,
+        "wheel scrolls the timeline when no panel is open"
+    );
+
+    f.with_window(cx, |window, cx| {
+        window.press("cmd-,", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("settings").is_some());
+    });
+    let before = f.update(cx, |app, _, cx| app.timeline_scroll_top(cx));
+    f.with_window(cx, |window, cx| {
+        window.scroll("timeline", scroll_up, cx);
+        window.render_frame(cx);
+    });
+    let after = f.update(cx, |app, _, cx| app.timeline_scroll_top(cx));
+    assert_eq!(
+        before, after,
+        "scroll wheel over the scrim must not scroll the timeline"
+    );
+
+    // Clicking the scrim (outside the panel) keeps the panel open.
+    f.with_window(cx, |window, cx| {
+        window.click_at("settings-overlay", point(px(8.), px(8.)), cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("settings").is_some(),
+            "scrim click does not close"
+        );
+        // A click on a control behind the scrim does nothing either.
+        window.click("new-session", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("settings").is_some());
+    });
+    cx.run_until_parked();
+    let sent = f.backend.take();
+    assert!(
+        !sent
+            .iter()
+            .any(|c| matches!(c, Command::CreateSession { .. })),
+        "新会话 behind the scrim must not react: {sent:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn settings_initial_focus_and_tab_cycle_stay_in_panel(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.press("cmd-,", cx);
+        window.render_frame(cx);
+    });
+    f.update(cx, |app, window, cx| {
+        assert!(
+            app.key_input_focused(0, window, cx),
+            "initial focus: first control of the panel (OpenAI key field)"
+        );
+    });
+    // Shift-Tab from the first control wraps to the last (关闭).
+    f.with_window(cx, |window, cx| {
+        window.press("shift-tab", cx);
+        window.render_frame(cx);
+    });
+    f.update(cx, |app, window, _| {
+        assert!(
+            app.settings_close_focused(window),
+            "Shift-Tab wraps to 关闭"
+        );
+    });
+    // Tab from the last wraps back to the first.
+    f.with_window(cx, |window, cx| {
+        window.press("tab", cx);
+        window.render_frame(cx);
+    });
+    f.update(cx, |app, window, cx| {
+        assert!(
+            app.key_input_focused(0, window, cx),
+            "Tab wraps to the first control"
+        );
+    });
+    // A full forward cycle never leaves the panel.
+    for step in 0..12 {
+        f.with_window(cx, |window, cx| {
+            window.press("tab", cx);
+            window.render_frame(cx);
+        });
+        f.update(cx, |app, window, cx| {
+            assert!(
+                app.settings_contains_focus(window, cx),
+                "tab {step} left the panel"
+            );
+        });
+    }
+    for step in 0..12 {
+        f.with_window(cx, |window, cx| {
+            window.press("shift-tab", cx);
+            window.render_frame(cx);
+        });
+        f.update(cx, |app, window, cx| {
+            assert!(
+                app.settings_contains_focus(window, cx),
+                "shift-tab {step} left the panel"
+            );
+        });
+    }
+    // Esc closes and focus returns to the composer (focused before opening).
+    f.with_window(cx, |window, cx| {
+        window.press("escape", cx);
+        window.render_frame(cx);
+    });
+    f.update(cx, |app, window, cx| {
+        assert!(app.composer().read(cx).focus_handle(cx).is_focused(window));
+    });
+}
+
+#[gpui_kit::test]
+fn settings_initial_focus_is_retry_when_keychain_unavailable(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.update(cx, |app, window, cx| {
+        let event = key_snapshot(app, KeyStatus::Unavailable);
+        fixture_event(app, event, window, cx);
+        app.open_settings(window, cx);
+    });
+    f.update(cx, |app, window, _| {
+        assert!(
+            app.key_retry_focused(0, window),
+            "重试 is the first control"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn example_n_fills_text_n(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    for (n, text) in [
+        (1, "解释这个项目的结构"),
+        (2, "找出并修复一个失败的测试"),
+        (3, "给最近的改动写说明"),
+    ] {
+        f.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find(format!("example-{n}")).label(), Some(text));
+            window.click(format!("example-{n}"), cx);
+            window.render_frame(cx);
+        });
+        f.update(cx, |app, window, cx| {
+            assert_eq!(
+                app.composer().read(cx).value().as_ref(),
+                text,
+                "example {n}"
+            );
+            assert!(app.composer().read(cx).focus_handle(cx).is_focused(window));
+        });
+        assert!(
+            !f.backend
+                .take()
+                .iter()
+                .any(|c| matches!(c, Command::Send { .. })),
+            "example {n} fills only, never sends"
+        );
+    }
 }

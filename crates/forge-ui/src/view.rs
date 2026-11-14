@@ -17,7 +17,7 @@ use forge_state::{
     SessionRowVm, SidebarGroup, SidebarResize, SidebarVm, StatusIcon, TimelineRowVm,
 };
 use gpui_kit::assets::IconName;
-use gpui_kit::base::TestSupportExt;
+use gpui_kit::base::{FocusTrapElement, TestSupportExt};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
@@ -68,6 +68,9 @@ pub struct ForgeApp {
     /// "重试" next to "无法读取钥匙串", one per provider (caller-owned so
     /// focus stays on the button while the retry snapshot is in flight).
     key_retry_focus: Vec<FocusHandle>,
+    /// Settings panel container (focus-trap scope) and its 关闭 button.
+    settings_focus: FocusHandle,
+    settings_close_focus: FocusHandle,
     /// Focus to restore when the settings panel closes (Esc or 关闭).
     settings_return_focus: Option<FocusHandle>,
     /// `ui_prefs` as last loaded or sent; a change is persisted once the
@@ -209,6 +212,8 @@ impl ForgeApp {
             inspector_tab: 0,
             key_inputs,
             key_retry_focus,
+            settings_focus: cx.focus_handle(),
+            settings_close_focus: cx.focus_handle(),
             settings_return_focus: None,
             persisted_prefs: None,
             _tasks: tasks,
@@ -491,6 +496,7 @@ impl ForgeApp {
         self.after_change(window, cx);
     }
 
+    /// Example `n` (1-based, matching `empty.example.{n}`) fills its text.
     fn fill_example(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         // UI-TL-04: fill only, focus the composer, never send.
         self.state.fill_example(index);
@@ -533,9 +539,44 @@ impl ForgeApp {
         }
         self.state.open_settings();
         self.after_change(window, cx);
-        if let Some((_, input)) = self.key_inputs.first() {
+        self.focus_first_settings_control(window, cx);
+    }
+
+    /// Initial focus: the first actionable control of the panel's content,
+    /// i.e. the first provider row's first control (重试 when its keychain is
+    /// unreadable, otherwise its key field). 关闭 is the last tab stop.
+    fn focus_first_settings_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((provider, input)) = self.key_inputs.first() else {
+            return;
+        };
+        if self.state.settings.key_unavailable(provider) {
+            self.key_retry_focus[0].focus(window, cx);
+        } else {
             input.read(cx).focus_handle(cx).focus(window, cx);
         }
+    }
+
+    /// Whether the key field of provider `index` holds focus (tests).
+    pub fn key_input_focused(&self, index: usize, window: &Window, cx: &gpui_kit::App) -> bool {
+        self.key_inputs
+            .get(index)
+            .is_some_and(|(_, input)| input.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    /// Timeline scroll position (first visible row, offset in it) for tests.
+    pub fn timeline_scroll_top(&self, cx: &gpui_kit::App) -> (usize, gpui_kit::Pixels) {
+        let top = self.scroller.read(cx).logical_scroll_top();
+        (top.item_ix, top.offset_in_item)
+    }
+
+    /// Whether the settings panel's 关闭 button holds focus (tests).
+    pub fn settings_close_focused(&self, window: &Window) -> bool {
+        self.settings_close_focus.is_focused(window)
+    }
+
+    /// Whether focus is anywhere inside the settings panel (tests).
+    pub fn settings_contains_focus(&self, window: &Window, cx: &gpui_kit::App) -> bool {
+        self.settings_focus.contains_focused(window, cx)
     }
 
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1002,16 +1043,15 @@ impl ForgeApp {
                     .child(t("empty.title")),
             );
         if has_session && !no_key {
-            col =
-                col.child(h_flex().gap_2().children((1..=3).map(|i| {
-                    Button::new(SharedString::from(format!("example-{i}")))
-                        .label(t(&format!("empty.example.{i}")))
-                        .outline()
-                        .small()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.fill_example(i - 1, window, cx)
-                        }))
-                })));
+            col = col.child(h_flex().gap_2().children((1..=3).map(|i| {
+                Button::new(SharedString::from(format!("example-{i}")))
+                    .label(t(&format!("empty.example.{i}")))
+                    .outline()
+                    .small()
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.fill_example(i, window, cx)),
+                    )
+            })));
         }
         if no_key {
             let palette = *Palette::for_dark(theme.is_dark());
@@ -1594,10 +1634,18 @@ impl ForgeApp {
                     .id(SharedString::from(format!("settings-key-{id}")))
                     .role(Role::Group)
                     .aria_label(format!("{name}，{status}"))
+                    .w_full()
+                    .min_w_0()
                     .gap_1p5()
                     .child(
+                        // Name · status · 重试; wraps to a second line rather
+                        // than pushing past the panel edge.
                         h_flex()
-                            .gap_2()
+                            .w_full()
+                            .min_w_0()
+                            .flex_wrap()
+                            .gap_x_2()
+                            .gap_y_1()
                             .child(
                                 div()
                                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
@@ -1619,9 +1667,11 @@ impl ForgeApp {
                                         )
                                     })
                                     .flex()
+                                    .min_w_0()
                                     .gap_1()
                                     .items_center()
-                                    .child(status),
+                                    .child(status)
+                                    .test_support(),
                             )
                             .child(div().flex_1())
                             .when(unavailable, |row| {
@@ -1643,11 +1693,23 @@ impl ForgeApp {
                             }),
                     )
                     .child(
+                        // The key field shrinks (flex-1 + min-w-0) so 保存 /
+                        // 移除 always stay inside the panel.
                         h_flex()
+                            .w_full()
+                            .min_w_0()
                             .gap_2()
-                            .child(div().flex_1().child(Input::new(input).small()))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("settings-input-{id}")))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(input).small())
+                                    .test_support(),
+                            )
                             .child(
                                 Button::new(SharedString::from(format!("settings-save-{id}")))
+                                    .flex_none()
                                     .label(t("settings.key.save"))
                                     .primary()
                                     .small()
@@ -1660,6 +1722,7 @@ impl ForgeApp {
                                     Button::new(SharedString::from(format!(
                                         "settings-remove-{id}"
                                     )))
+                                    .flex_none()
                                     .label(t("settings.key.remove"))
                                     .outline()
                                     .small()
@@ -1684,58 +1747,82 @@ impl ForgeApp {
                 .flex()
                 .items_center()
                 .justify_center()
+                .p_4()
                 .bg(gpui_kit::black().opacity(0.25))
+                // Modal scrim: blocks hover, clicks and the scroll wheel for
+                // everything behind it. Clicking it does not close the panel
+                // (only Esc or 关闭 do).
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .on_scroll(|_, _, cx| cx.stop_propagation())
                 .child(
-                    v_flex()
-                        .id("settings")
-                        .role(Role::Dialog)
-                        .aria_label(t("settings.page.keys"))
+                    // Tab / Shift-Tab cycle within the panel only.
+                    div()
+                        .id("settings-trap")
+                        .track_focus(&self.settings_focus)
+                        .tab_stop(false)
                         .w(px(520.))
-                        .p_5()
-                        .gap_4()
-                        .rounded(px(12.))
-                        .bg(rgb(palette.surface))
-                        .border_1()
-                        .border_color(rgb(palette.border))
-                        .shadow_lg()
+                        .max_w_full()
+                        .min_w_0()
                         .child(
-                            h_flex()
+                            v_flex()
+                                .id("settings")
+                                .role(Role::Dialog)
+                                .aria_label(t("settings.page.keys"))
+                                .w_full()
+                                .min_w_0()
+                                .p_5()
+                                .gap_4()
+                                .rounded(px(12.))
+                                .bg(rgb(palette.surface))
+                                .border_1()
+                                .border_color(rgb(palette.border))
+                                .shadow_lg()
+                                .child(
+                                    h_flex()
+                                        .child(
+                                            div()
+                                                .text_size(px(17.))
+                                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                                .child(t("settings.page.keys")),
+                                        )
+                                        .child(div().flex_1())
+                                        .child(
+                                            Button::new("settings-close")
+                                                .track_focus(&self.settings_close_focus)
+                                                // Last tab stop: the cycle starts in the rows.
+                                                .tab_index(1)
+                                                .label(t("settings.close"))
+                                                .ghost()
+                                                .small()
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.close_settings(window, cx)
+                                                })),
+                                        ),
+                                )
+                                .child(rows)
+                                .when_some(error, |col, error| {
+                                    col.child(
+                                        div()
+                                            .id("settings-error")
+                                            .role(Role::Alert)
+                                            .text_sm()
+                                            .text_color(rgb(palette.danger))
+                                            .child(error),
+                                    )
+                                })
                                 .child(
                                     div()
-                                        .text_size(px(17.))
-                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                        .child(t("settings.page.keys")),
+                                        .text_xs()
+                                        .text_color(rgb(palette.fg2))
+                                        .child(t("settings.key.note")),
                                 )
-                                .child(div().flex_1())
-                                .child(
-                                    Button::new("settings-close")
-                                        .label(t("settings.close"))
-                                        .ghost()
-                                        .small()
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.close_settings(window, cx)
-                                        })),
-                                ),
+                                .test_support(),
                         )
-                        .child(rows)
-                        .when_some(error, |col, error| {
-                            col.child(
-                                div()
-                                    .id("settings-error")
-                                    .role(Role::Alert)
-                                    .text_sm()
-                                    .text_color(rgb(palette.danger))
-                                    .child(error),
-                            )
-                        })
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(palette.fg2))
-                                .child(t("settings.key.note")),
-                        )
-                        .test_support(),
+                        .focus_trap("settings-trap", &self.settings_focus),
                 )
+                .test_support()
                 .into_any_element(),
         )
     }
