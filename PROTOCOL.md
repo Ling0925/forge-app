@@ -69,3 +69,11 @@ P0 已实现类型、命令应答通道、seq 分配和事件广播。调用方�
 P0 仅提供 `Shutdown` / `ShutdownComplete` 类型，`dispatch_next()` 返回 `not_implemented`。当前 Runtime 尚无活动 Run 管理和 R4 的 Run 取消入口，只有底层命令进程组取消；三秒等待编排留待 P2。
 
 实现时，UI 在用户确认退出后发送 `Shutdown`。Core 对全部活动 Run 复用 R4 取消路径，共用注入 Clock 的三秒等待窗口；结束后发布 `ShutdownComplete`，已结束的归入 `stopped`，仍未结束的归入 `unfinished`。后者保持非终态，下次启动由 R9 标记 `interrupted`。
+
+## UI-REF-06 文件改动行数
+
+`forge-tools` 的 `write_file`、`edit_file` 返回 `FileChange { path, before_sha256, after_sha256, lines_added, lines_removed }`：`path` 为解析后的工作区相对路径，前后哈希为内容的 SHA-256，新文件的 `before_sha256` 为 `None`；两个行数字段均为 `u32`。
+
+UI Inspector diff 采用相同计数规则：对前后原始字节使用 `similar::TextDiff::from_lines` 的 Myers 行差异，`Insert` 每行计入 `lines_added`，`Delete` 每行计入 `lines_removed`。分行保留行结束符（包括 `\n` 和完整的 `\r\n`）；末行即使没有换行符也算一行；仅末尾换行符变化计为删除一行、增加一行。非 UTF-8 内容直接按字节比较，不做有损转换。新文件删除行数为 0，增加行数为新内容行数（空文件为 0）；内容未变时两项均为 0。
+
+忽略规则与隐藏条目过滤仅用于非递归的 `list_dir` 及 `glob`、`grep`：无需 Git 仓库，仍应用目录树内的 `.gitignore`、`.ignore` 和存在时的 `.git/info/exclude`，不应用工作区外父目录或全局忽略规则；按名称调用 `read_file`、`write_file`、`edit_file` 不受这些过滤规则影响。

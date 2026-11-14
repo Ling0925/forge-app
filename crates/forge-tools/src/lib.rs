@@ -1,3 +1,5 @@
+//! Only `list_dir`, `glob`, and `grep` filter hidden entries using in-tree `.gitignore`, `.ignore`, and `.git/info/exclude` rules without requiring Git; outside-parent/global rules are excluded, while named reads, writes, and edits bypass filtering.
+
 pub mod cancellation;
 pub mod clock;
 #[cfg(unix)]

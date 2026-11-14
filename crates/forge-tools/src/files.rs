@@ -1,12 +1,11 @@
 use crate::{
-    Tool, ToolError, ToolFuture, ToolRequest, ToolResult, blocking, workspace::WorkspaceRoot,
+    Tool, ToolError, ToolFuture, ToolRequest, ToolResult, blocking,
+    search::{IgnoreScope, is_ignored},
+    workspace::{FileSnapshot, ResolvedPath, WorkspaceRoot},
 };
 use sha2::{Digest, Sha256};
-use std::{
-    fs, io,
-    ops::RangeInclusive,
-    path::{Path, PathBuf},
-};
+use similar::{ChangeTag, TextDiff};
+use std::{io, ops::RangeInclusive, path::PathBuf};
 
 pub struct ReadFileRequest {
     pub path: PathBuf,
@@ -31,12 +30,18 @@ pub struct FileChange {
     pub path: PathBuf,
     pub before_sha256: Option<String>,
     pub after_sha256: String,
+    /// Inserted byte lines from Myers `TextDiff::from_lines`, retaining line endings.
+    /// New files count all lines (empty: zero); an unterminated final line counts once.
+    pub lines_added: u32,
+    /// Deleted lines under the same rules; new files remove zero, unchanged writes count zero for both.
+    /// Final-newline-only changes remove and add one line; CRLF is compared intact.
+    pub lines_removed: u32,
 }
 
 #[derive(Debug)]
 pub struct DirectoryEntry {
     pub path: PathBuf,
-    pub file_type: fs::FileType,
+    pub file_type: cap_std::fs::FileType,
 }
 
 pub struct ReadFileTool {
@@ -71,7 +76,7 @@ impl Tool for ReadFileTool {
                     "line range must be one-based and increasing".into(),
                 ));
             }
-            let content = fs::read_to_string(root.resolve(&input.path)?)?;
+            let content = io::read_to_string(root.resolve(&input.path)?.open()?)?;
             Ok(match input.lines {
                 Some(lines) => content
                     .split_inclusive('\n')
@@ -120,13 +125,12 @@ impl Tool for WriteFileTool {
         Box::pin(async move {
             let result = blocking(request, move |input| {
                 let path = root.resolve_write(&input.path)?;
-                let before = match fs::read(&path) {
+                let before = match path.read() {
                     Ok(content) => Some(content),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => None,
                     Err(error) => return Err(error.into()),
                 };
-                fs::create_dir_all(path.parent().expect("file path has a parent"))?;
-                write(&root, &path, before.as_deref(), input.content.as_bytes())
+                write(&path, before.as_ref(), input.content.as_bytes())
             })
             .await?;
             crate::failpoint!(
@@ -174,18 +178,20 @@ impl Tool for EditFileTool {
         Box::pin(async move {
             let result = blocking(request, move |input| {
                 let path = root.resolve(&input.path)?;
-                let before = fs::read_to_string(&path)?;
-                let start = before
+                let before = path.read()?;
+                let text = std::str::from_utf8(&before.content)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                let start = text
                     .find(&input.old_string)
                     .ok_or_else(|| ToolError::InvalidArguments("old string not found".into()))?;
-                if before.rfind(&input.old_string) != Some(start) {
+                if text.rfind(&input.old_string) != Some(start) {
                     return Err(ToolError::InvalidArguments(
                         "old string is not unique".into(),
                     ));
                 }
-                let mut after = before.clone();
+                let mut after = text.to_owned();
                 after.replace_range(start..start + input.old_string.len(), &input.new_string);
-                write(&root, &path, Some(before.as_bytes()), after.as_bytes())
+                write(&path, Some(&before), after.as_bytes())
             })
             .await?;
             crate::failpoint!(
@@ -198,17 +204,31 @@ impl Tool for EditFileTool {
 }
 
 fn write(
-    root: &WorkspaceRoot,
-    path: &Path,
-    before: Option<&[u8]>,
+    path: &ResolvedPath,
+    before: Option<&FileSnapshot>,
     after: &[u8],
 ) -> Result<FileChange, ToolError> {
+    let diff = TextDiff::from_lines(
+        before.map_or(b"".as_slice(), |snapshot| snapshot.content.as_slice()),
+        after,
+    );
+    let mut lines_added = 0;
+    let mut lines_removed = 0;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => lines_added += 1,
+            ChangeTag::Delete => lines_removed += 1,
+            ChangeTag::Equal => {}
+        }
+    }
     let change = FileChange {
-        path: root.relative(path),
-        before_sha256: before.map(|content| format!("{:x}", Sha256::digest(content))),
+        path: path.path.clone(),
+        before_sha256: before.map(|snapshot| format!("{:x}", Sha256::digest(&snapshot.content))),
         after_sha256: format!("{:x}", Sha256::digest(after)),
+        lines_added,
+        lines_removed,
     };
-    fs::write(path, after)?;
+    path.write(after, before)?;
     Ok(change)
 }
 
@@ -237,13 +257,19 @@ impl Tool for ListDirTool {
     fn execute(&self, request: ToolRequest<PathBuf>) -> ToolFuture<'_, ToolResult<Self::Output>> {
         let root = self.root.clone();
         Box::pin(blocking(request, move |path| {
+            let path = root.resolve(&path)?;
+            let directory = path
+                .directory
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotADirectory))?;
+            let scopes = [IgnoreScope::read(&directory, &path.path)?];
             let mut entries = Vec::new();
-            for entry in fs::read_dir(root.resolve(&path)?)? {
+            for entry in directory.entries()? {
                 let entry = entry?;
-                entries.push(DirectoryEntry {
-                    path: root.relative(&entry.path()),
-                    file_type: entry.file_type()?,
-                });
+                let path = path.path.join(entry.file_name());
+                let file_type = entry.file_type()?;
+                if !is_ignored(&scopes, &path, file_type.is_dir()) {
+                    entries.push(DirectoryEntry { path, file_type });
+                }
             }
             entries.sort_by(|a, b| a.path.cmp(&b.path));
             Ok(entries)

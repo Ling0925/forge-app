@@ -130,7 +130,9 @@ async fn write_file_records_create_and_overwrite_hashes() {
     fs::create_dir(directory.path().join("sub")).unwrap();
     let tool = WriteFileTool::new(WorkspaceRoot::new(directory.path()).unwrap());
     let mut before = None;
-    for content in ["hello\n", "updated\r\n", ""] {
+    for (content, lines_added, lines_removed) in
+        [("hello\n", 1, 0), ("updated\r\n", 1, 1), ("", 0, 1)]
+    {
         let change = run(
             &tool,
             WriteFileRequest {
@@ -146,6 +148,8 @@ async fn write_file_records_create_and_overwrite_hashes() {
                 path: "sub/file".into(),
                 before_sha256: before,
                 after_sha256: hash(content),
+                lines_added,
+                lines_removed,
             }
         );
         assert_eq!(
@@ -157,21 +161,132 @@ async fn write_file_records_create_and_overwrite_hashes() {
 }
 
 #[tokio::test]
+async fn write_file_counts_lines_in_new_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let tool = WriteFileTool::new(WorkspaceRoot::new(directory.path()).unwrap());
+    for (path, content, added) in [
+        ("empty", "", 0),
+        ("blank", "\n", 1),
+        ("terminated", "first\nlast\n", 2),
+        ("unterminated", "first\nlast", 2),
+    ] {
+        let change = run(
+            &tool,
+            WriteFileRequest {
+                path: path.into(),
+                content: content.into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(change.before_sha256, None);
+        assert_eq!((change.lines_added, change.lines_removed), (added, 0));
+    }
+}
+
+#[tokio::test]
+async fn write_file_counts_only_changed_lines_when_overwriting() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("file"),
+        "head\nremove one\nmiddle\nremove two\ntail\n",
+    )
+    .unwrap();
+    let change = run(
+        &WriteFileTool::new(WorkspaceRoot::new(directory.path()).unwrap()),
+        WriteFileRequest {
+            path: "file".into(),
+            content: "head\ninsert one\ninsert two\nmiddle\ntail\n".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((change.lines_added, change.lines_removed), (2, 2));
+}
+
+#[tokio::test]
+async fn unchanged_writes_have_zero_line_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let tool = WriteFileTool::new(WorkspaceRoot::new(directory.path()).unwrap());
+    for content in ["", "same\nlines\n", "same\nlast", "same\r\nlines\r\n"] {
+        fs::write(directory.path().join("file"), content).unwrap();
+        let change = run(
+            &tool,
+            WriteFileRequest {
+                path: "file".into(),
+                content: content.into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((change.lines_added, change.lines_removed), (0, 0));
+        assert_eq!(change.before_sha256, Some(change.after_sha256));
+    }
+}
+
+#[tokio::test]
+async fn changing_only_the_final_newline_counts_as_one_removed_and_added_line() {
+    let directory = tempfile::tempdir().unwrap();
+    let tool = WriteFileTool::new(WorkspaceRoot::new(directory.path()).unwrap());
+    for (before, after) in [
+        ("first\nlast", "first\nlast\n"),
+        ("first\nlast\n", "first\nlast"),
+    ] {
+        fs::write(directory.path().join("file"), before).unwrap();
+        let change = run(
+            &tool,
+            WriteFileRequest {
+                path: "file".into(),
+                content: after.into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((change.lines_added, change.lines_removed), (1, 1));
+    }
+}
+
+#[tokio::test]
+async fn crlf_lines_are_compared_with_their_full_line_endings() {
+    let directory = tempfile::tempdir().unwrap();
+    let tool = WriteFileTool::new(WorkspaceRoot::new(directory.path()).unwrap());
+    for (before, after, added, removed) in [
+        ("keep\r\nold\r\n", "keep\r\nnew\r\nextra\r\n", 2, 1),
+        ("same\r\n", "same\n", 1, 1),
+        ("same\r\n", "same", 1, 1),
+    ] {
+        fs::write(directory.path().join("file"), before).unwrap();
+        let change = run(
+            &tool,
+            WriteFileRequest {
+                path: "file".into(),
+                content: after.into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((change.lines_added, change.lines_removed), (added, removed));
+    }
+}
+
+#[tokio::test]
 async fn write_file_hashes_original_bytes() {
     let directory = tempfile::tempdir().unwrap();
     let before = b"binary\0\xff";
+    let after = "binary\0\u{fffd}";
     fs::write(directory.path().join("file"), before).unwrap();
     let change = run(
         &WriteFileTool::new(WorkspaceRoot::new(directory.path()).unwrap()),
         WriteFileRequest {
             path: "file".into(),
-            content: "text".into(),
+            content: after.into(),
         },
     )
     .await
     .unwrap();
     assert_eq!(change.before_sha256, Some(hash(before)));
-    assert_eq!(change.after_sha256, hash("text"));
+    assert_eq!(change.after_sha256, hash(after));
+    assert_eq!((change.lines_added, change.lines_removed), (1, 1));
 }
 
 #[tokio::test]
@@ -200,6 +315,8 @@ async fn edit_file_replaces_exact_multiline_text_and_records_hashes() {
             path: "file".into(),
             before_sha256: Some(hash(before)),
             after_sha256: hash(after),
+            lines_added: 1,
+            lines_removed: 2,
         }
     );
 }
@@ -244,15 +361,10 @@ async fn list_dir_returns_sorted_immediate_entries_with_types() {
     let entries = run(&tool, "sub".into()).await.unwrap();
     assert_eq!(
         entries.iter().map(|entry| &entry.path).collect::<Vec<_>>(),
-        [
-            &PathBuf::from("sub/.hidden"),
-            &"sub/file".into(),
-            &"sub/nested".into()
-        ]
+        [&PathBuf::from("sub/file"), &"sub/nested".into()]
     );
     assert!(entries[0].file_type.is_file());
-    assert!(entries[1].file_type.is_file());
-    assert!(entries[2].file_type.is_dir());
+    assert!(entries[1].file_type.is_dir());
 }
 
 #[tokio::test]
@@ -335,6 +447,15 @@ async fn searches_skip_ignored_files_and_hidden_directories() {
     }
     let root = WorkspaceRoot::new(directory.path()).unwrap();
     assert_eq!(
+        run(&ListDirTool::new(root.clone()), ".".into())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>(),
+        vec![PathBuf::from("visible.txt")]
+    );
+    assert_eq!(
         run(&GlobTool::new(root.clone()), glob(".", "**/*.txt"))
             .await
             .unwrap(),
@@ -360,6 +481,248 @@ async fn grep_searches_non_utf8_content_without_aborting_the_tree() {
     assert_eq!(matches.len(), 2);
     assert_eq!(matches[0].line, "\u{fffd} hit");
     assert_eq!(matches[1].line, "αβ");
+}
+
+#[tokio::test]
+async fn searches_honor_gitignore_without_a_git_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("sub")).unwrap();
+    fs::create_dir_all(directory.path().join("build/deep")).unwrap();
+    for path in [
+        "keep.txt",
+        "ignored.txt",
+        "sub/keep.txt",
+        "sub/ignored.txt",
+        "build/output.txt",
+        "build/deep/output.txt",
+    ] {
+        fs::write(directory.path().join(path), "needle\n").unwrap();
+    }
+    fs::write(
+        directory.path().join(".gitignore"),
+        "/ignored.txt\nbuild/\n",
+    )
+    .unwrap();
+    fs::write(directory.path().join("sub/.gitignore"), "ignored.txt\n").unwrap();
+    let root = WorkspaceRoot::new(directory.path()).unwrap();
+    let expected = vec![PathBuf::from("keep.txt"), "sub/keep.txt".into()];
+    assert_eq!(
+        run(&GlobTool::new(root.clone()), glob(".", "**/*"))
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        run(&GrepTool::new(root.clone()), grep(".", "needle"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.path)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        run(&ListDirTool::new(root.clone()), ".".into())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>(),
+        vec![PathBuf::from("keep.txt"), "sub".into()]
+    );
+    assert_eq!(
+        run(
+            &ReadFileTool::new(root.clone()),
+            ReadFileRequest {
+                path: "build/output.txt".into(),
+                lines: None,
+            },
+        )
+        .await
+        .unwrap(),
+        "needle\n"
+    );
+    run(
+        &WriteFileTool::new(root.clone()),
+        WriteFileRequest {
+            path: "build/new.txt".into(),
+            content: "written\n".into(),
+        },
+    )
+    .await
+    .unwrap();
+    run(
+        &EditFileTool::new(root),
+        EditFileRequest {
+            path: "build/new.txt".into(),
+            old_string: "written".into(),
+            new_string: "edited".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(directory.path().join("build/new.txt")).unwrap(),
+        "edited\n"
+    );
+}
+
+#[tokio::test]
+async fn searches_do_not_apply_parent_ignore_files_outside_the_workspace() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join(".git")).unwrap();
+    fs::create_dir(directory.path().join("root")).unwrap();
+    fs::write(directory.path().join(".gitignore"), "*.rs\n").unwrap();
+    fs::write(directory.path().join(".ignore"), "*.txt\n").unwrap();
+    for path in ["keep.txt", "keep.rs", "ignored.txt"] {
+        fs::write(directory.path().join("root").join(path), "needle\n").unwrap();
+    }
+    fs::write(directory.path().join("root/.gitignore"), "ignored.txt\n").unwrap();
+    let root = WorkspaceRoot::new(directory.path().join("root")).unwrap();
+    let expected = vec![PathBuf::from("keep.rs"), "keep.txt".into()];
+    assert_eq!(
+        run(&ListDirTool::new(root.clone()), ".".into())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        run(&GlobTool::new(root.clone()), glob(".", "**/*"))
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        run(&GrepTool::new(root), grep(".", "needle"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.path)
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn searches_preserve_ignore_precedence_and_git_excludes() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join(".git/info")).unwrap();
+    fs::create_dir(directory.path().join("sub")).unwrap();
+    for path in [
+        "excluded.txt",
+        "gitignored.txt",
+        "ignored.txt",
+        "keep.txt",
+        "sub/keep.txt",
+        "sub/ignored.txt",
+    ] {
+        fs::write(directory.path().join(path), "needle\n").unwrap();
+    }
+    fs::write(
+        directory.path().join(".git/info/exclude"),
+        "excluded.txt\nkeep.txt\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join(".gitignore"),
+        "gitignored.txt\n!keep.txt\n",
+    )
+    .unwrap();
+    fs::write(directory.path().join(".ignore"), "ignored.txt\n").unwrap();
+    fs::write(directory.path().join("sub/.gitignore"), "!ignored.txt\n").unwrap();
+    let root = WorkspaceRoot::new(directory.path()).unwrap();
+    assert_eq!(
+        run(&ListDirTool::new(root.clone()), ".".into())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>(),
+        vec![PathBuf::from("keep.txt"), "sub".into()]
+    );
+    let expected = vec![PathBuf::from("keep.txt"), "sub/keep.txt".into()];
+    assert_eq!(
+        run(&GlobTool::new(root.clone()), glob(".", "**/*.txt"))
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        run(&GrepTool::new(root), grep(".", "needle"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.path)
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn listings_and_searches_ignore_global_git_rules() {
+    if let Some(path) = std::env::var_os("FORGE_TOOLS_GLOBAL_IGNORE_ROOT") {
+        assert!(
+            ignore::gitignore::Gitignore::global()
+                .0
+                .matched("keep.rs", false)
+                .is_ignore()
+        );
+        let root = WorkspaceRoot::new(path).unwrap();
+        let expected = vec![PathBuf::from("keep.rs")];
+        assert_eq!(
+            run(&ListDirTool::new(root.clone()), ".".into())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            run(&GlobTool::new(root.clone()), glob(".", "**/*"))
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            run(&GrepTool::new(root), grep(".", "needle"))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let excludes = directory.path().join("global-ignore");
+    let config = directory.path().join("gitconfig");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("keep.rs"), "needle\n").unwrap();
+    fs::write(&excludes, "*.rs\n").unwrap();
+    fs::write(
+        &config,
+        format!("[core]\nexcludesFile = {}\n", excludes.display()),
+    )
+    .unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "listings_and_searches_ignore_global_git_rules"])
+        .env("GIT_CONFIG_GLOBAL", config)
+        .env("FORGE_TOOLS_GLOBAL_IGNORE_ROOT", root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
@@ -536,6 +899,8 @@ async fn write_file_creates_nested_parents_inside_root() {
             path: "one/two/three/file".into(),
             before_sha256: None,
             after_sha256: hash("nested"),
+            lines_added: 1,
+            lines_removed: 0,
         }
     );
     assert_eq!(
@@ -571,6 +936,197 @@ async fn write_file_rejects_parent_escapes_before_creating_directories() {
 mod symlinks {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[tokio::test]
+    async fn qa10_toctou_dir_swapped_to_external_symlink() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::{Duration, Instant};
+
+        for round in 0..5 {
+            let directory = tempfile::tempdir().unwrap();
+            let workspace = directory.path().join("root");
+            let outside = directory.path().join("outside");
+            fs::create_dir(&workspace).unwrap();
+            fs::create_dir(&outside).unwrap();
+            let tool = WriteFileTool::new(WorkspaceRoot::new(&workspace).unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let start = Arc::new(Barrier::new(2));
+            let flipper = {
+                let stop = stop.clone();
+                let start = start.clone();
+                let outside = outside.clone();
+                std::thread::spawn(move || {
+                    let mut flips = 0;
+                    start.wait();
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = fs::create_dir(workspace.join("d_real"));
+                        let _ = fs::rename(workspace.join("d_real"), workspace.join("d"));
+                        let _ = symlink(&outside, workspace.join("d_link"));
+                        let _ = fs::rename(workspace.join("d"), workspace.join("d_old"));
+                        if fs::rename(workspace.join("d_link"), workspace.join("d")).is_ok() {
+                            flips += 1;
+                        }
+                        let _ = fs::remove_dir_all(workspace.join("d_old"));
+                        let _ = fs::rename(workspace.join("d"), workspace.join("d_link_old"));
+                        let _ = fs::remove_file(workspace.join("d_link_old"));
+                    }
+                    flips
+                })
+            };
+            start.wait();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut attempts = 0;
+            while Instant::now() < deadline && !outside.join("t.txt").exists() {
+                attempts += 1;
+                let _ = run(
+                    &tool,
+                    WriteFileRequest {
+                        path: "d/t.txt".into(),
+                        content: format!("toctou {attempts}\n"),
+                    },
+                )
+                .await;
+            }
+            stop.store(true, Ordering::Relaxed);
+            let flips = flipper.join().unwrap();
+            assert!(
+                attempts > 0 && flips > 0,
+                "no race activity in round {round}"
+            );
+            assert!(
+                !outside.join("t.txt").exists(),
+                "write escaped during directory swap in round {round}"
+            );
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_and_edits_replace_hardlinks_without_modifying_outside_files() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("root")).unwrap();
+        let outside = directory.path().join("outside");
+        fs::write(&outside, "original\n").unwrap();
+        for name in ["write", "edit"] {
+            fs::hard_link(&outside, directory.path().join("root").join(name)).unwrap();
+        }
+        let root = WorkspaceRoot::new(directory.path().join("root")).unwrap();
+        let write = run(
+            &WriteFileTool::new(root.clone()),
+            WriteFileRequest {
+                path: "write".into(),
+                content: "written\n".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "original\n");
+        let edit = run(
+            &EditFileTool::new(root),
+            EditFileRequest {
+                path: "edit".into(),
+                old_string: "original".into(),
+                new_string: "edited".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "original\n");
+        assert_eq!(
+            fs::read_to_string(directory.path().join("root/write")).unwrap(),
+            "written\n"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("root/edit")).unwrap(),
+            "edited\n"
+        );
+        for change in [write, edit] {
+            assert_eq!(change.before_sha256, Some(hash("original\n")));
+            assert_eq!((change.lines_added, change.lines_removed), (1, 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn all_tools_keep_using_the_opened_workspace_after_its_path_is_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("root")).unwrap();
+        fs::create_dir(directory.path().join("outside")).unwrap();
+        fs::write(directory.path().join("root/a"), "inside\n").unwrap();
+        fs::write(directory.path().join("outside/a"), "outside\n").unwrap();
+        let root = WorkspaceRoot::new(directory.path().join("root")).unwrap();
+        fs::rename(
+            directory.path().join("root"),
+            directory.path().join("opened"),
+        )
+        .unwrap();
+        symlink("outside", directory.path().join("root")).unwrap();
+        assert_eq!(
+            run(
+                &ReadFileTool::new(root.clone()),
+                ReadFileRequest {
+                    path: "a".into(),
+                    lines: None
+                }
+            )
+            .await
+            .unwrap(),
+            "inside\n"
+        );
+        let write = run(
+            &WriteFileTool::new(root.clone()),
+            WriteFileRequest {
+                path: "b".into(),
+                content: "inside\n".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(write.path, PathBuf::from("b"));
+        let edit = run(
+            &EditFileTool::new(root.clone()),
+            EditFileRequest {
+                path: "a".into(),
+                old_string: "inside".into(),
+                new_string: "inside edited".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(edit.path, PathBuf::from("a"));
+        let expected = vec![PathBuf::from("a"), "b".into()];
+        assert_eq!(
+            run(&ListDirTool::new(root.clone()), ".".into())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| e.path)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            run(&GlobTool::new(root.clone()), glob(".", "**/*"))
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            run(&GrepTool::new(root), grep(".", "inside"))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.path)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("outside/a")).unwrap(),
+            "outside\n"
+        );
+        assert!(!directory.path().join("outside/b").exists());
+    }
 
     #[tokio::test]
     async fn absolute_paths_through_a_symlinked_workspace_root_are_accepted() {
