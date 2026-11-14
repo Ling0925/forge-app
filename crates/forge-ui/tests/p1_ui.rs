@@ -1149,3 +1149,56 @@ fn example_n_fills_text_n(cx: &mut TestAppContext) {
         );
     }
 }
+
+#[gpui_kit::test]
+fn settings_scrim_covers_window_and_uses_scrim_token(cx: &mut TestAppContext) {
+    use gpui_kit::component::{ActiveTheme, Theme, ThemeMode};
+    for (width, mode, dark) in [
+        (960., ThemeMode::Light, false),
+        (1280., ThemeMode::Dark, true),
+    ] {
+        let f = Fixture::new(cx, width);
+        f.update(cx, |app, window, cx| {
+            Theme::change(mode, Some(window), cx);
+            app.open_settings(window, cx);
+        });
+        f.with_window(cx, |window, cx| {
+            window.render_frame(cx);
+            let viewport = window.viewport_size();
+            let scrim = window.find("settings-overlay").bounds();
+            assert_eq!(scrim.origin, Point::default(), "{mode:?}");
+            assert_eq!(scrim.size, viewport, "{mode:?}: scrim spans the window");
+            // Sidebar, main (incl. the empty-state examples) and composer
+            // all lie under the scrim.
+            for id in [
+                "sidebar",
+                "new-session",
+                "timeline-empty",
+                "example-3",
+                "composer-send",
+            ] {
+                let b = window.find(id).bounds();
+                assert!(
+                    b.origin.x >= scrim.origin.x
+                        && b.origin.y >= scrim.origin.y
+                        && b.origin.x + b.size.width <= scrim.origin.x + scrim.size.width
+                        && b.origin.y + b.size.height <= scrim.origin.y + scrim.size.height,
+                    "{mode:?}: {id} {b:?} not under scrim {scrim:?}"
+                );
+            }
+            let expected = gpui_kit::rgba(forge_ui::tokens::scrim(dark));
+            let actual = gpui_kit::Rgba::from(cx.theme().overlay);
+            for (a, e, ch) in [
+                (actual.r, expected.r, "r"),
+                (actual.g, expected.g, "g"),
+                (actual.b, expected.b, "b"),
+                (actual.a, expected.a, "a"),
+            ] {
+                assert!(
+                    (a - e).abs() < 0.01,
+                    "{mode:?}: overlay {ch} {a} vs token {e}"
+                );
+            }
+        });
+    }
+}

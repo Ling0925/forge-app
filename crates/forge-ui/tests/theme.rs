@@ -1,6 +1,6 @@
 //! The bundled gpui-kit theme must carry exactly the §3.1 token values.
 use forge_ui::theme::{DARK_NAME, LIGHT_NAME, THEME_JSON};
-use forge_ui::tokens::{DARK, GPUI_KIT_MAPPING, LIGHT, Palette};
+use forge_ui::tokens::{DARK, GPUI_KIT_MAPPING, LIGHT, Palette, SCRIM_DARK, SCRIM_LIGHT};
 
 fn hex(rgb: u32) -> String {
     format!("#{rgb:06X}")
@@ -78,4 +78,15 @@ fn stop_button_danger_contrast() {
         contrast(DARK.danger_btn, DARK.surface) < 4.5,
         "why dangerBtn is not used"
     );
+}
+
+#[test]
+fn overlay_key_carries_the_scrim_token_per_theme() {
+    // Settings scrim: black 30 % light, black 50 % dark.
+    assert_eq!(colors(LIGHT_NAME)["overlay"], format!("#{SCRIM_LIGHT:08X}"));
+    assert_eq!(colors(DARK_NAME)["overlay"], format!("#{SCRIM_DARK:08X}"));
+    assert_eq!(colors(LIGHT_NAME)["overlay"], "#0000004D");
+    assert_eq!(colors(DARK_NAME)["overlay"], "#00000080");
+    assert_eq!(forge_ui::tokens::scrim(false), SCRIM_LIGHT);
+    assert_eq!(forge_ui::tokens::scrim(true), SCRIM_DARK);
 }

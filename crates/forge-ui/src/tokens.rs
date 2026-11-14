@@ -31,6 +31,17 @@ pub struct Palette {
     pub del_bg: u32,
 }
 
+/// Modal scrim, light theme: black at 30 % (0x4D / 255). 0xRRGGBBAA.
+pub const SCRIM_LIGHT: u32 = 0x0000_004D;
+/// Modal scrim, dark theme: black at 50 % (0x80 / 255). 0xRRGGBBAA.
+pub const SCRIM_DARK: u32 = 0x0000_0080;
+
+/// Modal scrim (settings panel) as 0xRRGGBBAA for the theme; carried by the
+/// gpui-kit `overlay` theme key.
+pub const fn scrim(dark: bool) -> u32 {
+    if dark { SCRIM_DARK } else { SCRIM_LIGHT }
+}
+
 /// Forge Light. Primary blue #0A5BD3 (user decision 2026-11-14).
 pub const LIGHT: Palette = Palette {
     window: 0xFFFFFF,

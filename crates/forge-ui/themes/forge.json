@@ -235,7 +235,7 @@
         "info.active.background": "#62B0F5",
         "info.foreground": "#1F2D40",
         "scrollbar.background": "#00000000",
-        "overlay": "#0000004D"
+        "overlay": "#00000080"
       }
     }
   ]

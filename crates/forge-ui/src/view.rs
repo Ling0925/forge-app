@@ -1748,7 +1748,8 @@ impl ForgeApp {
                 .items_center()
                 .justify_center()
                 .p_4()
-                .bg(gpui_kit::black().opacity(0.25))
+                // Scrim token (gpui-kit `overlay`): black 30 % light / 50 % dark.
+                .bg(theme.overlay)
                 // Modal scrim: blocks hover, clicks and the scroll wheel for
                 // everything behind it. Clicking it does not close the panel
                 // (only Esc or 关闭 do).
