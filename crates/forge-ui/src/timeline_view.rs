@@ -1,6 +1,7 @@
 //! Timeline row rendering (spec §6.3–§6.8) on gpui-kit `MessageScroller`,
 //! `Message`/`Bubble`, `TextView` (Markdown), `Collapsible` and `Marker`.
 
+use crate::card::{ItemCard, Tone};
 use crate::tokens::Palette;
 use crate::view::ForgeApp;
 use forge_state::i18n::t;
@@ -275,59 +276,39 @@ fn render_error_card(
         ErrorCardKind::Interrupted | ErrorCardKind::RateLimitedWait => IconName::TriangleAlert,
         _ => IconName::CircleX,
     };
-    let fg = rgb(palette.fg);
-    v_flex()
-        .id(SharedString::from(format!("error-{}", card.run_id.0)))
-        .role(Role::Group)
-        .aria_label(card.a11y_label.clone())
-        .aria_description(card.body.clone())
-        .p_4()
-        .gap_2()
-        .rounded(px(8.))
-        .bg(rgb(palette.danger_bg))
-        .border_1()
-        .border_color(rgb(palette.danger))
-        .text_color(fg)
-        .child(
-            h_flex()
-                .gap_2()
-                .items_start()
-                .child(Icon::new(icon).text_color(rgb(palette.danger)))
-                .child(
-                    v_flex()
-                        .gap_0p5()
-                        .child(
-                            div()
-                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                .child(card.title.clone()),
-                        )
-                        .child(div().text_sm().child(card.body.clone())),
-                ),
-        )
-        .child(
-            h_flex()
-                .pl_6()
-                .gap_2()
-                .child(action_button(card, card.primary, true, app, cx))
-                .child(action_button(card, card.secondary, false, app, cx)),
-        )
-        .when(card.details_open, |el| {
-            el.child(
-                v_flex()
-                    .id(SharedString::from(format!(
-                        "error-details-{}",
-                        card.run_id.0
-                    )))
-                    .ml_6()
-                    .p_2()
-                    .rounded(px(6.))
-                    .bg(rgb(palette.surface))
-                    .font_family("SF Mono")
-                    .text_xs()
-                    .children(card.details.iter().map(|line| div().child(line.clone())))
-                    .test_support(),
-            )
-        })
-        .test_support()
-        .into_any_element()
+    let details = card.details_open.then(|| {
+        v_flex()
+            .id(SharedString::from(format!(
+                "error-details-{}",
+                card.run_id.0
+            )))
+            .mt_1()
+            .p_2()
+            .rounded(px(6.))
+            .bg(rgb(palette.surface))
+            .font_family("SF Mono")
+            .text_xs()
+            .children(card.details.iter().map(|line| div().child(line.clone())))
+            .test_support()
+            .into_any_element()
+    });
+    let copy_text = card.details.join("\n");
+    ItemCard::new(
+        format!("error-{}", card.run_id.0),
+        Tone::Danger,
+        icon,
+        card.status,
+        card.title.clone(),
+    )
+    .meta(card.meta.clone())
+    .body(card.body.clone())
+    .a11y_label(card.a11y_label.clone())
+    .action(action_button(card, card.primary, true, app, cx))
+    .action(action_button(card, card.secondary, false, app, cx))
+    .details(details)
+    // Details are already redacted (UI-ER-04), so copying them is safe.
+    .menu_item(t("error.copy_details"), move |_, _, cx| {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(copy_text.clone()));
+    })
+    .render(palette)
 }

@@ -1277,6 +1277,7 @@ impl Render for ForgeApp {
         };
         h_flex()
             .id("forge-root")
+            .font_features(crate::style::tabular_figures())
             .key_context(ROOT_CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_toggle_sidebar))

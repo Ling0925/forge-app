@@ -21,3 +21,20 @@ pub fn disabled_readable(button: Button, disabled: bool, cx: &App) -> Button {
         .border_1()
         .border_color(rgb(palette.border_strong))
 }
+
+/// V6 / UI-REF-04: every digit in the app is tabular (`tnum`), so counters,
+/// run timers and countdowns ("0:09" → "0:10", "1 分 40 秒" → "1 分 39 秒")
+/// never shift the text next to them. Set once on the window root and
+/// inherited by all text.
+pub fn tabular_figures() -> gpui_kit::FontFeatures {
+    gpui_kit::FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)]))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn root_text_uses_tabular_figures() {
+        let features = super::tabular_figures();
+        assert!(features.0.iter().any(|(tag, on)| tag == "tnum" && *on == 1));
+    }
+}

@@ -281,6 +281,11 @@ pub struct ErrorCardVm {
     pub kind: ErrorCardKind,
     pub title: String,
     pub body: String,
+    /// V1 status pill text ("失败"); always paired with the colour (UI-REF-02).
+    pub status: &'static str,
+    /// V1 meta line "来源 · 时间" ("OpenAI · 14:03"); time is when the failure
+    /// arrived, empty when unknown.
+    pub meta: String,
     pub primary: ErrorAction,
     pub secondary: ErrorAction,
     /// Shortcut hint shown on the primary button ("重试 ⌘R"); only the latest
@@ -375,6 +380,8 @@ impl ErrorCardVm {
             a11y_label: tf("announce.run.failed", &[("title", title.as_str())]),
             title,
             body,
+            status: t("card.status.failed"),
+            meta: provider.to_owned(),
             primary,
             secondary,
             retry,
@@ -382,6 +389,19 @@ impl ErrorCardVm {
             details_open,
             details,
         }
+    }
+
+    /// Appends the local wall-clock time the failure arrived to the meta line.
+    pub fn with_time(mut self, at_ms: Option<u64>, utc_offset_ms: i64) -> Self {
+        if let Some(at) = at_ms {
+            let time = clock_time(at, utc_offset_ms);
+            self.meta = if self.meta.is_empty() {
+                time
+            } else {
+                format!("{} · {time}", self.meta)
+            };
+        }
+        self
     }
 }
 
