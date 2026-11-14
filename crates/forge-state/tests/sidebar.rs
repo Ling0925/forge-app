@@ -497,3 +497,113 @@ fn workspace_events_track_active_workspace() {
     assert_eq!(app.active_workspace, Some("b".into()));
     assert_eq!(app.workspaces.len(), 1);
 }
+
+#[test]
+fn idle_rows_show_relative_time_and_split_by_local_day() {
+    const H: u64 = 3_600_000;
+    // 2026-11-14 10:00 UTC+8 = 02:00 UTC.
+    let now = 1_794_621_600_000;
+    let mut app = app();
+    app.set_utc_offset_ms(8 * H as i64);
+    feed(
+        &mut app,
+        [Event::WorkspaceAdded {
+            workspace: Workspace {
+                id: "ws".into(),
+                root: "/tmp/ws".into(),
+                name: "ws".into(),
+            },
+        }],
+    );
+    // s-old: 3 days ago; s-yday: 23:30 local yesterday; s-today: 2 h ago.
+    for (id, at) in [
+        ("s-old", now - 72 * H),
+        ("s-yday", now - 10 * H - H / 2),
+        ("s-today", now - 2 * H),
+    ] {
+        app.set_now_ms(at);
+        feed(
+            &mut app,
+            [Event::SessionCreated {
+                session: session(id),
+            }],
+        );
+    }
+    app.set_now_ms(now);
+    let sidebar = app.sidebar();
+    let buckets: Vec<_> = sidebar
+        .recent_buckets()
+        .into_iter()
+        .map(|(b, rows)| (b, ids(rows)))
+        .collect();
+    assert_eq!(
+        buckets,
+        [
+            (DayBucket::Today, vec!["s-today".to_owned()]),
+            (DayBucket::Yesterday, vec!["s-yday".to_owned()]),
+            (DayBucket::Week, vec!["s-old".to_owned()]),
+        ]
+    );
+    let today = &sidebar.recent[0];
+    assert_eq!(today.status_text, "2 小时前");
+    assert_eq!(today.a11y_label, "会话 s-today，2 小时前");
+    assert_eq!(sidebar.recent[2].status_text, "3 天前");
+    assert_eq!(
+        SidebarVm::bucket_label(DayBucket::Today, 1),
+        "今天，1 个会话"
+    );
+    assert_eq!(relative_time(now - 30_000, now), "刚刚");
+    assert_eq!(relative_time(now - 5 * 60_000, now), "5 分钟前");
+    // No known time (restored session) → 更早, no time text.
+    assert_eq!(DayBucket::for_time(None, now, 0), DayBucket::Older);
+}
+
+#[test]
+fn ui_ref_03_attention_count_change_is_announced() {
+    let mut app = app_with_session();
+    feed(
+        &mut app,
+        [Event::RunStarted {
+            run: run("r1", "s1", None),
+        }],
+    );
+    app.take_announcements();
+    feed(&mut app, tool_and_approval("r1", "c1", "a1"));
+    let sidebar = app.sidebar();
+    assert_eq!(sidebar.needs_attention.len(), 1);
+    let said: Vec<String> = app
+        .take_announcements()
+        .into_iter()
+        .map(|a| a.text)
+        .collect();
+    assert!(said.iter().any(|t| t == "需要处理，1 个会话"), "{said:?}");
+    // Unchanged count → no repeat.
+    feed(
+        &mut app,
+        [Event::TextDelta {
+            run: "r1".into(),
+            text: "x".into(),
+        }],
+    );
+    assert!(
+        app.take_announcements()
+            .iter()
+            .all(|a| a.kind != AnnouncementKind::SidebarCount)
+    );
+    app.set_now_ms(app.now_ms() + ANNOUNCE_MERGE_MS);
+    feed(
+        &mut app,
+        [Event::ApprovalResolved {
+            approval: "a1".into(),
+            decision: ApprovalDecision::Allow,
+            scope: ApprovalScope::Once,
+            by: ApprovalResolvedBy::User,
+        }],
+    );
+    let said: Vec<String> = app
+        .take_announcements()
+        .into_iter()
+        .map(|a| a.text)
+        .collect();
+    assert!(said.iter().any(|t| t == "需要处理，0 个会话"), "{said:?}");
+}

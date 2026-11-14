@@ -25,6 +25,55 @@ impl SidebarGroup {
     }
 }
 
+/// "最近" sub-buckets by local calendar day (§6.1). Sessions with no known
+/// time (restored from storage, no protocol timestamp yet) fall into `Older`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DayBucket {
+    Today,
+    Yesterday,
+    Week,
+    Older,
+}
+
+impl DayBucket {
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Self::Today => "sidebar.bucket.today",
+            Self::Yesterday => "sidebar.bucket.yesterday",
+            Self::Week => "sidebar.bucket.week",
+            Self::Older => "sidebar.bucket.older",
+        }
+    }
+
+    pub const ALL: [DayBucket; 4] = [Self::Today, Self::Yesterday, Self::Week, Self::Older];
+
+    pub fn for_time(at_ms: Option<u64>, now_ms: u64, utc_offset_ms: i64) -> Self {
+        let Some(at) = at_ms else {
+            return Self::Older;
+        };
+        let day = |ms: u64| (ms as i64 + utc_offset_ms).div_euclid(DAY_MS);
+        match day(now_ms) - day(at) {
+            ..=0 => Self::Today,
+            1 => Self::Yesterday,
+            2..=6 => Self::Week,
+            _ => Self::Older,
+        }
+    }
+}
+
+const DAY_MS: i64 = 86_400_000;
+
+/// "刚刚" / "5 分钟前" / "2 小时前" / "3 天前".
+pub fn relative_time(at_ms: u64, now_ms: u64) -> String {
+    let mins = now_ms.saturating_sub(at_ms) / 60_000;
+    match mins {
+        0 => t("time.just_now").to_owned(),
+        1..=59 => tf("time.minutes_ago", &[("n", &mins.to_string())]),
+        60..=1439 => tf("time.hours_ago", &[("n", &(mins / 60).to_string())]),
+        _ => tf("time.days_ago", &[("n", &(mins / 1440).to_string())]),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activity {
     Idle,
@@ -56,6 +105,8 @@ pub struct SessionRowVm {
     pub last_outcome: Option<RunOutcome>,
     pub last_error: Option<ErrorKind>,
     pub group: SidebarGroup,
+    /// Day bucket inside "最近" (meaningful for `SidebarGroup::Recent`).
+    pub bucket: DayBucket,
     pub icon: StatusIcon,
     pub status_text: String,
     pub a11y_label: String,
@@ -77,6 +128,28 @@ impl SidebarVm {
     /// "还没有会话" empty state.
     pub fn is_empty(&self) -> bool {
         self.needs_attention.is_empty() && self.in_progress.is_empty() && self.recent.is_empty()
+    }
+
+    /// "最近" rows split by day bucket, in display order, empty buckets omitted.
+    pub fn recent_buckets(&self) -> Vec<(DayBucket, &[SessionRowVm])> {
+        DayBucket::ALL
+            .iter()
+            .filter_map(|&bucket| {
+                let start = self.recent.iter().position(|r| r.bucket == bucket)?;
+                let len = self.recent[start..]
+                    .iter()
+                    .take_while(|r| r.bucket == bucket)
+                    .count();
+                Some((bucket, &self.recent[start..start + len]))
+            })
+            .collect()
+    }
+
+    pub fn bucket_label(bucket: DayBucket, count: usize) -> String {
+        tf(
+            "a11y.sidebar.group",
+            &[("group", t(bucket.label_key())), ("n", &count.to_string())],
+        )
     }
 
     pub fn group_label(group: SidebarGroup, count: usize) -> String {
@@ -160,9 +233,15 @@ impl AppState {
                     (Some(RunOutcome::Interrupted), _) => {
                         (StatusIcon::Interrupted, t("row.interrupted").into())
                     }
-                    // Idle: relative time + diffstat need protocol timestamps
-                    // and checkpoints (P2); show nothing for now.
-                    _ => (StatusIcon::None, String::new()),
+                    // Idle: "2 小时前 · +12 −3". The time is when this window
+                    // last saw activity. TODO(core-p1): diffstat needs
+                    // checkpoints, and restored sessions need `updated_at`.
+                    _ => (
+                        StatusIcon::None,
+                        vm.last_activity_ms
+                            .map(|at| relative_time(at, self.now_ms))
+                            .unwrap_or_default(),
+                    ),
                 },
             }
         };
@@ -193,6 +272,7 @@ impl AppState {
             last_outcome: vm.last_outcome.clone(),
             last_error: vm.last_error,
             group,
+            bucket: DayBucket::for_time(vm.last_activity_ms, self.now_ms, self.utc_offset_ms),
             icon,
             status_text,
             a11y_label,
@@ -235,6 +315,8 @@ impl AppState {
                 }
             }
         }
+        // Keep "最近" contiguous per day bucket (stable: activity order inside).
+        vm.recent.sort_by_key(|row| row.bucket);
         vm
     }
 

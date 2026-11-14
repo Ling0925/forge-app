@@ -534,6 +534,27 @@ impl ForgeApp {
 
     fn render_sidebar(&self, sidebar: SidebarVm, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = *Palette::for_dark(theme.is_dark());
+        // §6.1: "＋ 新会话" left-aligned with its ⌘N hint on the right.
+        let new_session = Button::new("new-session")
+            .ghost()
+            .small()
+            .w_full()
+            .justify_start()
+            .accessibility_label(t("sidebar.new_session"))
+            .tooltip(t("menu.file.new_session"))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(Icon::new(IconName::Plus))
+                    .child(t("sidebar.new_session"))
+                    .child(div().flex_1())
+                    .child(div().text_xs().text_color(rgb(palette.fg2)).child("⌘N")),
+            )
+            .on_click(
+                cx.listener(|this, _, window, cx| this.on_new_session(&NewSession, window, cx)),
+            );
         let mut list = v_flex()
             .id("sidebar")
             .role(Role::Navigation)
@@ -545,52 +566,68 @@ impl ForgeApp {
             .text_color(theme.sidebar_foreground)
             .p_2()
             .gap_3()
-            .child(
-                Button::new("new-session")
-                    .label(t("sidebar.new_session"))
-                    .icon(IconName::Plus)
-                    .ghost()
-                    .small()
-                    .tooltip(t("menu.file.new_session"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_new_session(&NewSession, window, cx)
-                    })),
-            );
+            .child(new_session);
         if sidebar.is_empty() {
             list = list.child(
                 div()
-                    .px_2()
+                    .px_3()
                     .text_sm()
-                    .text_color(theme.muted_foreground)
+                    .text_color(rgb(palette.fg2))
                     .child(t("sidebar.empty")),
             );
         }
-        for (group, rows) in [
-            (SidebarGroup::NeedsAttention, sidebar.needs_attention),
-            (SidebarGroup::InProgress, sidebar.in_progress),
-            (SidebarGroup::Recent, sidebar.recent),
-            (SidebarGroup::Archived, sidebar.archived),
-        ] {
+        // Groups: 需要处理 / 进行中 / 今天 / 昨天 / 过去 7 天 / 更早 / 归档.
+        // Headers carry the row count (V2 / UI-REF-03).
+        let mut sections: Vec<(String, &'static str, Vec<SessionRowVm>)> = vec![
+            (
+                "NeedsAttention".into(),
+                SidebarGroup::NeedsAttention.label_key(),
+                sidebar.needs_attention.clone(),
+            ),
+            (
+                "InProgress".into(),
+                SidebarGroup::InProgress.label_key(),
+                sidebar.in_progress.clone(),
+            ),
+        ];
+        for (bucket, rows) in sidebar.recent_buckets() {
+            sections.push((format!("{bucket:?}"), bucket.label_key(), rows.to_vec()));
+        }
+        sections.push((
+            "Archived".into(),
+            SidebarGroup::Archived.label_key(),
+            sidebar.archived.clone(),
+        ));
+        for (key, label_key, rows) in sections {
             if rows.is_empty() {
                 continue;
             }
-            let label = SidebarVm::group_label(group, rows.len());
+            let count = rows.len();
+            let name = t(label_key).replace("（{n}）", "");
+            let label = tf(
+                "a11y.sidebar.group",
+                &[("group", &name), ("n", &count.to_string())],
+            );
             let mut section = v_flex()
-                .id(SharedString::from(format!("group-{group:?}")))
+                .id(SharedString::from(format!("group-{key}")))
                 .role(Role::List)
                 .aria_label(label)
                 .gap_0p5()
                 .child(
-                    div()
-                        .px_2()
+                    h_flex()
+                        .id(SharedString::from(format!("group-{key}-header")))
+                        .px_3()
+                        .gap_1p5()
                         .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(t(group.label_key())),
+                        .text_color(rgb(palette.fg2))
+                        .child(name)
+                        .child(div().child(count.to_string()))
+                        .test_support(),
                 );
             for row in rows {
                 section = section.child(self.render_row(row, cx));
             }
-            list = list.child(section);
+            list = list.child(section.test_support());
         }
         list.test_support().into_any_element()
     }
@@ -615,44 +652,40 @@ impl ForgeApp {
 
     fn render_row(&self, row: SessionRowVm, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let icon: Option<AnyElement> = match row.icon {
-            StatusIcon::None => None,
-            StatusIcon::Spinner => Some(Spinner::new().xsmall().into_any_element()),
-            StatusIcon::Approval => Some(
-                Icon::new(IconName::Shield)
-                    .text_color(theme.warning)
-                    .into_any_element(),
-            ),
-            StatusIcon::Failed => Some(
-                Icon::new(IconName::CircleX)
-                    .text_color(theme.danger)
-                    .into_any_element(),
-            ),
-            StatusIcon::Stopped => Some(
-                Icon::new(IconName::Square)
-                    .text_color(theme.muted_foreground)
-                    .into_any_element(),
-            ),
-            StatusIcon::Interrupted => Some(
-                Icon::new(IconName::TriangleAlert)
-                    .text_color(theme.warning)
-                    .into_any_element(),
-            ),
-            StatusIcon::Uncertain => Some(
-                Icon::new(IconName::CircleAlert)
-                    .text_color(theme.warning)
-                    .into_any_element(),
-            ),
+        let palette = *Palette::for_dark(theme.is_dark());
+        // Status colours use the text-safe tokens (≥4.5:1 on sidebar/selected);
+        // every state also has its own glyph and text (UI-SB-03).
+        let icon: AnyElement = match row.icon {
+            StatusIcon::None => div().into_any_element(),
+            StatusIcon::Spinner => Spinner::new().xsmall().into_any_element(),
+            StatusIcon::Approval => Icon::new(IconName::Shield)
+                .text_color(rgb(palette.warning))
+                .into_any_element(),
+            StatusIcon::Failed => Icon::new(IconName::CircleX)
+                .text_color(rgb(palette.danger))
+                .into_any_element(),
+            StatusIcon::Stopped => Icon::new(IconName::Square)
+                .text_color(rgb(palette.fg2))
+                .into_any_element(),
+            StatusIcon::Interrupted => Icon::new(IconName::TriangleAlert)
+                .text_color(rgb(palette.warning))
+                .into_any_element(),
+            StatusIcon::Uncertain => Icon::new(IconName::CircleAlert)
+                .text_color(rgb(palette.warning))
+                .into_any_element(),
         };
         let id = row.id.clone();
+        let approvals = row.approvals;
+        // §6.1: 48pt, two lines, 12pt side padding, radius-md.
         h_flex()
             .id(SharedString::from(format!("session-{}", row.id.0)))
             .role(Role::ListItem)
             .aria_label(row.a11y_label.clone())
             .aria_selected(row.selected)
+            .h(px(48.))
+            .flex_shrink_0()
             .gap_2()
-            .px_2()
-            .py_1()
+            .px_3()
             .rounded(px(8.))
             .cursor_pointer()
             .when(row.selected, |row| {
@@ -660,21 +693,43 @@ impl ForgeApp {
                     .text_color(theme.sidebar_accent_foreground)
             })
             .when(!row.selected, |row| row.hover(|s| s.bg(theme.list_hover)))
-            .children(icon)
             .child(
                 v_flex()
                     .min_w_0()
                     .flex_1()
-                    .child(div().text_sm().truncate().child(row.title.clone()))
-                    .when(!row.status_text.is_empty(), |col| {
-                        col.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .truncate()
-                                .child(row.status_text.clone()),
-                        )
-                    }),
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().size(px(16.)).flex_shrink_0().child(icon))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .truncate()
+                                    .child(row.title.clone()),
+                            )
+                            .when(approvals > 0, |line| {
+                                line.child(
+                                    div()
+                                        .px_1p5()
+                                        .rounded_full()
+                                        .bg(rgb(palette.warning_bg))
+                                        .text_color(rgb(palette.warning))
+                                        .text_xs()
+                                        .child(approvals.to_string()),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .pl(px(24.))
+                            .text_xs()
+                            .text_color(rgb(palette.fg2))
+                            .truncate()
+                            .child(row.status_text.clone()),
+                    ),
             )
             .on_click(cx.listener(move |this, _, window, cx| this.select(&id, window, cx)))
             .test_support()
