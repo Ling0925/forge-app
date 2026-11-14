@@ -42,3 +42,22 @@ fn dark_theme_matches_tokens() {
     check(DARK_NAME, &DARK);
     assert_eq!(colors(DARK_NAME)["primary.background"], "#5AA2FF");
 }
+
+#[test]
+fn high_contrast_variants_raise_secondary_text_and_borders() {
+    use forge_ui::theme::{DARK_HC_NAME, LIGHT_HC_NAME, high_contrast_json};
+    let json: serde_json::Value = serde_json::from_str(&high_contrast_json()).unwrap();
+    for (name, palette) in [(LIGHT_HC_NAME, &LIGHT), (DARK_HC_NAME, &DARK)] {
+        let colors = json["themes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|theme| theme["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing"))["colors"]
+            .clone();
+        assert_eq!(colors["muted.foreground"], hex(palette.fg), "{name}");
+        assert_eq!(colors["border"], hex(palette.border_strong), "{name}");
+        assert_eq!(colors["foreground"], hex(palette.fg), "{name}");
+        assert_eq!(colors["primary.background"], hex(palette.accent), "{name}");
+    }
+}

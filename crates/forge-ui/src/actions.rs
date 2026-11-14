@@ -8,6 +8,7 @@ gpui_kit::actions!(
     forge,
     [
         ToggleSidebar,
+        ToggleInspector,
         NewSession,
         FocusComposer,
         StopRun,
@@ -32,6 +33,7 @@ pub const COMPOSER_CONTEXT: &str = "ForgeComposer";
 pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("ctrl-cmd-s", ToggleSidebar, None),
+        KeyBinding::new("alt-cmd-i", ToggleInspector, None),
         KeyBinding::new("cmd-n", NewSession, None),
         KeyBinding::new("cmd-l", FocusComposer, None),
         KeyBinding::new("cmd-.", StopRun, None),
@@ -69,10 +71,10 @@ pub fn menus() -> Vec<Menu> {
             MenuItem::os_action(t("menu.edit.paste"), Paste, OsAction::Paste),
             MenuItem::os_action(t("menu.edit.select_all"), SelectAll, OsAction::SelectAll),
         ]),
-        Menu::new(t("menu.view")).items([MenuItem::action(
-            t("menu.view.toggle_sidebar"),
-            ToggleSidebar,
-        )]),
+        Menu::new(t("menu.view")).items([
+            MenuItem::action(t("menu.view.toggle_sidebar"), ToggleSidebar),
+            MenuItem::action(t("menu.view.toggle_inspector"), ToggleInspector),
+        ]),
         Menu::new(t("menu.session")).items([
             MenuItem::action(t("menu.session.focus_composer"), FocusComposer),
             MenuItem::action(t("menu.session.stop"), StopRun),
