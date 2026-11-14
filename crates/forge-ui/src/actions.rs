@@ -9,6 +9,9 @@ gpui_kit::actions!(
     [
         ToggleSidebar,
         ToggleInspector,
+        InspectorChanges,
+        InspectorQueue,
+        InspectorOutput,
         RetryLastRun,
         NewSession,
         FocusComposer,
@@ -35,6 +38,9 @@ pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("ctrl-cmd-s", ToggleSidebar, None),
         KeyBinding::new("alt-cmd-i", ToggleInspector, None),
+        KeyBinding::new("alt-cmd-1", InspectorChanges, None),
+        KeyBinding::new("alt-cmd-2", InspectorQueue, None),
+        KeyBinding::new("alt-cmd-3", InspectorOutput, None),
         KeyBinding::new("cmd-n", NewSession, None),
         KeyBinding::new("cmd-l", FocusComposer, None),
         KeyBinding::new("cmd-.", StopRun, None),

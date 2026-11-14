@@ -1,8 +1,9 @@
 //! Root view. Rendering only: every decision comes from `forge_state::AppState`.
 
 use crate::actions::{
-    COMPOSER_CONTEXT, CloseWindow, FocusComposer, Minimize, NewSession, NextSession, PrevSession,
-    Quit, ROOT_CONTEXT, RetryLastRun, Steer, StopRun, ToggleInspector, ToggleSidebar,
+    COMPOSER_CONTEXT, CloseWindow, FocusComposer, InspectorChanges, InspectorOutput,
+    InspectorQueue, Minimize, NewSession, NextSession, PrevSession, Quit, ROOT_CONTEXT,
+    RetryLastRun, Steer, StopRun, ToggleInspector, ToggleSidebar,
 };
 use crate::announce::Announcer;
 use crate::backend::{Backend, EventReceiver, StartError};
@@ -21,6 +22,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle,
@@ -55,6 +57,8 @@ pub struct ForgeApp {
     exiting: bool,
     drag: Option<SidebarDrag>,
     placeholder: &'static str,
+    /// Inspector tab: 0 改动, 1 队列, 2 工具输出 (UI-only).
+    inspector_tab: usize,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -159,6 +163,7 @@ impl ForgeApp {
             exiting: false,
             drag: None,
             placeholder: t("composer.placeholder.idle"),
+            inspector_tab: 0,
             _tasks: tasks,
             _subscriptions: subscriptions,
         };
@@ -424,6 +429,13 @@ impl ForgeApp {
         cx: &mut Context<Self>,
     ) {
         self.state.ui.inspector_visible = !self.state.ui.inspector_visible;
+        self.after_change(window, cx);
+    }
+
+    /// ⌥⌘1/2/3: open the Inspector on 改动 / 队列 / 工具输出 (§6.10).
+    fn show_inspector_tab(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.inspector_tab = tab;
+        self.state.ui.inspector_visible = true;
         self.after_change(window, cx);
     }
 
@@ -1174,6 +1186,27 @@ impl ForgeApp {
 
     fn render_inspector(&self, width: f32, overlay: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = *Palette::for_dark(theme.is_dark());
+        let tab = self.inspector_tab;
+        // TODO(core-p2): checkpoints / tool output; tab counts ("改动 3", V2)
+        // appear once that data exists.
+        let empty = match tab {
+            0 => t("inspector.empty.changes").to_owned(),
+            1 => {
+                let n = self.state.selected().map_or(0, |vm| vm.pending_queue_len());
+                if n == 0 {
+                    t("inspector.empty.queue").to_owned()
+                } else {
+                    tf("inspector.queue.count", &[("n", &n.to_string())])
+                }
+            }
+            _ => t("inspector.empty.output").to_owned(),
+        };
+        let tabs = [
+            ("inspector.tab.changes", "⌥⌘1"),
+            ("inspector.tab.queue", "⌥⌘2"),
+            ("inspector.tab.output", "⌥⌘3"),
+        ];
         v_flex()
             .id("inspector")
             .role(Role::Complementary)
@@ -1188,34 +1221,35 @@ impl ForgeApp {
             .child(
                 h_flex()
                     .h(px(52.))
-                    .px_4()
-                    .gap_4()
+                    .px_3()
                     .items_center()
                     .border_b_1()
                     .border_color(theme.border)
-                    .text_sm()
                     .child(
-                        div()
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .child(t("inspector.tab.changes")),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child(t("inspector.tab.queue")),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child(t("inspector.tab.output")),
+                        TabBar::new("inspector-tabs")
+                            .segmented()
+                            .small()
+                            .w_full()
+                            .selected_index(tab)
+                            .children(tabs.iter().map(|(key, keys)| {
+                                Tab::new()
+                                    .label(t(key))
+                                    .aria_label(format!("{}，{keys}", t(key)))
+                            }))
+                            .on_click(cx.listener(|this, ix: &usize, window, cx| {
+                                this.show_inspector_tab(*ix, window, cx)
+                            })),
                     ),
             )
             .child(
                 div()
-                    .p_4()
+                    .id("inspector-empty")
+                    .aria_label(empty.clone())
+                    .p_3()
                     .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(t("inspector.empty")),
+                    .text_color(rgb(palette.fg2))
+                    .child(empty)
+                    .test_support(),
             )
             .test_support()
             .into_any_element()
@@ -1282,6 +1316,15 @@ impl Render for ForgeApp {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_inspector))
+            .on_action(cx.listener(|this, _: &InspectorChanges, window, cx| {
+                this.show_inspector_tab(0, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &InspectorQueue, window, cx| {
+                this.show_inspector_tab(1, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &InspectorOutput, window, cx| {
+                this.show_inspector_tab(2, window, cx)
+            }))
             .on_action(cx.listener(Self::on_new_session))
             .on_action(cx.listener(Self::on_focus_composer))
             .on_action(cx.listener(Self::on_stop))

@@ -503,3 +503,28 @@ fn sidebar_rows_are_48pt_and_groups_show_counts(cx: &mut TestAppContext) {
         assert_eq!(button.label(), Some("新会话"));
     });
 }
+
+#[gpui_kit::test]
+fn inspector_tabs_switch_with_alt_cmd_digits(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("inspector").is_none());
+        window.press("alt-cmd-1", cx);
+        assert!(window.try_find("inspector").is_some(), "⌥⌘1 opens it");
+        assert_eq!(
+            window.find("inspector-empty").label(),
+            Some("本会话还没有改动文件")
+        );
+        window.press("alt-cmd-3", cx);
+        assert_eq!(
+            window.find("inspector-empty").label(),
+            Some("选中一个工具步骤查看完整输出")
+        );
+        window.press("alt-cmd-2", cx);
+        assert_eq!(
+            window.find("inspector-empty").label(),
+            Some("没有排队的消息")
+        );
+    });
+}
