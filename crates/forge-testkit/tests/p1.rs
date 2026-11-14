@@ -1122,7 +1122,19 @@ async fn http_chat_persists_both_providers_and_key_tests_use_anthropic_minimal_r
         ("anthropic", include_str!("fixtures/anthropic.sse")),
         ("openai", include_str!("fixtures/openai.sse")),
     ] {
-        let server = MockServer::start(MockResponse::sse(body)).await;
+        // The fixture ends with tool calls, so the run issues a follow-up
+        // request; serve a terminal no-tool response to finish it.
+        let follow_up = match name {
+            "anthropic" => {
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_follow\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            }
+            _ => {
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\ndata: [DONE]\n\n"
+            }
+        };
+        let server =
+            MockServer::start_all(vec![MockResponse::sse(body), MockResponse::sse(follow_up)])
+                .await;
         let mut h = Harness::new([]);
         h.runtime.services.providers = Arc::new(HttpProviderFactory);
         let mut settings = common::settings(name);

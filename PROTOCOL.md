@@ -20,7 +20,7 @@ P1 已实现下表标记的业务命令。调用方循环驱动 `Runtime::dispat
 | `ArchiveSession{session, archived}` | P1 已实现 |
 | `DeleteSession{session}` | P1 已实现 |
 | `LoadHistory{session, before, limit}` | P1 已实现 |
-| `Send{session, input_id, content}` | P1 已实现单轮发送；忙时拒绝 invalid_state，P3 排队 |
+| `Send{session, input_id, content}` | P1 已实现发送；忙时拒绝 invalid_state，P3 排队；Provider 响应内的只读工具调用按末节执行并续跑 |
 | `Steer{run, steer_id, content}` | P3 |
 | `EditQueueItem{item, content}` | P3 |
 | `RemoveQueueItem{item}` | P3 |
@@ -119,3 +119,13 @@ P1 保留 `Shutdown` / `ShutdownComplete` 类型，业务处理返回 `not_imple
 UI Inspector diff 采用相同计数规则：对前后原始字节使用 `similar::TextDiff::from_lines` 的 Myers 行差异，`Insert` 每行计入 `lines_added`，`Delete` 每行计入 `lines_removed`。分行保留行结束符（包括 `\n` 和完整的 `\r\n`）；末行即使没有换行符也算一行；仅末尾换行符变化计为删除一行、增加一行。非 UTF-8 内容直接按字节比较，不做有损转换。新文件删除行数为 0，增加行数为新内容行数（空文件为 0）；内容未变时两项均为 0。
 
 忽略规则与隐藏条目过滤仅用于非递归的 `list_dir` 及 `glob`、`grep`：无需 Git 仓库，仍应用目录树内的 `.gitignore`、`.ignore` 和存在时的 `.git/info/exclude`，不应用工作区外父目录或全局忽略规则；按名称调用 `read_file`、`write_file`、`edit_file` 不受这些过滤规则影响。
+
+## P2 只读工具循环
+
+- `Send` 发起的 `ProviderRequest.tools` 只发布本切片实际支持的工具：`read_file`、`list_dir`、`glob`、`grep`，全部 `has_side_effects=false`，不需要审批。`write_file`、`edit_file`、`command` 等副作用工具不发布也不可执行；模型仍调用时按 `failed` 工具结果回传“该工具在此构建不可用”。参数为 JSON Schema：`read_file.lines` 是 `[start, end]` 一元起始闭区间；`glob`/`grep` 的 `path` 省略时默认工作区根。
+- 流式工具调用按 `ToolCallId` 组装 `ToolCallStarted` 与多个 `ToolArgumentsDelta` 的 `partial_json` 增量，顺序与内容原样拼接；同一响应中重复 call id、或对未开始 call 的参数增量，按 `invalid_response`（Failed.kind: server）终止该 Run。流中途出错时该响应的未完成调用整体丢弃，不产生 `ToolCallProposed`。无参数增量时 `arguments_json` 记为 `{}`。
+- 一次 Provider 响应的全部调用先各自提交并广播 `ToolCallProposed`（`state: proposed`，含组装后的 `arguments_json`），随后按流式顺序逐个执行：执行前发布 `ToolCallStateChanged{running}`，结束发布终态 `succeeded`/`failed`/`cancelled`，`result` 为结果文本或错误文本。`ToolCallProposed` 与 `ToolCallStateChanged` 是持久事件，与其他状态事件在同一事务提交后广播。
+- 工具结果以 `role: tool`、`tool_call_id` 指向该调用的 `ProviderMessage` 追加进同一 Run 的下一次 `ProviderRequest.messages`（连同产生这些调用的 assistant 消息）；某次响应没有工具调用时按既有终态处理。`Run.usage` 累计该 Run 全部 Provider 请求的用量（`requests` 为请求次数），`UsageRecord` 在终态记录合计值。
+- `read_file` 结果即文件文本；`list_dir` 每行一个条目、目录以 `/` 结尾；`glob` 每行一个相对路径；`grep` 每行 `path:line:text`。参数不是合法 JSON、缺字段或行区间非法 → `failed`（InvalidArguments）；执行中的 IO/规则错误同样 → `failed`，错误文本作为工具结果回传给模型。
+- `ToolError::Cancelled` 映射为 `cancelled`，Run 终态为 `Cancelled{source: user}`。本切片没有取消入口：`CancelRun`、`DecideApproval`、`SetPermissionMode`、`Shutdown` 仍返回 `not_implemented`；glob/grep 已接入 `CancellationToken`，但没有路径触发取消，该映射当前不可达。
+- 已知缺口（后续切片）：`tool_calls`/`approvals` 表不写行，调用状态仅靠持久事件恢复；工具结果不落 `messages`（`tool_call_id` 外键指向 `tool_calls` 行），续跑消息仅在内存中维护；真实 Provider 尚不能完整消费续跑消息：编码层会发送 `role: tool` + `tool_call_id`，但 Anthropic 需要 `tool_result` 块，OpenAI 还要求前置 assistant 消息携带 `tool_calls` 字段，二者均未编码；`ToolOutputChunk` 不发布（本切片工具无流式输出）；`AwaitingApproval`/`Approved`/`Denied` 等审批态不使用。

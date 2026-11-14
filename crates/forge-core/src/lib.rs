@@ -1,15 +1,18 @@
 mod errors;
 pub mod secrets;
+mod tool_loop;
 
 use forge_protocol::*;
 use forge_provider::{
     ErrorKind, ProviderError, ProviderFactory, ProviderMessage, ProviderRequest, StreamEvent,
 };
 use forge_store::{StoreError, WriteTransaction};
-use forge_tools::clock::Clock;
+use forge_tools::{cancellation::CancellationToken, clock::Clock};
 use secrets::SecretStore;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    mem::take,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use thiserror::Error;
@@ -41,11 +44,39 @@ struct Running {
     active: ActiveRun,
     turn: TurnId,
     usage: Usage,
+    request_usage: Usage,
     key: Option<String>,
+    model: ModelSelection,
+    configuration: Result<(ProviderSettings, Option<String>), ProviderError>,
+    workspace: PathBuf,
+    generation: String,
+    tail: Vec<ProviderMessage>,
+    calls: Vec<PendingCall>,
+    remaining: VecDeque<ToolCall>,
+    cancellation: CancellationToken,
+}
+struct PendingCall {
+    id: ToolCallId,
+    name: String,
+    arguments: String,
+}
+impl Running {
+    /// One provider request just ended; fold its usage into the run total.
+    fn end_request(&mut self) {
+        let request = take(&mut self.request_usage);
+        self.usage.input_tokens += request.input_tokens;
+        self.usage.output_tokens += request.output_tokens;
+        self.usage.cached_tokens += request.cached_tokens;
+        self.usage.requests += request.requests;
+        if let Some(cost) = request.estimated_cost_usd {
+            *self.usage.estimated_cost_usd.get_or_insert(0.0) += cost;
+        }
+    }
 }
 enum Internal {
     Stream(RunId, Result<StreamEvent, ProviderError>),
     KeyTested(ProviderId, Result<(), ProviderError>),
+    ToolFinished(RunId, ToolCallId, tool_loop::Outcome),
 }
 struct ProviderJob {
     request: ProviderRequest,
@@ -594,6 +625,14 @@ impl Runtime {
             ));
         }
         let configuration = self.configuration(&session.model.provider);
+        let workspace = self
+            .services
+            .store
+            .workspaces()?
+            .into_iter()
+            .find(|workspace| workspace.id == session.workspace_id)
+            .expect("session has workspace")
+            .root;
         let now = self.now();
         let run = Run {
             id: RunId(self.services.store.new_id()?),
@@ -658,10 +697,10 @@ impl Runtime {
         forge_tools::failpoint!(self.failpoints, forge_tools::failpoints::SEND_AFTER_COMMIT);
         let request = ProviderRequest {
             run: run.id.clone(),
-            model: session.model,
+            model: session.model.clone(),
             system: None,
             messages,
-            tools: vec![],
+            tools: tool_loop::definitions(),
         };
         self.active.insert(
             run.id.clone(),
@@ -674,7 +713,16 @@ impl Runtime {
                 },
                 turn: turn.id,
                 usage: Usage::default(),
+                request_usage: Usage::default(),
                 key: configuration.as_ref().ok().and_then(|(_, key)| key.clone()),
+                model: session.model,
+                configuration: configuration.clone(),
+                workspace,
+                generation: String::new(),
+                tail: Vec::new(),
+                calls: Vec::new(),
+                remaining: VecDeque::new(),
+                cancellation: CancellationToken::default(),
             },
         );
         Ok(Completed {
@@ -752,6 +800,11 @@ impl Runtime {
                     self.storage_failed(run, error);
                 }
             }
+            Internal::ToolFinished(run, call, outcome) => {
+                if let Err(error) = self.tool_finished(run.clone(), call, outcome) {
+                    self.storage_failed(run, error);
+                }
+            }
         }
         Ok(())
     }
@@ -762,12 +815,9 @@ impl Runtime {
     ) -> Result<(), StoreError> {
         match result {
             Ok(StreamEvent::TextDelta(text)) => {
-                self.active
-                    .get_mut(&run)
-                    .expect("stream has active run")
-                    .active
-                    .text
-                    .push_str(&text);
+                let running = self.active.get_mut(&run).expect("stream has active run");
+                running.active.text.push_str(&text);
+                running.generation.push_str(&text);
                 self.publish(Event::TextDelta { run, text })?;
             }
             Ok(StreamEvent::ReasoningDelta(text)) => {
@@ -783,12 +833,217 @@ impl Runtime {
                 self.active
                     .get_mut(&run)
                     .expect("stream has active run")
-                    .usage = usage;
+                    .request_usage = usage;
             }
-            Ok(StreamEvent::Finished) => self.finish(run, Ok(()))?,
-            Err(error) => self.finish(run, Err(error))?,
-            Ok(StreamEvent::ToolCallStarted { .. } | StreamEvent::ToolArgumentsDelta { .. }) => {}
+            Ok(StreamEvent::ToolCallStarted { id, name }) => {
+                let running = self.active.get_mut(&run).expect("stream has active run");
+                if running.calls.iter().any(|call| call.id == id) {
+                    self.finish(
+                        run,
+                        Err(invalid_response("provider repeated a tool call id")),
+                    )?;
+                } else {
+                    running.calls.push(PendingCall {
+                        id,
+                        name,
+                        arguments: String::new(),
+                    });
+                }
+            }
+            Ok(StreamEvent::ToolArgumentsDelta { id, json }) => {
+                let running = self.active.get_mut(&run).expect("stream has active run");
+                match running.calls.iter().position(|call| call.id == id) {
+                    Some(index) => running.calls[index].arguments.push_str(&json),
+                    None => self.finish(
+                        run,
+                        Err(invalid_response(
+                            "provider sent tool arguments for an unknown call",
+                        )),
+                    )?,
+                }
+            }
+            Ok(StreamEvent::Finished) => {
+                let tools = {
+                    let running = self.active.get_mut(&run).expect("stream has active run");
+                    running.end_request();
+                    !running.calls.is_empty()
+                };
+                if tools {
+                    self.execute_tools(run)?;
+                } else {
+                    self.finish(run, Ok(()))?;
+                }
+            }
+            Err(error) => {
+                self.active
+                    .get_mut(&run)
+                    .expect("stream has active run")
+                    .end_request();
+                self.finish(run, Err(error))?;
+            }
         }
+        Ok(())
+    }
+
+    /// The provider response ended with tool calls: propose every call, then run
+    /// them sequentially so each terminal state is published before the next starts.
+    fn execute_tools(&mut self, run: RunId) -> Result<(), StoreError> {
+        let (first, events) = {
+            let running = self.active.get_mut(&run).expect("stream has active run");
+            running.tail.push(ProviderMessage {
+                role: MessageRole::Assistant,
+                content: Content {
+                    text: take(&mut running.generation),
+                    attachments: vec![],
+                },
+                tool_call_id: None,
+            });
+            let calls: Vec<ToolCall> = take(&mut running.calls)
+                .into_iter()
+                .map(|pending| ToolCall {
+                    id: pending.id,
+                    run_id: run.clone(),
+                    tool: pending.name,
+                    arguments_json: if pending.arguments.is_empty() {
+                        "{}".into()
+                    } else {
+                        pending.arguments
+                    },
+                    state: ToolCallState::Proposed,
+                    result: None,
+                    has_side_effects: false,
+                })
+                .collect();
+            let first = calls[0].clone();
+            running.remaining = calls.iter().skip(1).cloned().collect();
+            let mut events: Vec<Event> = calls
+                .into_iter()
+                .map(|call| Event::ToolCallProposed { call })
+                .collect();
+            events.push(Event::ToolCallStateChanged {
+                call: first.id.clone(),
+                state: ToolCallState::Running,
+                result: None,
+            });
+            (first, events)
+        };
+        for envelope in self.commit(events, |_| Ok(()))? {
+            self.broadcast(envelope);
+        }
+        self.start_tool(run, first);
+        Ok(())
+    }
+
+    fn start_tool(&self, run: RunId, call: ToolCall) {
+        let running = self.active.get(&run).expect("stream has active run");
+        let workspace = running.workspace.clone();
+        let cancellation = running.cancellation.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let outcome = tool_loop::execute(call.clone(), workspace, cancellation).await;
+            let _ = sender.send(Internal::ToolFinished(run, call.id, outcome));
+        });
+    }
+
+    fn tool_finished(
+        &mut self,
+        run: RunId,
+        call: ToolCallId,
+        outcome: tool_loop::Outcome,
+    ) -> Result<(), StoreError> {
+        let (state, result) = match outcome {
+            tool_loop::Outcome::Succeeded(text) => (ToolCallState::Succeeded, Some(text)),
+            tool_loop::Outcome::Failed(text) => (ToolCallState::Failed, Some(text)),
+            tool_loop::Outcome::Cancelled => (ToolCallState::Cancelled, None),
+        };
+        let result = result.map(|text| Content {
+            text,
+            attachments: vec![],
+        });
+        let next = {
+            let running = self.active.get_mut(&run).expect("stream has active run");
+            running.tail.push(ProviderMessage {
+                role: MessageRole::Tool,
+                content: result.clone().unwrap_or_else(|| Content {
+                    text: String::new(),
+                    attachments: vec![],
+                }),
+                tool_call_id: Some(call.clone()),
+            });
+            if state == ToolCallState::Cancelled {
+                running.remaining.clear();
+            }
+            running.remaining.pop_front()
+        };
+        for envelope in self.commit(
+            vec![Event::ToolCallStateChanged {
+                call,
+                state: state.clone(),
+                result,
+            }],
+            |_| Ok(()),
+        )? {
+            self.broadcast(envelope);
+        }
+        match (state, next) {
+            (ToolCallState::Cancelled, _) => self.finish_with(
+                run,
+                RunOutcome::Cancelled {
+                    source: CancelSource::User,
+                },
+            )?,
+            (_, Some(next)) => {
+                for envelope in self.commit(
+                    vec![Event::ToolCallStateChanged {
+                        call: next.id.clone(),
+                        state: ToolCallState::Running,
+                        result: None,
+                    }],
+                    |_| Ok(()),
+                )? {
+                    self.broadcast(envelope);
+                }
+                self.start_tool(run, next);
+            }
+            (_, None) => self.continue_run(run)?,
+        }
+        Ok(())
+    }
+
+    /// All tool calls of a provider response are done; feed the results back and
+    /// keep the same run going with a follow-up provider request.
+    fn continue_run(&mut self, run: RunId) -> Result<(), StoreError> {
+        let (model, configuration, messages) = {
+            let running = self.active.get_mut(&run).expect("stream has active run");
+            let mut messages = self
+                .services
+                .store
+                .messages(&running.active.run.session_id)?
+                .into_iter()
+                .map(|message| ProviderMessage {
+                    role: message.role,
+                    content: message.content,
+                    tool_call_id: message.tool_call_id,
+                })
+                .collect::<Vec<_>>();
+            messages.extend(running.tail.iter().cloned());
+            (
+                running.model.clone(),
+                running.configuration.clone(),
+                messages,
+            )
+        };
+        self.start(ProviderJob {
+            request: ProviderRequest {
+                run,
+                model,
+                system: None,
+                messages,
+                tools: tool_loop::definitions(),
+            },
+            configuration,
+            test_key: false,
+        });
         Ok(())
     }
     fn storage_failed(&mut self, id: RunId, error: StoreError) {
@@ -847,6 +1102,23 @@ impl Runtime {
         }
     }
     fn finish(&mut self, id: RunId, result: Result<(), ProviderError>) -> Result<(), StoreError> {
+        let outcome = match result {
+            Ok(()) => RunOutcome::Succeeded,
+            Err(error) => {
+                let running = self.active.get(&id).expect("stream has active run");
+                let provider = self
+                    .services
+                    .store
+                    .session(&running.active.run.session_id)?
+                    .expect("active run has session")
+                    .model
+                    .provider;
+                errors::outcome(error, self.services.clock.now(), &provider)
+            }
+        };
+        self.finish_with(id, outcome)
+    }
+    fn finish_with(&mut self, id: RunId, outcome: RunOutcome) -> Result<(), StoreError> {
         let running = self.active.get(&id).expect("stream has active run");
         let mut run = running.active.run.clone();
         let mut session = self
@@ -854,17 +1126,11 @@ impl Runtime {
             .store
             .session(&run.session_id)?
             .expect("active run has session");
-        let outcome = match result {
-            Ok(()) => RunOutcome::Succeeded,
-            Err(error) => {
-                errors::outcome(error, self.services.clock.now(), &session.model.provider)
-            }
-        };
         let success = outcome == RunOutcome::Succeeded;
-        run.state = if success {
-            RunState::Succeeded
-        } else {
-            RunState::Failed
+        run.state = match outcome {
+            RunOutcome::Succeeded => RunState::Succeeded,
+            RunOutcome::Cancelled { .. } => RunState::Cancelled,
+            RunOutcome::Failed { .. } => RunState::Failed,
         };
         run.outcome = Some(outcome.clone());
         let now = self.now();
@@ -939,6 +1205,13 @@ fn configuration(message: &str) -> ProviderError {
     ProviderError {
         code: None,
         kind: ErrorKind::Configuration,
+        message: message.into(),
+    }
+}
+fn invalid_response(message: &str) -> ProviderError {
+    ProviderError {
+        code: None,
+        kind: ErrorKind::InvalidResponse,
         message: message.into(),
     }
 }
