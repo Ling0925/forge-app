@@ -212,3 +212,28 @@ fn unknown_run_errors_round_trip_with_provider_or_storage_source() {
         );
     }
 }
+
+#[test]
+fn finished_run_fields_are_additive_and_round_trip() {
+    use forge_protocol::{Event, FinishedRun, Session};
+    let mut session = json!({"id":"s", "workspace_id":"w", "title":"title", "model":{"provider":"provider", "model":"fixture"}, "permission_mode":"ask", "state":"idle", "archived":false, "queue_state":"active", "created_at":1000, "updated_at":2000});
+    let legacy: Session = serde_json::from_value(session.clone()).unwrap();
+    assert_eq!(legacy.last_finished_run, None);
+    round_trip::<Session>(session.clone());
+    let outcome = json!({"type":"failed", "kind":"interrupted", "message":"上次异常退出时中断", "http_status":null, "retry_after_ms":null, "retryable":true});
+    let finished = json!({"run":"r", "input_id":"i", "outcome":outcome, "finished_at":2000});
+    round_trip::<FinishedRun>(finished.clone());
+    session["last_finished_run"] = finished;
+    round_trip::<Session>(session.clone());
+    round_trip::<EventEnvelope>(json!({"seq":10, "event":{
+        "type":"snapshot", "sessions":[session], "workspaces":[],
+        "settings":{"providers":[], "model":{"provider":"provider", "model":"fixture"}, "permission_mode":"ask", "ui_prefs":{}},
+        "providers":[], "active_runs":[], "last_seq":10
+    }}));
+    let mut history = json!({"type":"history_loaded", "session":"s", "messages":[{"id":"m", "ordinal":1, "input_id":"i", "run_id":"r", "turn_id":"t", "role":"user", "content":{"text":"hello", "attachments":[]}, "tool_call_id":null}], "next_before":null});
+    let legacy: Event = serde_json::from_value(history.clone()).unwrap();
+    assert!(matches!(legacy, Event::HistoryLoaded { runs, .. } if runs.is_empty()));
+    round_trip::<Event>(history.clone());
+    history["runs"] = json!([{"id":"r", "session_id":"s", "queue_item_id":null, "state":"failed", "outcome":outcome, "started_at":1000, "finished_at":2000, "usage":{"input_tokens":0, "output_tokens":0, "cached_tokens":0, "requests":0, "estimated_cost_usd":null}}]);
+    round_trip::<Event>(history);
+}

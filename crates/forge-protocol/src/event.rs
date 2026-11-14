@@ -41,6 +41,8 @@ pub enum Event {
         session: SessionId,
         messages: Vec<Message>,
         next_before: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        runs: Vec<Run>,
     },
     Snapshot {
         sessions: Vec<Session>,

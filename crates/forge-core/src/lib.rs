@@ -9,7 +9,7 @@ use forge_store::{StoreError, WriteTransaction};
 use forge_tools::clock::Clock;
 use secrets::SecretStore;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 use thiserror::Error;
@@ -104,23 +104,72 @@ impl Runtime {
         let (commands, receiver) = mpsc::unbounded_channel();
         let (sender, internal) = mpsc::unbounded_channel();
         let subscribers = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = Self {
+            commands: receiver,
+            subscribers: subscribers.clone(),
+            seq,
+            services,
+            internal,
+            sender,
+            active: BTreeMap::new(),
+            #[cfg(feature = "failpoints")]
+            failpoints: forge_tools::failpoints::Failpoints::default(),
+        };
+        runtime.recover_running_runs()?;
         Ok((
-            Self {
-                commands: receiver,
-                subscribers: subscribers.clone(),
-                seq,
-                services,
-                internal,
-                sender,
-                active: BTreeMap::new(),
-                #[cfg(feature = "failpoints")]
-                failpoints: forge_tools::failpoints::Failpoints::default(),
-            },
+            runtime,
             RuntimeHandle {
                 commands,
                 subscribers,
             },
         ))
+    }
+    fn recover_running_runs(&mut self) -> Result<(), StoreError> {
+        let now = self.now();
+        for mut run in self.services.store.running_runs()? {
+            let mut session = self
+                .services
+                .store
+                .session(&run.session_id)?
+                .expect("run has session");
+            let outcome = RunOutcome::Failed {
+                kind: RunErrorKind::Interrupted,
+                message: "上次异常退出时中断".into(),
+                http_status: None,
+                retry_after_ms: None,
+                retryable: true,
+            };
+            run.state = RunState::Failed;
+            run.outcome = Some(outcome.clone());
+            run.finished_at = Some(now);
+            session.state = SessionState::Idle;
+            session.updated_at = now;
+            session.last_finished_run = Some(FinishedRun {
+                run: run.id.clone(),
+                input_id: self.services.store.run_input_id(&run.id)?,
+                outcome: outcome.clone(),
+                finished_at: now,
+            });
+            let events = self.commit(
+                vec![
+                    Event::SessionUpdated {
+                        session: session.clone(),
+                    },
+                    Event::RunFinished {
+                        run: run.id.clone(),
+                        outcome,
+                    },
+                ],
+                |tx| {
+                    tx.run(&run)?;
+                    tx.session(&session)
+                },
+            )?;
+            for event in events {
+                self.broadcast(event);
+            }
+        }
+        Ok(())
     }
     pub async fn next_command(&mut self) -> Option<CommandRequest> {
         self.commands.recv().await
@@ -315,6 +364,7 @@ impl Runtime {
                     queue_state: QueueState::Active,
                     created_at: now,
                     updated_at: now,
+                    last_finished_run: None,
                 };
                 let events = self.commit(
                     vec![Event::SessionCreated {
@@ -404,10 +454,23 @@ impl Runtime {
                 self.session(&session)?;
                 let (messages, next_before) =
                     self.services.store.history(&session, before, limit)?;
+                let runs = messages
+                    .iter()
+                    .map(|message| &message.run_id)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .map(|id| {
+                        self.services
+                            .store
+                            .run(id)
+                            .map(|run| run.expect("message has run"))
+                    })
+                    .collect::<Result<_, _>>()?;
                 let events = self.envelopes(vec![Event::HistoryLoaded {
                     session: session.clone(),
                     messages,
                     next_before,
+                    runs,
                 }]);
                 Ok(Completed::new(session.0, events))
             }
@@ -728,14 +791,21 @@ impl Runtime {
         let running = self.active.remove(&id).expect("stream has active run");
         let outcome = errors::storage_outcome(error, running.key.as_deref());
         let mut run = running.active.run;
+        let now = self.now();
         run.state = RunState::Failed;
         run.outcome = Some(outcome.clone());
-        run.finished_at = Some(self.now());
+        run.finished_at = Some(now);
         run.usage = running.usage;
         let session = self.services.store.session(&run.session_id).ok().flatten();
         let session = session.map(|mut session| {
             session.state = SessionState::Idle;
-            session.updated_at = self.now();
+            session.updated_at = now;
+            session.last_finished_run = Some(FinishedRun {
+                run: run.id.clone(),
+                input_id: Some(running.active.input_id),
+                outcome: outcome.clone(),
+                finished_at: now,
+            });
             session
         });
         let mut events = Vec::new();
@@ -788,10 +858,17 @@ impl Runtime {
             RunState::Failed
         };
         run.outcome = Some(outcome.clone());
-        run.finished_at = Some(self.now());
+        let now = self.now();
+        run.finished_at = Some(now);
         run.usage = running.usage.clone();
         session.state = SessionState::Idle;
-        session.updated_at = self.now();
+        session.updated_at = now;
+        session.last_finished_run = Some(FinishedRun {
+            run: run.id.clone(),
+            input_id: Some(running.active.input_id.clone()),
+            outcome: outcome.clone(),
+            finished_at: now,
+        });
         let message = Message {
             id: MessageId(self.services.store.new_id()?),
             ordinal: 0,

@@ -471,12 +471,16 @@ async fn history_uses_persisted_message_ordinals_in_oldest_to_newest_pages() {
             session,
             messages,
             next_before,
+            runs,
         } = h.next().await.event
         else {
             panic!()
         };
         assert_eq!(session, s);
         assert_eq!(messages, expected);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, messages[0].run_id);
+        assert_eq!(runs[0].outcome, Some(RunOutcome::Succeeded));
         before = next_before;
         if expected[0].ordinal != all[0].ordinal {
             assert_eq!(before, Some(expected[0].ordinal));
@@ -1349,7 +1353,7 @@ async fn run_storage_failure_persists_failure_and_redacts_the_runs_key() {
             kind: RunErrorKind::Unknown {
                 source: UnknownSource::Storage,
             },
-            message: "save failed\necho: [redacted]\nencoded: [redacted]\ndetails survive".into(),
+            message: "save failed\n[已移除请求头]\n[已移除请求头]\necho: [redacted]\nencoded: [redacted]\ndetails survive".into(),
             http_status: None,
             retry_after_ms: None,
             retryable: false,
@@ -1548,7 +1552,8 @@ async fn ephemeral_events_skip_transactions_and_event_rows() {
         .await,
     );
     let history = h.next().await;
-    assert!(matches!(history.event, Event::HistoryLoaded { .. }));
+    assert!(matches!(&history.event, Event::HistoryLoaded { runs, .. }
+        if runs.len() == 1 && runs[0].state == RunState::Running && runs[0].outcome.is_none() && runs[0].finished_at.is_none()));
     seen.push(history);
     accepted(h.command(Command::GetSnapshot).await);
     let snapshot = h.next().await;
@@ -1773,10 +1778,10 @@ async fn run_transport_and_configuration_errors_use_network_and_auth_cards() {
 }
 
 #[tokio::test]
-async fn run_failure_messages_remove_header_lines_before_publish_and_persistence() {
+async fn run_failure_messages_redact_header_segments_before_publish_and_persistence() {
     use forge_testkit::http::{MockResponse, MockServer};
     for name in ["anthropic", "openai"] {
-        for newline in ["\n", "\r\n"] {
+        for newline in ["\n", "\r\n", r"\n", r"\r\n"] {
             for embedded_key in [false, true] {
                 let mut lines = vec![
                     "provider rejected request".to_owned(),
@@ -1789,7 +1794,17 @@ async fn run_failure_messages_remove_header_lines_before_publish_and_persistence
                     format!("request headers: API-KEY = {KEY}"),
                     "trace = available".into(),
                 ];
-                let mut expected = vec!["provider rejected request", "trace = available"];
+                let mut expected = vec![
+                    "provider rejected request",
+                    "[已移除请求头]",
+                    "  [已移除请求头]",
+                    "[已移除请求头]",
+                    "[已移除请求头]",
+                    "{\"[已移除请求头]",
+                    "  \"[已移除请求头]",
+                    "request headers: [已移除请求头]",
+                    "trace = available",
+                ];
                 if embedded_key {
                     lines.push(format!("upstream echo: {KEY}"));
                     expected.push("upstream echo: [redacted]");
@@ -1840,5 +1855,308 @@ async fn run_failure_messages_remove_header_lines_before_publish_and_persistence
                 }
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn json_401_headers_never_reach_events_sqlite_or_wal() {
+    use forge_testkit::http::{MockResponse, MockServer};
+    const PROXY_TOKEN: &str = "sentinel-proxy-credential-never-persist";
+    const API_KEY: &str = "sentinel-echoed-api-key-never-persist";
+    for provider in ["openai", "anthropic"] {
+        let body = format!(
+            r#"{{"error":{{"type":"authentication_error","message":"invalid key\nProxy-Authorization: Basic {PROXY_TOKEN}\nx-api-key: {API_KEY}"}}}}"#
+        );
+        let mut response = MockResponse::sse(&body);
+        response.status = 401;
+        let server = MockServer::start(response).await;
+        let mut h = Harness::new([]);
+        let session = h.http_session(provider, &server.endpoint, Some(KEY)).await;
+        accepted(h.command(send(&session, "input", "hello")).await);
+        let mut events = Vec::new();
+        loop {
+            let envelope = h.next().await;
+            let finished = matches!(envelope.event, Event::RunFinished { .. });
+            events.push(envelope);
+            if finished {
+                break;
+            }
+        }
+        server.request.await.unwrap();
+        server.task.await.unwrap().unwrap();
+        accepted(h.command(Command::GetSnapshot).await);
+        events.push(h.next().await);
+        accepted(
+            h.command(Command::LoadHistory {
+                session,
+                before: None,
+                limit: 1,
+            })
+            .await,
+        );
+        events.push(h.next().await);
+        let serialized = serde_json::to_string(&events).unwrap();
+        for secret in [KEY, PROXY_TOKEN, API_KEY] {
+            assert!(!serialized.contains(secret));
+        }
+        let Event::RunFinished {
+            outcome: RunOutcome::Failed { message, .. },
+            ..
+        } = &events[events.len() - 3].event
+        else {
+            panic!()
+        };
+        assert_eq!(
+            message,
+            r#"{"error":{"message":"invalid key\n[已移除请求头]\n[已移除请求头]"#
+        );
+        for file in ["forge.sqlite", "forge.sqlite-wal"] {
+            let bytes = std::fs::read(h.directory.path().join(file)).unwrap();
+            for secret in [KEY, PROXY_TOKEN, API_KEY] {
+                assert!(
+                    !bytes
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes()),
+                    "{file}: {secret}"
+                );
+            }
+        }
+        let h = h.reopen();
+        let bytes = std::fs::read(h.directory.path().join("forge.sqlite")).unwrap();
+        for secret in [KEY, PROXY_TOKEN, API_KEY] {
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes())
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_outcomes_survive_restart_and_dropped_event_resync() {
+    use forge_testkit::http::{MockResponse, MockServer};
+    for restart in [false, true] {
+        let mut response = MockResponse::sse(r#"{"error":{"message":"invalid key"}}"#);
+        response.status = 401;
+        let server = MockServer::start(response).await;
+        let mut h = Harness::new([]);
+        let session = h.http_session("openai", &server.endpoint, Some(KEY)).await;
+        accepted(h.command(send(&session, "input", "hello")).await);
+        let run_id = h
+            .runtime
+            .services
+            .store
+            .input(&"input".into())
+            .unwrap()
+            .unwrap()
+            .run_id;
+        let run = loop {
+            let run = h.runtime.services.store.run(&run_id).unwrap().unwrap();
+            if run.outcome.is_some() {
+                break run;
+            }
+            h.runtime.dispatch_next().await.unwrap();
+        };
+        server.request.await.unwrap();
+        server.task.await.unwrap().unwrap();
+        assert!(matches!(
+            run.outcome,
+            Some(RunOutcome::Failed {
+                kind: RunErrorKind::Auth,
+                http_status: Some(401),
+                retryable: false,
+                ..
+            })
+        ));
+        h.events = h.handle.subscribe();
+        if restart {
+            h = h.reopen();
+        }
+        accepted(h.command(Command::GetSnapshot).await);
+        let snapshot = h.next().await;
+        let Event::Snapshot {
+            sessions,
+            active_runs,
+            last_seq,
+            ..
+        } = snapshot.event
+        else {
+            panic!()
+        };
+        assert_eq!(last_seq, snapshot.seq);
+        assert!(active_runs.is_empty());
+        assert_eq!(sessions[0].id, session);
+        assert_eq!(sessions[0].state, SessionState::Idle);
+        assert_eq!(
+            sessions[0].last_finished_run,
+            Some(FinishedRun {
+                run: run_id,
+                input_id: Some("input".into()),
+                outcome: run.outcome.clone().unwrap(),
+                finished_at: run.finished_at.unwrap(),
+            })
+        );
+        accepted(
+            h.command(Command::LoadHistory {
+                session,
+                before: None,
+                limit: 1,
+            })
+            .await,
+        );
+        let Event::HistoryLoaded { messages, runs, .. } = h.next().await.event else {
+            panic!()
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].run_id, run.id);
+        assert_eq!(runs, vec![run]);
+    }
+}
+
+#[tokio::test]
+async fn snapshot_keeps_latest_finished_run_while_a_new_run_is_active() {
+    let mut h = Harness::new([
+        success("first"),
+        success("second"),
+        Script::Stream(vec![
+            Step::Delay(Duration::from_secs(10)),
+            Step::Event(StreamEvent::Finished),
+        ]),
+    ]);
+    let session = h.session().await;
+    accepted(h.command(Command::GetSnapshot).await);
+    loop {
+        if let Event::Snapshot { sessions, .. } = h.next().await.event {
+            assert_eq!(sessions[0].last_finished_run, None);
+            break;
+        }
+    }
+    accepted(h.command(send(&session, "first", "hello")).await);
+    h.finished().await;
+    accepted(h.command(send(&session, "second", "hello again")).await);
+    let second = h.finished().await;
+    accepted(h.command(send(&session, "third", "still running")).await);
+    accepted(h.command(Command::GetSnapshot).await);
+    loop {
+        if let Event::Snapshot {
+            sessions,
+            active_runs,
+            ..
+        } = h.next().await.event
+        {
+            let finished = sessions[0].last_finished_run.as_ref().unwrap();
+            assert_eq!(finished.run, second);
+            assert_eq!(finished.input_id, Some("second".into()));
+            assert_eq!(finished.outcome, RunOutcome::Succeeded);
+            assert_eq!(sessions[0].state, SessionState::Running);
+            assert_eq!(active_runs.len(), 1);
+            break;
+        }
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn startup_recovers_crashed_runs_and_accepts_new_sends() {
+    use forge_tools::failpoints::{Action, Failpoints, RUN_BEFORE_FINAL_COMMIT, SEND_AFTER_COMMIT};
+    for point in [SEND_AFTER_COMMIT, RUN_BEFORE_FINAL_COMMIT] {
+        let mut h = Harness::new([success("answer"), success("after restart")]);
+        let session = h.session().await;
+        h.runtime.failpoints = Failpoints::with_actions([(point, Action::Panic)]);
+        let Harness {
+            mut runtime,
+            handle,
+            events,
+            clock,
+            provider,
+            secrets,
+            directory,
+        } = h;
+        let task = tokio::spawn(async move {
+            loop {
+                runtime.dispatch_next().await.unwrap();
+            }
+        });
+        let result = handle.execute(send(&session, "input", "hello")).await;
+        if point == SEND_AFTER_COMMIT {
+            assert!(result.is_err());
+        } else {
+            accepted(result.unwrap());
+        }
+        assert!(task.await.unwrap_err().is_panic());
+        drop(handle);
+        drop(events);
+        let store = Store::open(directory.path()).unwrap();
+        let run_id = store.input(&"input".into()).unwrap().unwrap().run_id;
+        clock.advance(Duration::from_secs(10));
+        let now = clock.now().as_millis() as u64;
+        let (runtime, handle) = Runtime::new(
+            RuntimeServices {
+                clock: clock.clone(),
+                store,
+                providers: Arc::new(FixedProviderFactory(provider.clone())),
+                secrets: secrets.clone(),
+                initial_settings: common::settings("script"),
+            },
+            0,
+        )
+        .unwrap();
+        let events = handle.subscribe();
+        let mut h = Harness {
+            runtime,
+            handle,
+            events,
+            clock,
+            provider,
+            secrets,
+            directory,
+        };
+        let run = h.runtime.services.store.run(&run_id).unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
+        assert_eq!(run.finished_at, Some(now));
+        assert!(matches!(
+            run.outcome,
+            Some(RunOutcome::Failed {
+                kind: RunErrorKind::Interrupted,
+                retryable: true,
+                ..
+            })
+        ));
+        let seq = h.runtime.services.store.last_seq().unwrap();
+        h.clock.advance(Duration::from_secs(10));
+        h = h.reopen();
+        assert_eq!(h.runtime.services.store.last_seq().unwrap(), seq);
+        assert_eq!(
+            h.runtime.services.store.run(&run_id).unwrap(),
+            Some(run.clone())
+        );
+        accepted(h.command(Command::GetSnapshot).await);
+        let Event::Snapshot {
+            sessions,
+            active_runs,
+            ..
+        } = h.next().await.event
+        else {
+            panic!()
+        };
+        assert!(active_runs.is_empty());
+        assert_eq!(sessions[0].state, SessionState::Idle);
+        assert_eq!(sessions[0].updated_at, now);
+        assert_eq!(
+            sessions[0].last_finished_run,
+            Some(FinishedRun {
+                run: run_id,
+                input_id: Some("input".into()),
+                outcome: run.outcome.unwrap(),
+                finished_at: now,
+            })
+        );
+        assert_eq!(
+            accepted(h.command(send(&session, "new-input", "try again")).await),
+            "new-input"
+        );
+        h.finished().await;
+        accepted(h.command(Command::DeleteSession { session }).await);
     }
 }

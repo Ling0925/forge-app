@@ -50,26 +50,46 @@ pub(crate) fn key_error(error: &ProviderError, provider: &ProviderId) -> Provide
     }
 }
 fn remove_request_headers(message: &str) -> String {
-    message
-        .split_inclusive('\n')
-        .filter(|line| {
-            !line.match_indices([':', '=']).any(|(index, _)| {
-                let prefix = line[..index].trim_end().trim_end_matches(['"', '\'', '\\']);
-                let name = prefix
-                    .rsplit(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-                    .next()
-                    .unwrap();
-                [
-                    "authorization",
-                    "proxy-authorization",
-                    "x-api-key",
-                    "api-key",
-                ]
-                .iter()
-                .any(|header| name.eq_ignore_ascii_case(header))
-            })
-        })
-        .collect()
+    let mut redacted = String::new();
+    let mut start = 0;
+    for (index, _) in message.match_indices(['\r', '\n', '\\']) {
+        if index < start {
+            continue;
+        }
+        if let Some(boundary) = ["\r\n", "\n", r"\r\n", r"\n"]
+            .into_iter()
+            .find(|boundary| message[index..].starts_with(boundary))
+        {
+            redact_segment(&message[start..index], &mut redacted);
+            redacted.push_str(boundary);
+            start = index + boundary.len();
+        }
+    }
+    redact_segment(&message[start..], &mut redacted);
+    redacted
+}
+fn redact_segment(segment: &str, redacted: &mut String) {
+    for (index, _) in segment.match_indices([':', '=']) {
+        let prefix = segment[..index]
+            .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'));
+        let name = prefix
+            .rsplit(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+            .next()
+            .unwrap();
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+        ) || ["api-key", "api_key", "apikey", "token", "secret"]
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
+        {
+            redacted.push_str(&segment[..prefix.len() - name.len()]);
+            redacted.push_str("[已移除请求头]");
+            return;
+        }
+    }
+    redacted.push_str(segment);
 }
 pub(crate) fn outcome(error: ProviderError, now: Duration, provider: &ProviderId) -> RunOutcome {
     let http_status = match error.kind {
@@ -117,16 +137,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn removes_header_lines_and_preserves_other_bytes() {
-        let kept = "  上游错误\r\nauthorization failed\r\npreauthorization: pending\r\nx-api-key-info: unavailable\r\n";
-        let message = format!(
-            "{kept}Authorization: [redacted]\r\nproxy-authorization = hidden\r\n{{\"X-Api-Key\":\"hidden\"}}\r\nrequest headers: 'API-KEY' = hidden\r\n\\\"authorization\\\": hidden\r\nremaining details"
-        );
+    fn redacts_credential_headers_from_name_to_segment_end() {
+        for (message, expected) in [
+            ("Authorization: hidden", "[已移除请求头]"),
+            ("Authorization=Bearer tok_123", "[已移除请求头]"),
+            ("token: hidden", "[已移除请求头]"),
+            ("Cookie: hidden", "[已移除请求头]"),
+            ("Set-Cookie: hidden", "[已移除请求头]"),
+            ("x-auth-token: hidden", "[已移除请求头]"),
+            ("client_secret=hidden", "[已移除请求头]"),
+            ("API_KEY: hidden", "[已移除请求头]"),
+            ("X-ApiKey: hidden", "[已移除请求头]"),
+            (r#"{"x-api-key":"hidden"}"#, "{\"[已移除请求头]"),
+            (r#"\"Authorization\": \"Bearer qqq\""#, "\\\"[已移除请求头]"),
+            (
+                "  上游错误 proxy-AUTHORIZATION = hidden",
+                "  上游错误 [已移除请求头]",
+            ),
+            (
+                "request headers: 'API-KEY' = hidden",
+                "request headers: '[已移除请求头]",
+            ),
+        ] {
+            assert_eq!(remove_request_headers(message), expected, "{message}");
+        }
+    }
+
+    #[test]
+    fn redaction_preserves_all_segment_boundaries() {
+        for boundary in ["\n", "\r\n", r"\n", r"\r\n"] {
+            let message = format!(
+                "details{boundary}Proxy-Authorization: Basic secret{boundary}prefix x-api-key: key{boundary}tail{boundary}"
+            );
+            assert_eq!(
+                remove_request_headers(&message),
+                format!(
+                    "details{boundary}[已移除请求头]{boundary}prefix [已移除请求头]{boundary}tail{boundary}"
+                )
+            );
+        }
         assert_eq!(
-            remove_request_headers(&message),
-            format!("{kept}remaining details")
+            remove_request_headers("token: a\nCookie: b\\nsecret=c\r\napi-key: d\\r\\ntail"),
+            "[已移除请求头]\n[已移除请求头]\\n[已移除请求头]\r\n[已移除请求头]\\r\\ntail"
         );
-        assert_eq!(remove_request_headers("Authorization: hidden"), "");
-        assert_eq!(remove_request_headers(""), "");
+    }
+
+    #[test]
+    fn redaction_preserves_non_header_text_exactly() {
+        for message in [
+            "",
+            "invalid api key: please check settings",
+            "  上游错误\r\nauthorization failed\r\npreauthorization: pending\r\nx-api-key-info: unavailable\r\n",
+        ] {
+            assert_eq!(remove_request_headers(message), message);
+        }
     }
 }

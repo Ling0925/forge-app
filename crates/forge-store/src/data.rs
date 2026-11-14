@@ -34,6 +34,7 @@ fn session(row: &Row<'_>) -> rusqlite::Result<Session> {
         queue_state: json(row, "queue_state")?,
         created_at: row.get::<_, i64>("created_at")? as u64,
         updated_at: row.get::<_, i64>("updated_at")? as u64,
+        last_finished_run: None,
     })
 }
 fn workspace(row: &Row<'_>) -> rusqlite::Result<Workspace> {
@@ -88,17 +89,47 @@ impl Store {
             .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?)
     }
     pub fn sessions(&self) -> Result<Vec<Session>, StoreError> {
-        Ok(self
+        let mut sessions: Vec<Session> = self
             .connection
             .prepare("SELECT * FROM sessions ORDER BY id")?
             .query_map([], session)?
-            .collect::<Result<_, _>>()?)
+            .collect::<Result<_, _>>()?;
+        for session in &mut sessions {
+            session.last_finished_run = self.last_finished_run(&session.id)?;
+        }
+        Ok(sessions)
     }
     pub fn session(&self, id: &SessionId) -> Result<Option<Session>, StoreError> {
-        Ok(self
+        let mut session = self
             .connection
             .query_row("SELECT * FROM sessions WHERE id=?", [&id.0], session)
-            .optional()?)
+            .optional()?;
+        if let Some(session) = &mut session {
+            session.last_finished_run = self.last_finished_run(id)?;
+        }
+        Ok(session)
+    }
+    fn last_finished_run(&self, id: &SessionId) -> Result<Option<FinishedRun>, StoreError> {
+        Ok(self.connection.query_row(
+            "SELECT id, outcome_json, finished_at,
+                (SELECT input_id FROM messages WHERE run_id=runs.id AND input_id IS NOT NULL ORDER BY ordinal LIMIT 1) AS input_id
+             FROM runs WHERE session_id=? AND finished_at IS NOT NULL
+             ORDER BY finished_at DESC, rowid DESC LIMIT 1",
+            [&id.0],
+            |row| Ok(FinishedRun {
+                run: RunId(row.get("id")?),
+                input_id: row.get::<_, Option<String>>("input_id")?.map(InputId),
+                outcome: json(row, "outcome_json")?,
+                finished_at: row.get::<_, i64>("finished_at")? as u64,
+            }),
+        ).optional()?)
+    }
+    pub fn running_runs(&self) -> Result<Vec<Run>, StoreError> {
+        Ok(self
+            .connection
+            .prepare("SELECT * FROM runs WHERE state=? ORDER BY rowid")?
+            .query_map([encode(&RunState::Running)?], run)?
+            .collect::<Result<_, _>>()?)
     }
     pub fn workspaces(&self) -> Result<Vec<Workspace>, StoreError> {
         Ok(self
@@ -118,6 +149,13 @@ impl Store {
             .connection
             .query_row("SELECT * FROM messages WHERE input_id=?", [&id.0], message)
             .optional()?)
+    }
+    pub fn run_input_id(&self, id: &RunId) -> Result<Option<InputId>, StoreError> {
+        Ok(self.connection.query_row(
+            "SELECT input_id FROM messages WHERE run_id=? AND input_id IS NOT NULL ORDER BY ordinal LIMIT 1",
+            [&id.0],
+            |row| Ok(InputId(row.get(0)?)),
+        ).optional()?)
     }
     pub fn settings(&self) -> Result<Option<Settings>, StoreError> {
         Ok(self

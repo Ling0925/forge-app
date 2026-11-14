@@ -189,6 +189,16 @@ pub struct Session {
     pub queue_state: QueueState,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_finished_run: Option<FinishedRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinishedRun {
+    pub run: RunId,
+    pub input_id: Option<InputId>,
+    pub outcome: RunOutcome,
+    pub finished_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
