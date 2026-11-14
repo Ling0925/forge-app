@@ -19,7 +19,7 @@ pub fn disabled_readable(button: Button, disabled: bool, cx: &App) -> Button {
         .bg(rgb(palette.subtle))
         .text_color(rgb(palette.fg3))
         .border_1()
-        .border_color(rgb(palette.border_strong))
+        .border_color(rgb(palette.subtle))
 }
 
 /// V6 / UI-REF-04: every digit in the app is tabular (`tnum`), so counters,
