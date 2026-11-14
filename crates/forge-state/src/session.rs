@@ -168,10 +168,11 @@ pub struct RunVm {
     pub queue_item_id: Option<QueueItemId>,
     pub phase: RunPhase,
     pub usage: Usage,
-    /// `Run.started_at` (Core clock, UTC ms).
+    /// `Run.started_at` (Core clock, UTC ms). `0` means unknown.
     pub started_at_ms: u64,
-    /// `Run.finished_at` when known, else the wall clock when `RunFinished`
-    /// arrived (the event carries no timestamp).
+    /// `Run.finished_at` / live `RunFinished.finished_at` when known. `None`
+    /// (including a Core value of 0) means the time is unknown; the UI must
+    /// not fall back to the receive time.
     pub finished_at_ms: Option<u64>,
     /// `CancelRun` already sent for this run; ⌘. must not send it again (UI-CP-04).
     pub cancel_requested: bool,
@@ -189,7 +190,7 @@ impl RunVm {
             },
             usage: run.usage.clone(),
             started_at_ms: run.started_at,
-            finished_at_ms: run.finished_at,
+            finished_at_ms: crate::outcome::known_optional_time(run.finished_at),
             cancel_requested: false,
         }
     }

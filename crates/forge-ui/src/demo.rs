@@ -32,6 +32,9 @@ pub enum Scene {
     Storage,
     /// Conversation with a third run still streaming: composer shows 停止 ⌘.
     Running,
+    /// Settings open: OpenAI `key_status: unavailable` (无法读取钥匙串 + 重试),
+    /// Anthropic `missing`; empty session without the no-key notice.
+    Keychain,
 }
 
 impl Scene {
@@ -48,6 +51,7 @@ impl Scene {
             "error" => Some(Scene::Error),
             "storage" => Some(Scene::Storage),
             "running" => Some(Scene::Running),
+            "keychain" => Some(Scene::Keychain),
             _ => None,
         }
     }
@@ -118,6 +122,7 @@ impl Feeder<'_> {
         self.event(Event::RunFinished {
             run: run_id.into(),
             outcome,
+            finished_at: self.now,
         });
         let s = session(session_id, title, self.now);
         self.event(Event::SessionUpdated { session: s })
@@ -259,12 +264,22 @@ pub fn populate(app: &mut AppState, scene: Scene, base: u64) -> u64 {
     };
     f.at(1_000);
     f.app.load_settings(settings());
-    // P1: whether a key exists comes only from Core (`key_configured`).
-    let with_key = !matches!(scene, Scene::Onboarding | Scene::NoKey);
+    // P1: whether a key exists comes only from Core (`key_status`).
+    let key_status = match scene {
+        Scene::Onboarding | Scene::NoKey => KeyStatus::Missing,
+        Scene::Keychain => KeyStatus::Unavailable,
+        _ => KeyStatus::Configured,
+    };
     f.event(Event::ProviderKeyConfigured {
         provider: "openai".into(),
-        configured: with_key,
+        key_status,
     });
+    if scene == Scene::Keychain {
+        f.event(Event::ProviderKeyConfigured {
+            provider: "anthropic".into(),
+            key_status: KeyStatus::Missing,
+        });
+    }
     f.event(Event::WorkspaceAdded {
         workspace: Workspace {
             id: "ws".into(),
@@ -305,7 +320,7 @@ pub fn populate(app: &mut AppState, scene: Scene, base: u64) -> u64 {
         next_before: None,
         runs: vec![],
     });
-    if scene == Scene::Empty {
+    if matches!(scene, Scene::Empty | Scene::Keychain) {
         return f.now;
     }
 

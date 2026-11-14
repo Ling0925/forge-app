@@ -249,9 +249,10 @@ impl AppState {
                     let mut text = t(key).to_owned();
                     let mut a11y = tf("a11y.divider", &[("outcome", t(key))]);
                     if let Some(run) = run {
-                        if let Some(finished) = run.finished_at_ms {
-                            let elapsed =
-                                format_duration_words(finished.saturating_sub(run.started_at_ms));
+                        if let Some(ms) = run.finished_at_ms.and_then(|finished| {
+                            crate::outcome::known_duration_ms(run.started_at_ms, finished)
+                        }) {
+                            let elapsed = format_duration_words(ms);
                             text.push_str(" · ");
                             text.push_str(&tf("divider.elapsed", &[("elapsed", &elapsed)]));
                             a11y.push('，');
@@ -307,13 +308,16 @@ impl AppState {
             }
             let text = match run.phase {
                 RunPhase::Cancelling => t("composer.stopping").to_owned(),
-                _ => tf(
-                    "run.running",
-                    &[(
-                        "elapsed",
-                        &format_elapsed(now.saturating_sub(run.started_at_ms) / 1000),
-                    )],
-                ),
+                _ => match crate::outcome::known_time(run.started_at_ms) {
+                    Some(started) => tf(
+                        "run.running",
+                        &[(
+                            "elapsed",
+                            &format_elapsed(now.saturating_sub(started) / 1000),
+                        )],
+                    ),
+                    None => t("run.running_unknown").to_owned(),
+                },
             };
             rows.push(TimelineRowVm::Running {
                 key: format!("running-{}", run.id.0),

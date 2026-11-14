@@ -13,8 +13,8 @@ use forge_protocol::{EventEnvelope, ProviderId, RunId, SessionId};
 use forge_state::i18n::{t, tf};
 use forge_state::{
     AppState, BootState, ComposerKey, ComposerMode, DisabledReason, ErrorAction, ErrorEffect,
-    HistoryState, KeyOutcome, KeyStatus, OnboardingStep, PanelLayout, QuitDecision, SessionRowVm,
-    SidebarGroup, SidebarResize, SidebarVm, StatusIcon, TimelineRowVm,
+    HistoryState, KeyOutcome, LocalKeyState, OnboardingStep, PanelLayout, QuitDecision,
+    SessionRowVm, SidebarGroup, SidebarResize, SidebarVm, StatusIcon, TimelineRowVm,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::base::TestSupportExt;
@@ -65,6 +65,9 @@ pub struct ForgeApp {
     inspector_tab: usize,
     /// Settings panel key fields (masked), one per provider.
     key_inputs: Vec<(ProviderId, Entity<InputState>)>,
+    /// "重试" next to "无法读取钥匙串", one per provider (caller-owned so
+    /// focus stays on the button while the retry snapshot is in flight).
+    key_retry_focus: Vec<FocusHandle>,
     /// Focus to restore when the settings panel closes (Esc or 关闭).
     settings_return_focus: Option<FocusHandle>,
     /// `ui_prefs` as last loaded or sent; a change is persisted once the
@@ -118,6 +121,7 @@ impl ForgeApp {
                 (ProviderId::from(*id), input)
             })
             .collect();
+        let key_retry_focus = PROVIDERS.iter().map(|_| cx.focus_handle()).collect();
         let subscriptions = vec![
             cx.subscribe_in(&composer, window, Self::on_composer_event),
             // Scrolled to the top of the timeline → next older history page.
@@ -204,6 +208,7 @@ impl ForgeApp {
             placeholder: t("composer.placeholder.idle"),
             inspector_tab: 0,
             key_inputs,
+            key_retry_focus,
             settings_return_focus: None,
             persisted_prefs: None,
             _tasks: tasks,
@@ -279,6 +284,7 @@ impl ForgeApp {
         }
         self.sync_composer(window, cx);
         self.sync_timeline(cx);
+        self.sync_key_retry_focus(window, cx);
         if self.state.should_exit() && !self.exiting {
             self.exiting = true;
             cx.quit();
@@ -354,7 +360,7 @@ impl ForgeApp {
         }
         // §6.9: placeholder follows the state (no key → "先在设置里添加 API Key").
         // No key wins even before a session exists (fresh install, §6.3).
-        let no_key = !self.state.has_api_key()
+        let no_key = self.state.settings.key_missing()
             || self.state.composer_mode() == ComposerMode::Disabled(DisabledReason::NoKey);
         let placeholder = if no_key {
             t("composer.no_key")
@@ -571,6 +577,42 @@ impl ForgeApp {
     /// "保存": the key goes to Core (`SetProviderKey`) and the field is
     /// cleared at once; the UI never keeps it. `ProviderKeyConfigured`
     /// flips the status.
+    /// "重试" on an unavailable keychain row: re-sends `GetSnapshot`; focus
+    /// stays on the button (the result is announced politely).
+    fn retry_key_status(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.retry_key_status();
+        if let Some(handle) = self.key_retry_focus.get(index) {
+            handle.focus(window, cx);
+        }
+        self.after_change(window, cx);
+    }
+
+    /// The retry button disappears once the keychain is readable again;
+    /// move focus to that provider's key field instead of losing it.
+    fn sync_key_retry_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (handle, (provider, input)) in self.key_retry_focus.iter().zip(&self.key_inputs) {
+            if handle.is_focused(window)
+                && (!self.state.settings.open || !self.state.settings.key_unavailable(provider))
+            {
+                input.read(cx).focus_handle(cx).focus(window, cx);
+            }
+        }
+    }
+
+    /// Moves focus to the keychain retry button of provider `index` (demo).
+    pub fn focus_key_retry(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handle) = self.key_retry_focus.get(index) {
+            handle.focus(window, cx);
+        }
+    }
+
+    /// Whether the keychain retry button for `index` holds focus (tests).
+    pub fn key_retry_focused(&self, index: usize, window: &Window) -> bool {
+        self.key_retry_focus
+            .get(index)
+            .is_some_and(|handle| handle.is_focused(window))
+    }
+
     fn save_key(
         &mut self,
         index: usize,
@@ -943,7 +985,8 @@ impl ForgeApp {
 
     fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let no_key = !self.state.settings.has_any_key();
+        // `unavailable` is not "未配置 Key" (no banner for an unreadable keychain).
+        let no_key = self.state.settings.key_missing();
         let has_session = self.state.selected().is_some();
         let mut col = v_flex()
             .id("timeline-empty")
@@ -1533,11 +1576,13 @@ impl ForgeApp {
             PROVIDERS.iter().zip(self.key_inputs.iter()).enumerate()
         {
             let configured = self.state.settings.has_key_for(provider);
+            let unavailable = self.state.settings.key_unavailable(provider);
             let status = match self.state.settings.key_status.get(provider) {
-                Some(KeyStatus::SavedUnverified) => t("settings.key.status.saved").to_owned(),
-                Some(KeyStatus::Testing) => t("settings.key.status.testing").to_owned(),
-                Some(KeyStatus::Verified) => t("settings.key.status.verified").to_owned(),
-                Some(KeyStatus::Failed { message, .. }) => tf(
+                _ if unavailable => t("settings.key.status.unavailable").to_owned(),
+                Some(LocalKeyState::SavedUnverified) => t("settings.key.status.saved").to_owned(),
+                Some(LocalKeyState::Testing) => t("settings.key.status.testing").to_owned(),
+                Some(LocalKeyState::Verified) => t("settings.key.status.verified").to_owned(),
+                Some(LocalKeyState::Failed { message, .. }) => tf(
                     "settings.key.status.failed",
                     &[("reason", message.as_deref().unwrap_or(""))],
                 ),
@@ -1558,7 +1603,44 @@ impl ForgeApp {
                                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                     .child(*name),
                             )
-                            .child(div().text_sm().text_color(rgb(palette.fg2)).child(status)),
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("settings-status-{id}")))
+                                    .text_sm()
+                                    .text_color(rgb(if unavailable {
+                                        palette.danger
+                                    } else {
+                                        palette.fg2
+                                    }))
+                                    .when(unavailable, |el| {
+                                        el.child(
+                                            Icon::new(IconName::TriangleAlert)
+                                                .text_color(rgb(palette.danger)),
+                                        )
+                                    })
+                                    .flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(status),
+                            )
+                            .child(div().flex_1())
+                            .when(unavailable, |row| {
+                                let focus = self.key_retry_focus[index].clone();
+                                row.child(
+                                    Button::new(SharedString::from(format!("settings-retry-{id}")))
+                                        .track_focus(&focus)
+                                        .label(t("settings.key.unavailable_retry"))
+                                        .accessibility_label(tf(
+                                            "settings.key.unavailable_retry_a11y",
+                                            &[("provider", *name)],
+                                        ))
+                                        .outline()
+                                        .small()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.retry_key_status(index, window, cx)
+                                        })),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()

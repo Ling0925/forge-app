@@ -226,8 +226,8 @@ pub struct ErrorCardVm {
     pub body: String,
     /// V1 status pill text ("失败"); always paired with the colour (UI-REF-02).
     pub status: &'static str,
-    /// V1 meta line "来源 · 时间" ("OpenAI · 14:03"); time is when the failure
-    /// arrived, empty when unknown.
+    /// V1 meta line "来源 · 时间" ("OpenAI · 14:03"); time is the Core
+    /// `finished_at` when known, omitted when it is 0 / missing.
     pub meta: String,
     pub primary: ErrorAction,
     pub secondary: ErrorAction,
@@ -332,7 +332,7 @@ impl ErrorCardVm {
 
     /// Appends the local wall-clock time the failure arrived to the meta line.
     pub fn with_time(mut self, at_ms: Option<u64>, utc_offset_ms: i64) -> Self {
-        if let Some(at) = at_ms {
+        if let Some(at) = known_optional_time(at_ms) {
             let time = clock_time(at, utc_offset_ms);
             self.meta = if self.meta.is_empty() {
                 time
@@ -366,6 +366,26 @@ fn error_code(failure: &FailureVm) -> String {
 /// Card title for a failure (also used by the "运行失败：<标题>" announcement).
 pub fn card_title(failure: &FailureVm) -> &'static str {
     t(ErrorCardKind::for_failure(failure).keys_for(failure).0)
+}
+
+/// A Core UTC-ms timestamp. `0` means the time is unknown (legacy payloads
+/// that lacked the field, or old session data) and must not be shown as
+/// 1970-01-01 or used to compute a duration.
+pub fn known_time(ms: u64) -> Option<u64> {
+    (ms != 0).then_some(ms)
+}
+
+pub fn known_optional_time(ms: Option<u64>) -> Option<u64> {
+    ms.and_then(known_time)
+}
+
+/// Elapsed milliseconds when both instants are known and `finished` is not
+/// before `started`. Otherwise the duration is omitted (no negative or
+/// epoch-spanning "huge" 用时).
+pub fn known_duration_ms(started_at: u64, finished_at: u64) -> Option<u64> {
+    let started = known_time(started_at)?;
+    let finished = known_time(finished_at)?;
+    finished.checked_sub(started)
 }
 
 /// Local wall-clock "HH:MM" for a UTC-ms instant.
@@ -655,6 +675,23 @@ mod tests {
         }
         // A single-line header message never becomes empty.
         assert_eq!(sanitize_details("Authorization: Bearer x"), X);
+    }
+
+    #[test]
+    fn known_time_treats_zero_as_unknown() {
+        assert_eq!(known_time(0), None);
+        assert_eq!(known_time(1), Some(1));
+        assert_eq!(known_optional_time(None), None);
+        assert_eq!(known_optional_time(Some(0)), None);
+        assert_eq!(known_optional_time(Some(5)), Some(5));
+        assert_eq!(known_duration_ms(0, 1_000), None);
+        assert_eq!(known_duration_ms(1_000, 0), None);
+        assert_eq!(
+            known_duration_ms(5_000, 1_000),
+            None,
+            "finished before start"
+        );
+        assert_eq!(known_duration_ms(1_000, 5_000), Some(4_000));
     }
 
     #[test]

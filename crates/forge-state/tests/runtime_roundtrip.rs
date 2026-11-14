@@ -27,6 +27,8 @@ struct Core {
 
 fn core(scripts: Vec<Script>) -> Core {
     let clock = Arc::new(FakeClock::default());
+    // 0 is "time unknown" in the UI; live Core events must carry a real clock.
+    clock.advance(Duration::from_millis(1_000));
     let dir = tempfile::tempdir().unwrap();
     let store = forge_store::Store::open(dir.path()).unwrap();
     let provider = Arc::new(ScriptedProvider::new(clock.clone(), scripts));
@@ -104,7 +106,7 @@ async fn ready(core: &mut Core, workspace: &std::path::Path) -> AppState {
     assert!(app.has_api_key());
     assert_eq!(
         app.settings.key_status[&ProviderId::from("openai")],
-        KeyStatus::SavedUnverified
+        LocalKeyState::SavedUnverified
     );
     app
 }

@@ -115,7 +115,7 @@ impl Fixture {
             };
             let key = Event::ProviderKeyConfigured {
                 provider: "openai".into(),
-                configured: true,
+                key_status: KeyStatus::Configured,
             };
             fixture_event(app, key, window, cx);
             fixture_event(app, Event::WorkspaceAdded { workspace }, window, cx);
@@ -164,7 +164,19 @@ impl Fixture {
 
     fn events(&self, cx: &mut TestAppContext, events: Vec<Event>) {
         self.update(cx, |app, window, cx| {
-            for event in events {
+            for mut event in events {
+                // Simulate Core: live RunStarted / RunFinished always carry
+                // real clocks. `0` means "fixture left it unset".
+                if let Event::RunStarted { run, .. } = &mut event
+                    && run.started_at == 0
+                {
+                    run.started_at = app.now_ms();
+                }
+                if let Event::RunFinished { finished_at, .. } = &mut event
+                    && *finished_at == 0
+                {
+                    *finished_at = app.now_ms();
+                }
                 fixture_event(app, event, window, cx);
             }
         });
@@ -237,6 +249,7 @@ impl Fixture {
                     retry_after_ms,
                     retryable,
                 },
+                finished_at: 0,
             }],
         );
     }
@@ -339,6 +352,7 @@ fn timeline_renders_rows_and_reasoning_toggles(cx: &mut TestAppContext) {
             Event::RunFinished {
                 run: "r1".into(),
                 outcome: RunOutcome::Succeeded,
+                finished_at: 1,
             },
         ],
     );
@@ -519,7 +533,7 @@ fn no_key_shows_banner_and_settings_link(cx: &mut TestAppContext) {
     f.update(cx, |app, window, cx| {
         let key = Event::ProviderKeyConfigured {
             provider: "openai".into(),
-            configured: false,
+            key_status: KeyStatus::Missing,
         };
         fixture_event(app, key, window, cx);
     });
@@ -729,4 +743,138 @@ fn settings_cmd_comma_opens_and_escape_restores_focus(cx: &mut TestAppContext) {
             "关闭 also restores the prior focus"
         );
     });
+}
+
+fn key_snapshot(app: &ForgeApp, openai: KeyStatus) -> Event {
+    let session = app.state.selected().unwrap().session.clone();
+    Event::Snapshot {
+        sessions: vec![session],
+        workspaces: vec![Workspace {
+            id: "ws".into(),
+            root: "/tmp/ws".into(),
+            name: "ws".into(),
+        }],
+        settings: app.state.settings.settings.clone().unwrap(),
+        providers: vec![
+            ProviderKeyStatus {
+                provider: "openai".into(),
+                key_status: openai,
+            },
+            ProviderKeyStatus {
+                provider: "anthropic".into(),
+                key_status: KeyStatus::Missing,
+            },
+        ],
+        active_runs: vec![],
+        last_seq: app.state.last_seq + 1,
+    }
+}
+
+#[gpui_kit::test]
+fn keychain_unavailable_shows_retry_not_missing_and_keeps_focus(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.update(cx, |app, window, cx| {
+        let event = key_snapshot(app, KeyStatus::Unavailable);
+        fixture_event(app, event, window, cx);
+    });
+    cx.run_until_parked();
+    f.backend.take();
+    f.update(cx, |app, _, _| {
+        assert_ne!(
+            app.state.composer_mode(),
+            forge_state::ComposerMode::Disabled(forge_state::DisabledReason::NoKey),
+            "unavailable is not the 未配置 Key state"
+        );
+    });
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("no-key").is_none(), "no missing-key banner");
+        assert!(window.try_find("composer-open-settings").is_none());
+        window.press("cmd-,", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-key-openai").label(),
+            Some("OpenAI，无法读取钥匙串")
+        );
+        assert_eq!(
+            window.find("settings-key-anthropic").label(),
+            Some("Anthropic，未配置"),
+            "missing keeps the existing 未配置 text"
+        );
+        assert!(window.try_find("settings-retry-anthropic").is_none());
+        let retry = window.find("settings-retry-openai");
+        assert_eq!(retry.label(), Some("重试读取 OpenAI 的钥匙串"));
+        window.click("settings-retry-openai", cx);
+    });
+    cx.run_until_parked();
+    let sent = f.backend.take();
+    assert_eq!(
+        sent.iter().filter(|c| **c == Command::GetSnapshot).count(),
+        1,
+        "重试 re-sends GetSnapshot once: {sent:?}"
+    );
+    f.update(cx, |app, window, _| {
+        assert!(app.key_retry_focused(0, window), "focus stays on 重试");
+    });
+
+    // Still unreadable: one polite announcement, button and focus stay.
+    f.update(cx, |app, window, cx| {
+        let event = key_snapshot(app, KeyStatus::Unavailable);
+        fixture_event(app, event, window, cx);
+    });
+    cx.run_until_parked();
+    let spoken = f.spoken.spoken.borrow().clone();
+    let still: Vec<_> = spoken
+        .iter()
+        .filter(|(text, _)| text == "仍无法读取钥匙串")
+        .collect();
+    assert_eq!(still.len(), 1, "{spoken:?}");
+    assert_ne!(
+        still[0].1,
+        AnnouncementPriority::High,
+        "polite, not assertive"
+    );
+    f.update(cx, |app, window, _| {
+        assert!(app.key_retry_focused(0, window));
+    });
+
+    // Retry again; keychain readable now → button gone, focus moves to the
+    // OpenAI key field (not lost), announced once.
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        window.click("settings-retry-openai", cx);
+    });
+    cx.run_until_parked();
+    let sent = f.backend.take();
+    assert_eq!(
+        sent.iter().filter(|c| **c == Command::GetSnapshot).count(),
+        1,
+        "{sent:?}"
+    );
+    f.update(cx, |app, window, cx| {
+        let event = key_snapshot(app, KeyStatus::Configured);
+        fixture_event(app, event, window, cx);
+    });
+    cx.run_until_parked();
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("settings-retry-openai").is_none());
+        assert_eq!(
+            window.find("settings-key-openai").label(),
+            Some("OpenAI，已保存，未验证")
+        );
+    });
+    f.update(cx, |app, window, cx| {
+        assert!(!app.key_retry_focused(0, window));
+        assert!(window.focused(cx).is_some(), "focus is not dropped");
+    });
+    let spoken = f.spoken.spoken.borrow().clone();
+    assert_eq!(
+        spoken
+            .iter()
+            .filter(|(text, _)| text == "已重新读取钥匙串")
+            .count(),
+        1,
+        "{spoken:?}"
+    );
 }

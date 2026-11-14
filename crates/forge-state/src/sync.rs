@@ -37,10 +37,11 @@ impl AppState {
 
         // Settings + key flags (no secrets in the snapshot).
         self.load_settings(settings);
-        self.settings.key_configured.clear();
+        self.settings.core_key_status.clear();
         for status in providers {
-            self.on_key_configured(status.provider, status.key_configured);
+            self.on_key_status(status.provider, status.key_status);
         }
+        self.announce_key_retry_result();
 
         // Sessions: replace rows, keep per-session UI state.
         let keep: BTreeSet<SessionId> = sessions.iter().map(|s| s.id.clone()).collect();
@@ -220,13 +221,16 @@ impl AppState {
             Some(RunPhase::EndedUnseen) => {
                 if let Some(r) = vm.runs.get_mut(&finished.run) {
                     r.phase = RunPhase::Finished(finished.outcome.clone());
-                    r.finished_at_ms = Some(finished.finished_at);
+                    if let Some(started) = crate::outcome::known_time(finished.started_at) {
+                        r.started_at_ms = started;
+                    }
+                    r.finished_at_ms = crate::outcome::known_time(finished.finished_at);
                 }
                 place_outcome(
                     vm,
                     &finished.run,
                     &finished.outcome,
-                    finished.finished_at,
+                    crate::outcome::known_time(finished.finished_at),
                     None,
                 );
             }
@@ -234,7 +238,11 @@ impl AppState {
             // SessionUpdated first); only the sidebar status moves early.
             _ => {}
         }
-        note_latest(vm, &finished.outcome, finished.finished_at);
+        note_latest(
+            vm,
+            &finished.outcome,
+            crate::outcome::known_time(finished.finished_at),
+        );
     }
 
     /// Rebuilds the error card + divider of a finished run reported by Core
@@ -265,7 +273,9 @@ impl AppState {
         if vm.active_run.as_ref() == Some(&run.id) {
             vm.active_run = None;
         }
-        let finished_at = run.finished_at.unwrap_or(run.started_at);
+        // 0 / missing timestamps stay unknown; never fall back to started_at
+        // (which may itself be 0) or to the UI clock.
+        let finished_at = crate::outcome::known_optional_time(run.finished_at);
         vm.runs.insert(run.id.clone(), RunVm::from_run(&run));
         if let Some(message) = vm.assistant_mut(&run.id) {
             message.streaming = false;
@@ -451,7 +461,7 @@ fn place_outcome(
     vm: &mut SessionVm,
     run: &RunId,
     outcome: &RunOutcome,
-    finished_at: u64,
+    finished_at: Option<u64>,
     anchor: Option<u64>,
 ) {
     if vm
@@ -469,7 +479,7 @@ fn place_outcome(
             retry_at_ms: failure
                 .retry_after_ms
                 .filter(|ms| *ms > crate::outcome::LONG_RETRY_AFTER_MS)
-                .map(|ms| finished_at + ms),
+                .and_then(|ms| finished_at.map(|at| at + ms)),
             failure,
         }));
     }
@@ -494,10 +504,15 @@ fn place_outcome(
 }
 
 /// Sidebar status follows the newest finished run we know of.
-fn note_latest(vm: &mut SessionVm, outcome: &RunOutcome, finished_at: u64) {
-    let newer = vm.runs.values().any(|r| {
-        matches!(r.phase, RunPhase::Finished(_))
-            && r.finished_at_ms.is_some_and(|t| t > finished_at)
+fn note_latest(vm: &mut SessionVm, outcome: &RunOutcome, finished_at: Option<u64>) {
+    // When this finish time is unknown, the caller (last_finished_run or the
+    // latest history run) is authoritative: do not let some other run's known
+    // clock skip the update.
+    let newer = finished_at.is_some_and(|finished_at| {
+        vm.runs.values().any(|r| {
+            matches!(r.phase, RunPhase::Finished(_))
+                && r.finished_at_ms.is_some_and(|t| t > finished_at)
+        })
     });
     if newer {
         return;

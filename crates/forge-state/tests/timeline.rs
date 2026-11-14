@@ -80,7 +80,7 @@ fn single_turn_flow() {
         .into_iter()
         .map(|a| a.text)
         .collect();
-    // Elapsed = local finish time − `Run.started_at` (fixture: 0).
+    // Elapsed = Core `finished_at` − `Run.started_at` (feed stamps both from the app clock).
     assert_eq!(announcements, vec!["开始运行", "运行完成，用时 0:46"]);
 }
 

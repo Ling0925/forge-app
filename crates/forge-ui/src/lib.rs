@@ -75,6 +75,10 @@ pub fn open_demo_window(cx: &mut App, scene: demo::Scene) {
         let now = demo::populate(&mut app.state, scene, base);
         app.set_clock_base(now);
         app.after_change(window, cx);
+        if scene == demo::Scene::Keychain {
+            app.open_settings(window, cx);
+            app.focus_key_retry(0, window, cx);
+        }
         app
     });
 }

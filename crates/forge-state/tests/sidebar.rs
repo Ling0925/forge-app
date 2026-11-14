@@ -98,6 +98,7 @@ fn ui_sb_02_cancel_with_pending_queue_needs_attention() {
         [Event::RunFinished {
             run: "r1".into(),
             outcome: cancelled(),
+            finished_at: 0,
         }],
     );
     let sidebar = app.sidebar();
@@ -145,6 +146,7 @@ fn row_status_texts_cover_each_state() {
         [Event::RunFinished {
             run: "r1".into(),
             outcome: failed(RunErrorKind::Network),
+            finished_at: 0,
         }],
     );
     let row = app.sidebar().recent[0].clone();
@@ -163,6 +165,7 @@ fn row_status_texts_cover_each_state() {
             Event::RunFinished {
                 run: "r2".into(),
                 outcome: interrupted(),
+                finished_at: 0,
             },
         ],
     );
@@ -201,6 +204,7 @@ fn failed_with_paused_queue_shows_paused_text() {
             Event::RunFinished {
                 run: "r1".into(),
                 outcome: failed(RunErrorKind::Auth),
+                finished_at: 0,
             },
             Event::QueuePaused {
                 session: "s1".into(),
@@ -239,6 +243,7 @@ fn recent_is_ordered_by_activity_and_filtered_by_workspace() {
         [Event::RunFinished {
             run: "r1".into(),
             outcome: RunOutcome::Succeeded,
+            finished_at: 0,
         }],
     );
     // Core bumps `updated_at` with the run and publishes SessionUpdated.
@@ -301,6 +306,7 @@ fn ui_sb_05_running_session_cannot_be_deleted() {
         [Event::RunFinished {
             run: "r1".into(),
             outcome: RunOutcome::Succeeded,
+            finished_at: 0,
         }],
     );
     assert!(app.delete_session(&"s1".into()).is_some());

@@ -1,16 +1,22 @@
 //! Settings window and provider-key state (§6.13) plus shared confirm dialogs.
 
-use crate::app::{AppState, CommandToken, Pending};
+use crate::app::{AnnouncementKind, AnnouncementPriority, AppState, CommandToken, Pending};
 use crate::i18n::{t, tf};
 use forge_protocol::{
-    Command, ModelSelection, PermissionMode, ProviderId, ProviderKeyErrorKind, RejectCode,
-    SessionId, Settings,
+    Command, KeyStatus, ModelSelection, PermissionMode, ProviderId, ProviderKeyErrorKind,
+    RejectCode, SessionId, Settings,
 };
 use std::collections::BTreeMap;
 
+/// UI-side state of one provider key row: Core's `KeyStatus` plus the
+/// local save / test lifecycle. Named apart from `forge_protocol::KeyStatus`
+/// so both can be glob-imported.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyStatus {
+pub enum LocalKeyState {
     Unconfigured,
+    /// Core `key_status: unavailable` — the keychain could not be read. Never
+    /// shown as the "未配置" (missing) UI.
+    Unavailable,
     SavedUnverified,
     Testing,
     Verified,
@@ -20,11 +26,12 @@ pub enum KeyStatus {
     },
 }
 
-impl KeyStatus {
+impl LocalKeyState {
     /// Localised status text for the provider row (§10 `settings.key.status`).
     pub fn label(&self) -> String {
         match self {
             Self::Unconfigured => t("settings.key.status.unconfigured").into(),
+            Self::Unavailable => t("settings.key.status.unavailable").into(),
             Self::SavedUnverified => t("settings.key.status.saved").into(),
             Self::Testing => t("settings.key.status.testing").into(),
             Self::Verified => t("settings.key.status.verified").into(),
@@ -62,11 +69,14 @@ pub enum ConfirmDialog {
 pub struct SettingsVm {
     /// `None` until the first `Snapshot` / `SettingsUpdated`.
     pub settings: Option<Settings>,
-    /// `Snapshot.providers[].key_configured` / `ProviderKeyConfigured` — the
-    /// only source for "is there a key" (drives the no-key banner and
+    /// `Snapshot.providers[].key_status` / `ProviderKeyConfigured.key_status`
+    /// — the only source for "is there a key" (drives the no-key banner and
     /// placeholder, §6.3 / §6.9).
-    pub key_configured: BTreeMap<ProviderId, bool>,
-    pub key_status: BTreeMap<ProviderId, KeyStatus>,
+    pub core_key_status: BTreeMap<ProviderId, KeyStatus>,
+    pub key_status: BTreeMap<ProviderId, LocalKeyState>,
+    /// "重试" on an unavailable keychain row sent `GetSnapshot`; the next
+    /// Snapshot (or its rejection) announces the result once, politely.
+    pub key_retry_pending: bool,
     /// The settings surface is open ("打开设置" on error cards, the no-key
     /// notice, ⌘,).
     pub open: bool,
@@ -77,12 +87,32 @@ pub struct SettingsVm {
 
 impl SettingsVm {
     pub fn has_any_key(&self) -> bool {
-        self.key_configured.values().any(|configured| *configured)
+        self.core_key_status
+            .values()
+            .any(|status| *status == KeyStatus::Configured)
     }
 
     /// Key configured for the provider of the default model.
     pub fn has_key_for(&self, provider: &ProviderId) -> bool {
-        self.key_configured.get(provider).copied().unwrap_or(false)
+        self.core_key_status.get(provider) == Some(&KeyStatus::Configured)
+    }
+
+    /// Core could not read this provider's key from the keychain.
+    pub fn key_unavailable(&self, provider: &ProviderId) -> bool {
+        self.core_key_status.get(provider) == Some(&KeyStatus::Unavailable)
+    }
+
+    pub fn any_key_unavailable(&self) -> bool {
+        self.core_key_status
+            .values()
+            .any(|status| *status == KeyStatus::Unavailable)
+    }
+
+    /// The "未配置 Key" UI (banner, composer placeholder): no configured key
+    /// and no provider whose keychain is merely unreadable. `unavailable`
+    /// never counts as missing.
+    pub fn key_missing(&self) -> bool {
+        !self.has_any_key() && !self.any_key_unavailable()
     }
 }
 
@@ -94,27 +124,72 @@ impl AppState {
             self.settings
                 .key_status
                 .entry(provider.id.clone())
-                .or_insert(KeyStatus::Unconfigured);
+                .or_insert(LocalKeyState::Unconfigured);
         }
         self.ui.apply_map(&settings.ui_prefs);
         self.settings.settings = Some(settings);
     }
 
     /// `ProviderKeyConfigured` (and each `Snapshot.providers` row).
-    pub(crate) fn on_key_configured(&mut self, provider: ProviderId, configured: bool) {
-        let status = self
+    pub(crate) fn on_key_status(&mut self, provider: ProviderId, key_status: KeyStatus) {
+        let local = self
             .settings
             .key_status
             .entry(provider.clone())
-            .or_insert(KeyStatus::Unconfigured);
-        let was = self.settings.key_configured.insert(provider, configured);
-        *status = match (configured, was, &*status) {
-            (false, _, _) => KeyStatus::Unconfigured,
+            .or_insert(LocalKeyState::Unconfigured);
+        let was = self
+            .settings
+            .core_key_status
+            .insert(provider, key_status.clone());
+        *local = match (&key_status, was, &*local) {
+            (KeyStatus::Missing, _, _) => LocalKeyState::Unconfigured,
+            (KeyStatus::Unavailable, _, _) => LocalKeyState::Unavailable,
             // Same key still there (snapshot after resync): keep the result
             // of an earlier test.
-            (true, Some(true), KeyStatus::Verified | KeyStatus::Testing) => status.clone(),
-            (true, _, _) => KeyStatus::SavedUnverified,
+            (
+                KeyStatus::Configured,
+                Some(KeyStatus::Configured),
+                LocalKeyState::Verified | LocalKeyState::Testing,
+            ) => local.clone(),
+            (KeyStatus::Configured, _, _) => LocalKeyState::SavedUnverified,
         };
+    }
+
+    /// "重试" next to "无法读取钥匙串": re-sends `GetSnapshot` (Core re-reads
+    /// the keychain for every provider). At most one snapshot is in flight;
+    /// a second press while waiting sends nothing.
+    pub fn retry_key_status(&mut self) -> Option<CommandToken> {
+        self.settings.key_retry_pending = true;
+        self.request_snapshot()
+    }
+
+    /// After the Snapshot that answers a keychain retry: one polite
+    /// announcement with the result.
+    pub(crate) fn announce_key_retry_result(&mut self) {
+        if !std::mem::take(&mut self.settings.key_retry_pending) {
+            return;
+        }
+        let key = if self.settings.any_key_unavailable() {
+            "announce.keychain.still_unavailable"
+        } else {
+            "announce.keychain.recovered"
+        };
+        self.announce(
+            AnnouncementKind::Other,
+            AnnouncementPriority::Medium,
+            t(key).into(),
+        );
+    }
+
+    /// The retry's `GetSnapshot` was rejected: still unreadable.
+    pub(crate) fn on_key_retry_rejected(&mut self) {
+        if std::mem::take(&mut self.settings.key_retry_pending) {
+            self.announce(
+                AnnouncementKind::Other,
+                AnnouncementPriority::Medium,
+                t("announce.keychain.still_unavailable").into(),
+            );
+        }
     }
 
     /// "添加 / 更换"(`Some`) or "移除"(`None`): `SetProviderKey`. The key goes
@@ -144,7 +219,7 @@ impl AppState {
         };
         self.settings.key_status.insert(
             provider,
-            KeyStatus::Failed {
+            LocalKeyState::Failed {
                 kind: None,
                 message: Some(text.clone()),
             },
@@ -171,7 +246,7 @@ impl AppState {
     pub fn test_provider_key(&mut self, provider: ProviderId) -> CommandToken {
         self.settings
             .key_status
-            .insert(provider.clone(), KeyStatus::Testing);
+            .insert(provider.clone(), LocalKeyState::Testing);
         self.push(
             Pending::TestKey {
                 provider: provider.clone(),
@@ -187,9 +262,9 @@ impl AppState {
         error_kind: Option<ProviderKeyErrorKind>,
     ) {
         let status = if ok {
-            KeyStatus::Verified
+            LocalKeyState::Verified
         } else {
-            KeyStatus::Failed {
+            LocalKeyState::Failed {
                 kind: error_kind,
                 message: None,
             }
@@ -206,7 +281,7 @@ impl AppState {
     ) {
         self.settings.key_status.insert(
             provider.clone(),
-            KeyStatus::Failed {
+            LocalKeyState::Failed {
                 kind: None,
                 message: Some(crate::app::not_sent(&code, &message)),
             },

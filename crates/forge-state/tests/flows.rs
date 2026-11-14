@@ -169,7 +169,10 @@ fn ui_st_04_default_mode_and_settings_revert_on_reject() {
 fn provider_key_status_flow() {
     let mut app = app();
     let openai: ProviderId = "openai".into();
-    assert_eq!(app.settings.key_status[&openai], KeyStatus::SavedUnverified);
+    assert_eq!(
+        app.settings.key_status[&openai],
+        LocalKeyState::SavedUnverified
+    );
     app.test_provider_key(openai.clone());
     assert_eq!(
         single_command(&mut app).command,
@@ -198,7 +201,7 @@ fn provider_key_status_flow() {
             error_kind: None,
         }],
     );
-    assert_eq!(app.settings.key_status[&openai], KeyStatus::Verified);
+    assert_eq!(app.settings.key_status[&openai], LocalKeyState::Verified);
 }
 
 #[test]

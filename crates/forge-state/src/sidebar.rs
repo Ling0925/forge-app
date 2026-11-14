@@ -210,11 +210,17 @@ impl AppState {
             match activity {
                 Activity::Cancelling => (StatusIcon::Spinner, t("row.cancelling").into()),
                 Activity::Running { started_at_ms } => {
-                    let secs = self.now_ms.saturating_sub(started_at_ms) / 1000;
-                    (
-                        StatusIcon::Spinner,
-                        tf("row.running", &[("elapsed", &format_elapsed(secs))]),
-                    )
+                    let status = match crate::outcome::known_time(started_at_ms) {
+                        Some(started) => tf(
+                            "row.running",
+                            &[(
+                                "elapsed",
+                                &format_elapsed(self.now_ms.saturating_sub(started) / 1000),
+                            )],
+                        ),
+                        None => t("row.running_unknown").to_owned(),
+                    };
+                    (StatusIcon::Spinner, status)
                 }
                 Activity::WaitingApproval => (StatusIcon::Approval, String::new()),
                 _ => match (&vm.last_outcome, vm.queue_paused.as_ref()) {

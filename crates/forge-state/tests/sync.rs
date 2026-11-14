@@ -21,13 +21,27 @@ fn snapshot(
     active_runs: Vec<ActiveRun>,
     last_seq: u64,
 ) -> Event {
+    let key_status = if key {
+        KeyStatus::Configured
+    } else {
+        KeyStatus::Missing
+    };
+    snapshot_keys(sessions, key_status, active_runs, last_seq)
+}
+
+fn snapshot_keys(
+    sessions: Vec<Session>,
+    key_status: KeyStatus,
+    active_runs: Vec<ActiveRun>,
+    last_seq: u64,
+) -> Event {
     Event::Snapshot {
         sessions,
         workspaces: vec![ws()],
         settings: settings(true),
         providers: vec![ProviderKeyStatus {
             provider: "openai".into(),
-            key_configured: key,
+            key_status,
         }],
         active_runs,
         last_seq,
@@ -371,7 +385,7 @@ fn key_configured_drives_banner_and_composer() {
         2,
         Event::ProviderKeyConfigured {
             provider: "openai".into(),
-            configured: true,
+            key_status: KeyStatus::Configured,
         },
     );
     assert!(app.has_api_key());
@@ -391,7 +405,7 @@ fn key_configured_drives_banner_and_composer() {
         3,
         Event::ProviderKeyConfigured {
             provider: "openai".into(),
-            configured: false,
+            key_status: KeyStatus::Missing,
         },
     );
     assert_eq!(
@@ -571,6 +585,7 @@ fn restore_after_restart_via_snapshot_last_finished_run_and_history_runs() {
         run: "r2".into(),
         input_id: Some("in3".into()),
         outcome: r2_interrupted(),
+        started_at: 0,
         finished_at: 9_000,
     });
     at(&mut app, 4, snapshot(vec![s1], true, vec![], 4));
@@ -647,6 +662,7 @@ fn restore_on_paging_back_places_older_failure_after_its_run() {
         run: "r4".into(),
         input_id: Some("in7".into()),
         outcome: RunOutcome::Succeeded,
+        started_at: 0,
         finished_at: 9_000,
     });
     feed(&mut app, [Event::SessionUpdated { session: s1 }]);
@@ -715,6 +731,7 @@ fn session_updated_before_run_finished_places_the_card_once() {
         run: "r1".into(),
         input_id: Some("in1".into()),
         outcome: outcome.clone(),
+        started_at: 0,
         finished_at: 5_000,
     });
     feed(
@@ -767,6 +784,7 @@ fn seq_gap_resync_reloads_history_and_restores_both_gap_failures() {
         run: "r3".into(),
         input_id: Some("in5".into()),
         outcome: auth.clone(),
+        started_at: 0,
         finished_at: 8_000,
     });
     at(
@@ -842,4 +860,362 @@ fn seq_gap_resync_reloads_history_and_restores_both_gap_failures() {
             .all(|a| a.kind != AnnouncementKind::RunFinished),
         "repeat HistoryLoaded must stay silent"
     );
+}
+
+#[test]
+fn restore_legacy_zero_timestamps_shows_no_time_or_duration() {
+    // Designer acceptance: old session data lacking finished_at / started_at
+    // (serde default 0) restores error cards with no clock, no 1970, and no
+    // 用时 (including no negative or epoch-spanning duration). The UI must
+    // not fall back to the receive / app clock.
+    let mut app = AppState::new(Box::new(SequentialIds::default()));
+    app.request_snapshot();
+    app.take_outbox();
+    let now = 1_794_636_300_000; // 2026-11-14 06:05 UTC = 14:05 in UTC+8
+    app.set_now_ms(now);
+    app.set_utc_offset_ms(8 * 3_600_000);
+
+    let outcome = r2_interrupted();
+    let mut s1 = session_at("s1", now);
+    s1.last_finished_run = Some(FinishedRun {
+        run: "r2".into(),
+        input_id: Some("in3".into()),
+        outcome: outcome.clone(),
+        started_at: 0,
+        finished_at: 0,
+    });
+    at(&mut app, 4, snapshot(vec![s1], true, vec![], 4));
+    app.take_outbox();
+
+    let mut messages = page(1..=2);
+    messages.push(message(3, MessageRole::User, "r2", Some("in3"), "u3"));
+    feed(
+        &mut app,
+        [Event::HistoryLoaded {
+            session: "s1".into(),
+            messages,
+            next_before: None,
+            runs: vec![failed_run("r2", outcome, 0, 0)],
+        }],
+    );
+
+    let run = &app.selected().unwrap().runs[&RunId::from("r2")];
+    assert_eq!(run.started_at_ms, 0);
+    assert_eq!(run.finished_at_ms, None);
+
+    let cards = error_cards(&app);
+    assert_eq!(cards.len(), 1);
+    let (at_row, card) = &cards[0];
+    assert_eq!(card.kind, ErrorCardKind::Interrupted);
+    assert_eq!(
+        card.meta, "OpenAI",
+        "no clock when finished_at is unknown: {}",
+        card.meta
+    );
+    assert!(!card.meta.contains("1970"), "{}", card.meta);
+    assert!(!card.meta.contains(':'), "no HH:MM fallback: {}", card.meta);
+    assert!(!card.body.contains("1970"), "{}", card.body);
+
+    let rows = app.timeline_rows();
+    let TimelineRowVm::Divider {
+        text, a11y_label, ..
+    } = &rows[at_row + 1]
+    else {
+        panic!("expected divider after card: {rows:?}")
+    };
+    assert!(
+        !text.contains("用时"),
+        "no duration for unknown times: {text}"
+    );
+    assert!(!text.contains("1970"), "{text}");
+    assert!(!a11y_label.contains("用时"), "{a11y_label}");
+    // A receive-time fallback would yield a ~56-year (or "14:05") duration.
+    assert!(!text.contains("小时"), "{text}");
+    assert!(!text.contains("14:05"), "{text}");
+
+    // Only the time is hidden: the card still offers 重试 and it works.
+    assert_eq!(card.primary, ErrorAction::Retry);
+    app.take_outbox();
+    app.error_action(&"r2".into(), ErrorAction::Retry);
+    assert!(
+        !app.take_outbox().is_empty(),
+        "retry still sends with unknown timestamps"
+    );
+}
+
+#[test]
+fn live_run_finished_uses_core_finished_at_not_receive_time() {
+    let mut app = app_with_session();
+    app.set_utc_offset_ms(8 * 3_600_000);
+    let started_at = 1_794_636_200_000; // 14:03:20 local
+    let finished = 1_794_636_300_000; // 14:05:00 local, 100 s later
+    let received = 1_794_636_900_000; // 14:15:00 local — must not be used
+    app.set_now_ms(started_at);
+    feed(&mut app, [started("r1", "s1", "in1")]);
+    app.set_now_ms(received);
+    let seq = app.last_seq + 1;
+    at(
+        &mut app,
+        seq,
+        Event::RunFinished {
+            run: "r1".into(),
+            outcome: RunOutcome::Failed {
+                kind: RunErrorKind::Server,
+                message: "502".into(),
+                http_status: Some(502),
+                retry_after_ms: None,
+                retryable: true,
+            },
+            finished_at: finished,
+        },
+    );
+    let run = &app.selected().unwrap().runs[&RunId::from("r1")];
+    assert_eq!(run.finished_at_ms, Some(finished));
+    let card = &error_cards(&app)[0].1;
+    assert!(card.meta.ends_with(" · 14:05"), "{}", card.meta);
+    assert!(!card.meta.contains("14:15"), "{}", card.meta);
+    let rows = app.timeline_rows();
+    let divider = rows
+        .iter()
+        .find_map(|r| match r {
+            TimelineRowVm::Divider { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(divider.contains("用时 1 分 40 秒"), "{divider}");
+}
+
+#[test]
+fn live_run_finished_zero_finished_at_is_unknown() {
+    let mut app = app_with_session();
+    app.set_utc_offset_ms(8 * 3_600_000);
+    app.set_now_ms(1_000);
+    feed(&mut app, [started("r1", "s1", "in1")]);
+    let now = 1_794_636_300_000;
+    app.set_now_ms(now);
+    // Apply directly: unlike `feed`, this does not stamp a Core clock, so 0
+    // stays "unknown" even on a live event.
+    let seq = app.last_seq + 1;
+    at(
+        &mut app,
+        seq,
+        Event::RunFinished {
+            run: "r1".into(),
+            outcome: RunOutcome::Succeeded,
+            finished_at: 0,
+        },
+    );
+    let run = &app.selected().unwrap().runs[&RunId::from("r1")];
+    assert_eq!(run.finished_at_ms, None);
+    let spoken: Vec<_> = app
+        .take_announcements()
+        .into_iter()
+        .map(|a| a.text)
+        .collect();
+    assert!(
+        spoken.iter().any(|t| t == "运行完成"),
+        "no 用时 when finished_at is 0: {spoken:?}"
+    );
+    assert!(
+        spoken
+            .iter()
+            .all(|t| !t.contains("用时") && !t.contains("1970")),
+        "{spoken:?}"
+    );
+    let divider = app
+        .timeline_rows()
+        .iter()
+        .find_map(|r| match r {
+            TimelineRowVm::Divider { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!divider.contains("用时"), "{divider}");
+}
+
+fn key_snapshot(app: &AppState, seq: u64, key_status: KeyStatus) -> Event {
+    let sessions = app.sessions.values().map(|vm| vm.session.clone()).collect();
+    snapshot_keys(sessions, key_status, vec![], seq)
+}
+
+#[test]
+fn key_status_three_states_unavailable_is_not_missing() {
+    let mut app = AppState::new(Box::new(SequentialIds::default()));
+    app.request_snapshot();
+    app.take_outbox();
+    at(
+        &mut app,
+        1,
+        snapshot_keys(vec![session_at("s1", 1)], KeyStatus::Configured, vec![], 1),
+    );
+    app.take_outbox();
+    let openai = ProviderId::from("openai");
+    assert!(app.settings.has_key_for(&openai));
+    assert!(!app.settings.key_missing());
+    assert_eq!(
+        app.settings.key_status[&openai],
+        LocalKeyState::SavedUnverified
+    );
+    assert_ne!(app.composer_hint_key(), "composer.no_key");
+
+    // unavailable: not configured, but never the missing ("未配置 Key") UI.
+    at(
+        &mut app,
+        2,
+        Event::ProviderKeyConfigured {
+            provider: "openai".into(),
+            key_status: KeyStatus::Unavailable,
+        },
+    );
+    assert!(!app.settings.has_key_for(&openai));
+    assert!(app.settings.key_unavailable(&openai));
+    assert!(!app.settings.key_missing(), "unavailable ≠ missing");
+    assert_ne!(
+        app.composer_mode(),
+        ComposerMode::Disabled(DisabledReason::NoKey)
+    );
+    assert_ne!(app.composer_hint_key(), "composer.no_key");
+    assert_eq!(app.settings.key_status[&openai], LocalKeyState::Unavailable);
+    assert_eq!(app.settings.key_status[&openai].label(), "无法读取钥匙串");
+
+    // missing: the existing 未配置 Key state.
+    at(
+        &mut app,
+        3,
+        Event::ProviderKeyConfigured {
+            provider: "openai".into(),
+            key_status: KeyStatus::Missing,
+        },
+    );
+    assert!(app.settings.key_missing());
+    assert!(!app.settings.key_unavailable(&openai));
+    assert_eq!(
+        app.composer_mode(),
+        ComposerMode::Disabled(DisabledReason::NoKey)
+    );
+    assert_eq!(app.composer_hint_key(), "composer.no_key");
+    assert_eq!(app.settings.key_status[&openai].label(), "未配置");
+
+    // Snapshot rows go through the same mapping.
+    let event = key_snapshot(&app, 4, KeyStatus::Unavailable);
+    at(&mut app, 4, event);
+    assert!(app.settings.key_unavailable(&openai));
+    assert!(!app.settings.key_missing());
+}
+
+#[test]
+fn keychain_retry_sends_get_snapshot_and_announces_politely_once() {
+    let mut app = AppState::new(Box::new(SequentialIds::default()));
+    app.request_snapshot();
+    app.take_outbox();
+    at(
+        &mut app,
+        1,
+        snapshot_keys(vec![session_at("s1", 1)], KeyStatus::Unavailable, vec![], 1),
+    );
+    app.take_outbox();
+    assert!(
+        app.take_announcements().is_empty(),
+        "a plain snapshot announces nothing about the keychain"
+    );
+
+    assert!(app.retry_key_status().is_some());
+    assert_eq!(single_command(&mut app).command, Command::GetSnapshot);
+    // A second press while the snapshot is in flight sends nothing.
+    assert!(app.retry_key_status().is_none());
+    assert!(app.take_outbox().is_empty());
+
+    let event = key_snapshot(&app, 2, KeyStatus::Unavailable);
+    at(&mut app, 2, event);
+    app.take_outbox();
+    let spoken = app.take_announcements();
+    assert_eq!(
+        spoken.iter().map(|a| a.text.as_str()).collect::<Vec<_>>(),
+        ["仍无法读取钥匙串"],
+        "{spoken:?}"
+    );
+    assert_eq!(spoken[0].priority, AnnouncementPriority::Medium, "polite");
+
+    app.retry_key_status();
+    assert_eq!(single_command(&mut app).command, Command::GetSnapshot);
+    let event = key_snapshot(&app, 3, KeyStatus::Configured);
+    at(&mut app, 3, event);
+    app.take_outbox();
+    let spoken: Vec<_> = app
+        .take_announcements()
+        .into_iter()
+        .map(|a| a.text)
+        .collect();
+    assert_eq!(spoken, ["已重新读取钥匙串"]);
+    assert!(app.settings.has_key_for(&"openai".into()));
+
+    // Later snapshots without a retry stay silent.
+    let event = key_snapshot(&app, 4, KeyStatus::Unavailable);
+    at(&mut app, 4, event);
+    app.take_outbox();
+    assert!(app.take_announcements().is_empty());
+
+    // A rejected retry snapshot: still unreadable, announced once.
+    app.retry_key_status();
+    let out = single_command(&mut app);
+    app.apply_result(
+        out.token,
+        CommandResult::Rejected {
+            code: RejectCode::Unavailable,
+            message: "core busy".into(),
+        },
+    );
+    let spoken: Vec<_> = app
+        .take_announcements()
+        .into_iter()
+        .map(|a| a.text)
+        .collect();
+    assert!(spoken.iter().any(|t| t == "仍无法读取钥匙串"), "{spoken:?}");
+}
+
+#[test]
+fn ended_unseen_run_uses_finished_run_started_at_for_duration() {
+    // A run that ended during a seq gap: the card time and 用时 come from
+    // Core's FinishedRun.started_at / finished_at, not the UI clock.
+    let mut app = app_with_session();
+    app.set_utc_offset_ms(8 * 3_600_000);
+    feed(&mut app, [history("s1", page(1..=2), None)]);
+    app.set_now_ms(1_000); // RunStarted stamped with a bogus early clock
+    feed(&mut app, [started("r1", "s1", "in1")]);
+    app.take_outbox();
+    app.take_announcements();
+    let started_at = 1_794_636_200_000; // 14:03:20 local
+    let finished_at = 1_794_636_300_000; // 14:05:00 local, 100 s later
+    app.set_now_ms(1_794_636_900_000); // receive time 14:15 — must not be used
+    let mut s1 = session_at("s1", finished_at);
+    s1.last_finished_run = Some(FinishedRun {
+        run: "r1".into(),
+        input_id: Some("in1".into()),
+        outcome: RunOutcome::Failed {
+            kind: RunErrorKind::Server,
+            message: "502".into(),
+            http_status: Some(502),
+            retry_after_ms: None,
+            retryable: true,
+        },
+        started_at,
+        finished_at,
+    });
+    let seq = app.last_seq + 5;
+    at(&mut app, seq, snapshot(vec![s1], true, vec![], seq));
+    let run = &app.selected().unwrap().runs[&RunId::from("r1")];
+    assert_eq!(run.started_at_ms, started_at);
+    assert_eq!(run.finished_at_ms, Some(finished_at));
+    let cards = error_cards(&app);
+    assert_eq!(cards.len(), 1, "{cards:?}");
+    assert!(cards[0].1.meta.ends_with(" · 14:05"), "{}", cards[0].1.meta);
+    let divider = app
+        .timeline_rows()
+        .iter()
+        .find_map(|r| match r {
+            TimelineRowVm::Divider { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(divider.contains("用时 1 分 40 秒"), "{divider}");
 }

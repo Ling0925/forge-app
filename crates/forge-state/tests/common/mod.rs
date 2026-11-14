@@ -18,13 +18,17 @@ pub fn set_key(app: &mut AppState, configured: bool) {
         app,
         [Event::ProviderKeyConfigured {
             provider: "openai".into(),
-            configured,
+            key_status: if configured {
+                KeyStatus::Configured
+            } else {
+                KeyStatus::Missing
+            },
         }],
     );
 }
 
 /// Settings fixture. Whether a key exists is not part of `Settings` any more
-/// (P1: `key_configured` comes from the snapshot / `ProviderKeyConfigured`);
+/// (P1: `key_status` comes from the snapshot / `ProviderKeyConfigured`);
 /// the flag is kept so call sites read the same.
 pub fn settings(_with_key: bool) -> Settings {
     Settings {
@@ -99,6 +103,7 @@ pub fn finished(id: &str, outcome: RunOutcome) -> Event {
     Event::RunFinished {
         run: id.into(),
         outcome,
+        finished_at: 0,
     }
 }
 
@@ -168,13 +173,22 @@ pub fn item(
 /// Feeds events with consecutive seqs, continuing from `app.last_seq`.
 /// Applies events with consecutive seqs. A `RunStarted` fixture without a
 /// start time (`started_at == 0`) is stamped with the app clock, the way Core
-/// stamps `Run.started_at` with its own clock.
+/// stamps `Run.started_at` with its own clock. A live `RunFinished` fixture
+/// with `finished_at == 0` is likewise stamped with the app clock: Core always
+/// supplies `finished_at` on new events. Tests of unknown / legacy times (0)
+/// apply the envelope directly, or go through restore / history, and are not
+/// stamped.
 pub fn feed(app: &mut AppState, events: impl IntoIterator<Item = Event>) {
     for mut event in events {
         if let Event::RunStarted { run, .. } = &mut event
             && run.started_at == 0
         {
             run.started_at = app.now_ms();
+        }
+        if let Event::RunFinished { finished_at, .. } = &mut event
+            && *finished_at == 0
+        {
+            *finished_at = app.now_ms();
         }
         let seq = app.last_seq + 1;
         app.apply(EventEnvelope { seq, event });

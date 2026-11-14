@@ -124,7 +124,7 @@ impl Fixture {
             };
             let key = Event::ProviderKeyConfigured {
                 provider: "openai".into(),
-                configured: true,
+                key_status: KeyStatus::Configured,
             };
             app.apply_event(event(app, key), window, cx);
             app.apply_event(event(app, Event::WorkspaceAdded { workspace }), window, cx);

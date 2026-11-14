@@ -537,8 +537,8 @@ impl AppState {
             Event::SettingsUpdated { settings } => self.load_settings(settings),
             Event::ProviderKeyConfigured {
                 provider,
-                configured,
-            } => self.on_key_configured(provider, configured),
+                key_status,
+            } => self.on_key_status(provider, key_status),
             Event::WorkspaceAdded { workspace } => {
                 if self.active_workspace.is_none() {
                     self.active_workspace = Some(workspace.id.clone());
@@ -621,7 +621,11 @@ impl AppState {
             }
             Event::RunStarted { run, input_id } => self.on_run_started(run, input_id),
             Event::RunStateChanged { run, state } => self.on_run_state(run, state),
-            Event::RunFinished { run, outcome } => self.finish_run(&run, outcome),
+            Event::RunFinished {
+                run,
+                outcome,
+                finished_at,
+            } => self.finish_run(&run, outcome, finished_at),
             Event::SteerApplied { .. } => {
                 // Steer bubbles land in P3 (§11 phase mapping).
             }
@@ -894,7 +898,7 @@ impl AppState {
 
     /// Terminal state is written once (R4 "终态只写一次"); later duplicates are
     /// ignored.
-    fn finish_run(&mut self, run: &RunId, outcome: RunOutcome) {
+    fn finish_run(&mut self, run: &RunId, outcome: RunOutcome, finished_at: u64) {
         let now = self.now_ms;
         let Some((vm, run)) = self.run_mut(run) else {
             return;
@@ -906,8 +910,13 @@ impl AppState {
             return;
         }
         r.phase = RunPhase::Finished(outcome.clone());
-        let finished_at = *r.finished_at_ms.get_or_insert(now);
-        let elapsed_secs = finished_at.saturating_sub(r.started_at_ms) / 1000;
+        // Live RunFinished: Core always supplies finished_at. A value of 0
+        // (legacy event) is unknown; do not fall back to the UI receive time.
+        r.finished_at_ms = crate::outcome::known_time(finished_at);
+        let finished_at = r.finished_at_ms;
+        let elapsed_secs = finished_at
+            .and_then(|finished| crate::outcome::known_duration_ms(r.started_at_ms, finished))
+            .map(|ms| ms / 1000);
         if vm.active_run.as_ref() == Some(&run) {
             vm.active_run = None;
         }
@@ -935,7 +944,7 @@ impl AppState {
                 retry_at_ms: failure
                     .retry_after_ms
                     .filter(|ms| *ms > crate::outcome::LONG_RETRY_AFTER_MS)
-                    .map(|ms| finished_at + ms),
+                    .and_then(|ms| finished_at.map(|at| at + ms)),
                 failure,
             }));
         }
@@ -955,13 +964,14 @@ impl AppState {
                 RunOutcome::Failed { .. } => Some(QueuePauseReason::Failed),
             };
         }
-        let text = match (&outcome, error_kind) {
-            (RunOutcome::Succeeded, _) => tf(
+        let text = match (&outcome, error_kind, elapsed_secs) {
+            (RunOutcome::Succeeded, _, Some(secs)) => tf(
                 "announce.run.succeeded",
-                &[("duration", &crate::i18n::format_elapsed(elapsed_secs))],
+                &[("duration", &crate::i18n::format_elapsed(secs))],
             ),
-            (RunOutcome::Cancelled { .. }, _) => t("announce.run.cancelled").into(),
-            (_, _) => tf(
+            (RunOutcome::Succeeded, _, None) => t("announce.run.succeeded_unknown").into(),
+            (RunOutcome::Cancelled { .. }, _, _) => t("announce.run.cancelled").into(),
+            (_, _, _) => tf(
                 "announce.run.failed",
                 &[(
                     "title",
@@ -1094,6 +1104,7 @@ impl AppState {
             Pending::Snapshot => {
                 if let Some((code, message)) = rejected {
                     self.snapshot_pending = false;
+                    self.on_key_retry_rejected();
                     self.toast_rejected(&code, &message);
                 }
             }
@@ -1409,7 +1420,9 @@ impl AppState {
         let Some(vm) = self.selected() else {
             return ComposerMode::Disabled(DisabledReason::NoSession);
         };
-        if !self.has_api_key() {
+        // `unavailable` (keychain unreadable) is not "未配置 Key": the
+        // settings row offers 重试 instead.
+        if self.settings.key_missing() {
             return ComposerMode::Disabled(DisabledReason::NoKey);
         }
         if vm.composer.in_flight.is_some() {

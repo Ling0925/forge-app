@@ -358,6 +358,7 @@ fn rows_markdown_reasoning_divider_usage() {
         [Event::RunFinished {
             run: "r1".into(),
             outcome: RunOutcome::Succeeded,
+            finished_at: 0,
         }],
     );
     let rows = app.timeline_rows();
@@ -693,6 +694,7 @@ fn cmd_r_retries_latest_failed_run_only() {
         [Event::RunFinished {
             run: "r2".into(),
             outcome: RunOutcome::Succeeded,
+            finished_at: 0,
         }],
     );
     app.take_outbox();
