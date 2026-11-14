@@ -3,3 +3,22 @@ name = "forge-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[[bin]]
+name = "forge-app"
+path = "src/main.rs"
+
+[dependencies]
+forge-state = { path = "../forge-state" }
+forge-protocol.workspace = true
+forge-core.workspace = true
+forge-store.workspace = true
+forge-provider.workspace = true
+forge-tools.workspace = true
+tokio.workspace = true
+# UI framework (user decision: gpui-kit 0.9.1, minor pinned).
+gpui-kit = "=0.9.1"
+
+[dev-dependencies]
+gpui-kit = { version = "=0.9.1", features = ["test-support"] }
+serde_json.workspace = true
