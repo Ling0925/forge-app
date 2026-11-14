@@ -348,6 +348,7 @@ fn opening_a_session_loads_history_once_and_retries_on_error() {
             session: id.clone(),
             messages: vec![],
             next_before: None,
+            runs: vec![],
         }],
     );
     assert_eq!(app.sessions[&id].history, HistoryState::Complete);

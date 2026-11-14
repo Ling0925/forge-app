@@ -130,6 +130,7 @@ impl Fixture {
                 queue_state: QueueState::Active,
                 created_at: 0,
                 updated_at: 0,
+                last_finished_run: None,
             };
             fixture_event(app, Event::SessionCreated { session }, window, cx);
             app.state.select_session(&"s1".into());

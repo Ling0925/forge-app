@@ -63,6 +63,7 @@ pub fn session_at(id: &str, at_ms: u64) -> Session {
         state: SessionState::Idle,
         archived: false,
         queue_state: QueueState::Active,
+        last_finished_run: None,
     }
 }
 

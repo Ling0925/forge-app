@@ -48,6 +48,7 @@ fn session(id: &str) -> Session {
         queue_state: QueueState::Active,
         created_at: 0,
         updated_at: 0,
+        last_finished_run: None,
     }
 }
 

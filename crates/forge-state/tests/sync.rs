@@ -43,6 +43,7 @@ fn history(session: &str, messages: Vec<Message>, next_before: Option<u64>) -> E
         session: session.into(),
         messages,
         next_before,
+        runs: vec![],
     }
 }
 
@@ -526,4 +527,209 @@ fn busy_session_send_rejected_invalid_state_restores_draft() {
             .is_some_and(|e| e.starts_with("没有发送"))
     );
     assert_eq!(app.composer_mode(), ComposerMode::Idle);
+}
+
+fn failed_run(id: &str, outcome: RunOutcome, started: u64, finished: u64) -> Run {
+    let mut r = run(id, "s1", None);
+    r.state = RunState::Failed;
+    r.started_at = started;
+    r.finished_at = Some(finished);
+    r.outcome = Some(outcome);
+    r
+}
+
+fn r2_interrupted() -> RunOutcome {
+    RunOutcome::Failed {
+        kind: RunErrorKind::Interrupted,
+        message: "上次异常退出时中断".into(),
+        http_status: None,
+        retry_after_ms: None,
+        retryable: true,
+    }
+}
+
+fn error_cards(app: &AppState) -> Vec<(usize, ErrorCardVm)> {
+    app.timeline_rows()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            TimelineRowVm::Error(c) => Some((i, c)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn restore_after_restart_via_snapshot_last_finished_run_and_history_runs() {
+    // Core restarted after a crash: R-2 turned the stale Running run into
+    // failed{interrupted}; the snapshot carries it as `last_finished_run`.
+    let mut app = AppState::new(Box::new(SequentialIds::default()));
+    app.request_snapshot();
+    app.take_outbox();
+    let mut s1 = session_at("s1", 9_000);
+    s1.last_finished_run = Some(FinishedRun {
+        run: "r2".into(),
+        input_id: Some("in3".into()),
+        outcome: r2_interrupted(),
+        finished_at: 9_000,
+    });
+    at(&mut app, 4, snapshot(vec![s1], true, vec![], 4));
+    // Sidebar knows the failure before any history arrives.
+    let sidebar = app.sidebar();
+    let row = sidebar
+        .needs_attention
+        .iter()
+        .chain(&sidebar.recent)
+        .find(|r| r.id.0 == "s1")
+        .unwrap_or_else(|| panic!("{sidebar:?}"))
+        .clone();
+    assert_eq!(row.last_error, Some(ErrorKind::Interrupted));
+    assert!(matches!(
+        row.last_outcome,
+        Some(RunOutcome::Failed {
+            kind: RunErrorKind::Interrupted,
+            ..
+        })
+    ));
+    app.take_outbox();
+    // Newest page: r1 ok (u1,a2), r2 interrupted with only its user row (u3).
+    let mut messages = page(1..=2);
+    messages.push(message(3, MessageRole::User, "r2", Some("in3"), "u3"));
+    let mut ok = run("r1", "s1", None);
+    ok.state = RunState::Succeeded;
+    ok.started_at = 1_000;
+    ok.finished_at = Some(2_000);
+    ok.outcome = Some(RunOutcome::Succeeded);
+    feed(
+        &mut app,
+        [Event::HistoryLoaded {
+            session: "s1".into(),
+            messages,
+            next_before: None,
+            runs: vec![ok, failed_run("r2", r2_interrupted(), 8_000, 9_000)],
+        }],
+    );
+    let cards = error_cards(&app);
+    assert_eq!(cards.len(), 1);
+    let (at_row, card) = &cards[0];
+    assert_eq!(card.kind, ErrorCardKind::Interrupted);
+    assert!(
+        card.details.join("\n").contains("上次异常退出时中断"),
+        "{:?}",
+        card.details
+    );
+    // Card follows r2's user row (no assistant message for r2).
+    let rows = app.timeline_rows();
+    assert!(
+        matches!(&rows[at_row - 1], TimelineRowVm::User { .. }),
+        "{:?}",
+        rows[at_row - 1]
+    );
+    // Interrupted is retryable → retry enabled and sends RetryRun.
+    assert_eq!(card.retry, RetryButtonState::Ready);
+    assert_eq!(card.primary, ErrorAction::Retry);
+    app.retry_run(&"r2".into())
+        .expect("interrupted card retry enabled");
+    assert_eq!(
+        single_command(&mut app).command,
+        Command::RetryRun { run: "r2".into() }
+    );
+    // Composer is idle again (session Idle after R-2).
+    assert_eq!(app.composer_mode(), ComposerMode::Idle);
+}
+
+#[test]
+fn restore_on_paging_back_places_older_failure_after_its_run() {
+    let mut app = app_with_session();
+    // Core says the latest finished run (r4) succeeded.
+    let mut s1 = session_at("s1", 9_000);
+    s1.last_finished_run = Some(FinishedRun {
+        run: "r4".into(),
+        input_id: Some("in7".into()),
+        outcome: RunOutcome::Succeeded,
+        finished_at: 9_000,
+    });
+    feed(&mut app, [Event::SessionUpdated { session: s1 }]);
+    // Newest page: r3..r4 (ordinals 5..=8), more available before 5.
+    feed(&mut app, [history("s1", page(5..=8), Some(5))]);
+    assert!(error_cards(&app).is_empty());
+    app.load_older().expect("older page requested");
+    app.take_outbox();
+    let auth = RunOutcome::Failed {
+        kind: RunErrorKind::Auth,
+        message: "401 invalid key\nAuthorization: Bearer sk-old-secret".into(),
+        http_status: Some(401),
+        retry_after_ms: None,
+        retryable: false,
+    };
+    feed(
+        &mut app,
+        [Event::HistoryLoaded {
+            session: "s1".into(),
+            messages: page(1..=4),
+            next_before: None,
+            runs: vec![failed_run("r1", auth, 1_000, 2_000)],
+        }],
+    );
+    assert_eq!(
+        texts(&app),
+        ["u1", "a2", "u3", "a4", "u5", "a6", "u7", "a8"]
+    );
+    let cards = error_cards(&app);
+    assert_eq!(cards.len(), 1);
+    let (at_row, card) = &cards[0];
+    assert_eq!(card.kind, ErrorCardKind::Auth);
+    assert!(!card.details.join("\n").contains("sk-old-secret"));
+    assert!(card.details.join("\n").contains("[已移除请求头]"));
+    let rows = app.timeline_rows();
+    // Right after r1's assistant reply (a2), before r2's user row (u3).
+    match (&rows[at_row - 1], &rows[at_row + 1], &rows[at_row + 2]) {
+        (
+            TimelineRowVm::Assistant { .. },
+            TimelineRowVm::Divider { .. },
+            TimelineRowVm::User { .. },
+        ) => {}
+        other => panic!("card misplaced: {other:?}"),
+    }
+    // An older failure must not take over the sidebar's latest status.
+    assert_eq!(app.selected().unwrap().last_error, None);
+    // Paging the same page again does not duplicate the card.
+    let _ = app.timeline_rows();
+}
+
+#[test]
+fn session_updated_before_run_finished_places_the_card_once() {
+    // Core order on finish: SessionUpdated{last_finished_run} → RunFinished.
+    let mut app = app_with_session();
+    set_key(&mut app, true);
+    feed(&mut app, [started("r1", "s1", "in1")]);
+    let outcome = RunOutcome::Failed {
+        kind: RunErrorKind::Server,
+        message: "502 bad gateway".into(),
+        http_status: Some(502),
+        retry_after_ms: None,
+        retryable: true,
+    };
+    let mut s1 = session_at("s1", 5_000);
+    s1.last_finished_run = Some(FinishedRun {
+        run: "r1".into(),
+        input_id: Some("in1".into()),
+        outcome: outcome.clone(),
+        finished_at: 5_000,
+    });
+    feed(
+        &mut app,
+        [
+            Event::SessionUpdated { session: s1 },
+            finished("r1", outcome),
+        ],
+    );
+    assert_eq!(error_cards(&app).len(), 1);
+    let dividers = app
+        .timeline_rows()
+        .iter()
+        .filter(|r| matches!(r, TimelineRowVm::Divider { .. }))
+        .count();
+    assert_eq!(dividers, 1);
+    assert_eq!(app.selected().unwrap().last_error, Some(ErrorKind::Server));
 }

@@ -158,6 +158,7 @@ fn session(id: &str, title: &str, at: u64) -> Session {
         queue_state: QueueState::Active,
         created_at: at,
         updated_at: at,
+        last_finished_run: None,
     }
 }
 
@@ -299,6 +300,7 @@ pub fn populate(app: &mut AppState, scene: Scene, base: u64) -> u64 {
         session: "s1".into(),
         messages: vec![],
         next_before: None,
+        runs: vec![],
     });
     if scene == Scene::Empty {
         return f.now;
