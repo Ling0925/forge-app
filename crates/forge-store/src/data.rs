@@ -82,6 +82,27 @@ fn message(row: &Row<'_>) -> rusqlite::Result<Message> {
             .map(ToolCallId),
     })
 }
+fn tool_call(row: &Row<'_>) -> rusqlite::Result<ToolCall> {
+    Ok(ToolCall {
+        id: ToolCallId(row.get("id")?),
+        run_id: RunId(row.get("run_id")?),
+        tool: row.get("tool")?,
+        arguments_json: row.get("arguments_json")?,
+        state: json(row, "state")?,
+        result: row
+            .get::<_, Option<String>>("result_json")?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+        has_side_effects: row.get("has_side_effects")?,
+    })
+}
 impl Store {
     pub fn new_id(&self) -> Result<String, StoreError> {
         Ok(self
@@ -197,6 +218,19 @@ impl Store {
         Ok(self.connection.prepare("SELECT messages.* FROM messages JOIN runs ON runs.id=messages.run_id WHERE runs.session_id=? ORDER BY messages.ordinal")?
             .query_map([&id.0],message)?.collect::<Result<_,_>>()?)
     }
+    pub fn tool_call(&self, id: &ToolCallId) -> Result<Option<ToolCall>, StoreError> {
+        Ok(self
+            .connection
+            .query_row("SELECT * FROM tool_calls WHERE id=?", [&id.0], tool_call)
+            .optional()?)
+    }
+    pub fn tool_calls(&self, run: &RunId) -> Result<Vec<ToolCall>, StoreError> {
+        Ok(self
+            .connection
+            .prepare("SELECT * FROM tool_calls WHERE run_id=? ORDER BY rowid")?
+            .query_map([&run.0], tool_call)?
+            .collect::<Result<_, _>>()?)
+    }
     pub fn write(&mut self) -> Result<WriteTransaction<'_>, StoreError> {
         Ok(WriteTransaction {
             transaction: self.connection.transaction()?,
@@ -253,6 +287,11 @@ impl WriteTransaction<'_> {
     pub fn message(&self, m: &Message) -> Result<(), StoreError> {
         self.transaction.execute("INSERT INTO messages (id,input_id,run_id,turn_id,role,content_json,tool_call_id) VALUES (?,?,?,?,?,?,?)",
             params![m.id.0,m.input_id.as_ref().map(|i| &i.0),m.run_id.0,m.turn_id.0,encode(&m.role)?,encode(&m.content)?,m.tool_call_id.as_ref().map(|i| &i.0)])?;
+        Ok(())
+    }
+    pub fn tool_call(&self, call: &ToolCall) -> Result<(), StoreError> {
+        self.transaction.execute("INSERT INTO tool_calls (id,run_id,tool,arguments_json,state,result_json,has_side_effects) VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state, result_json=excluded.result_json",
+            params![call.id.0,call.run_id.0,call.tool,call.arguments_json,encode(&call.state)?,call.result.as_ref().map(encode).transpose()?,call.has_side_effects])?;
         Ok(())
     }
     pub fn usage(&self, r: &UsageRecord) -> Result<(), StoreError> {

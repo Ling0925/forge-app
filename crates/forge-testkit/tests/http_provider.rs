@@ -20,6 +20,8 @@ fn request(provider: &str) -> ProviderRequest {
                 attachments: vec![],
             },
             tool_call_id: None,
+            tool_calls: vec![],
+            is_error: false,
         }],
         tools: vec![ToolDefinition {
             name: "read".into(),

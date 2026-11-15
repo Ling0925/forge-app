@@ -2,11 +2,11 @@ use std::{collections::BTreeMap, io};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
-    sync::oneshot,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RecordedRequest {
     pub method: String,
     pub path: String,
@@ -31,7 +31,10 @@ impl MockResponse {
 }
 pub struct MockServer {
     pub endpoint: String,
+    /// First request only, for single-request call sites.
     pub request: oneshot::Receiver<RecordedRequest>,
+    /// Every request, in order.
+    pub requests: mpsc::UnboundedReceiver<RecordedRequest>,
     pub task: JoinHandle<io::Result<()>>,
 }
 impl MockServer {
@@ -39,12 +42,13 @@ impl MockServer {
     pub async fn start(response: MockResponse) -> Self {
         Self::start_all(vec![response]).await
     }
-    /// Serve each response to one request, in order. Only the first request is
-    /// recorded on `request`; later requests are read and discarded.
+    /// Serve each response to one request, in order. The first request is
+    /// recorded on `request`; every request is sent to `requests`.
     pub async fn start_all(responses: Vec<MockResponse>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (sender, request) = oneshot::channel();
+        let (recorded, requests) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let mut sender = Some(sender);
             for response in responses {
@@ -68,16 +72,16 @@ impl MockServer {
                 let length = headers.get("content-length").unwrap().parse().unwrap();
                 let mut body = vec![0; length];
                 socket.read_exact(&mut body).await?;
+                let recorded_request = RecordedRequest {
+                    method,
+                    path,
+                    headers,
+                    body,
+                };
                 if let Some(sender) = sender.take() {
-                    sender
-                        .send(RecordedRequest {
-                            method,
-                            path,
-                            headers,
-                            body,
-                        })
-                        .unwrap();
+                    sender.send(recorded_request.clone()).unwrap();
                 }
+                recorded.send(recorded_request).unwrap();
                 socket.write_all(format!("HTTP/1.1 {} Response\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n",response.status).as_bytes()).await?;
                 for (name, value) in response.headers {
                     socket
@@ -104,6 +108,7 @@ impl MockServer {
         Self {
             endpoint,
             request,
+            requests,
             task,
         }
     }

@@ -256,9 +256,18 @@ async fn tool_result_feeds_back_and_run_succeeds() {
     let tail = &requests[1].messages[requests[1].messages.len() - 2..];
     assert_eq!(tail[0].role, MessageRole::Assistant);
     assert_eq!(tail[0].content.text, "");
+    // The assistant carries the call it issued so providers can pair results.
+    assert_eq!(tail[0].tool_calls.len(), 1);
+    assert_eq!(tail[0].tool_calls[0].id, ToolCallId("call-1".into()));
+    assert_eq!(tail[0].tool_calls[0].name, "read_file");
+    assert_eq!(
+        tail[0].tool_calls[0].arguments_json,
+        "{\"path\":\"note.txt\"}"
+    );
     assert_eq!(tail[1].role, MessageRole::Tool);
     assert_eq!(tail[1].tool_call_id, Some(ToolCallId("call-1".into())));
     assert_eq!(tail[1].content.text, "file-body\n");
+    assert!(!tail[1].is_error);
 
     assert_eq!(persisted_tool_events(&h).len(), 3);
 }
@@ -290,6 +299,7 @@ async fn malformed_arguments_fail_the_call_and_run_continues() {
     assert_eq!(result.role, MessageRole::Tool);
     assert_eq!(result.tool_call_id, Some(ToolCallId("call-1".into())));
     assert_eq!(result.content.text, error);
+    assert!(result.is_error);
 }
 
 #[tokio::test]
@@ -391,6 +401,14 @@ async fn multiple_calls_run_in_stream_order() {
     let requests = h.provider.requests();
     let tail = &requests[1].messages[requests[1].messages.len() - 3..];
     assert_eq!(tail[0].role, MessageRole::Assistant);
+    assert_eq!(
+        tail[0]
+            .tool_calls
+            .iter()
+            .map(|call| call.id.clone())
+            .collect::<Vec<_>>(),
+        [ToolCallId("call-1".into()), ToolCallId("call-2".into())]
+    );
     assert_eq!(tail[1].tool_call_id, Some(ToolCallId("call-1".into())));
     assert_eq!(tail[1].content.text, listing);
     assert_eq!(tail[2].tool_call_id, Some(ToolCallId("call-2".into())));
@@ -413,6 +431,12 @@ async fn unadvertised_side_effect_tools_are_rejected() {
     let session = h.session(&workspace).await;
     accepted(h.command(send(&session, "in-1")).await);
     let events = h.until_finished().await;
+
+    // Rejected side-effect tools are still marked side-effecting: the flag
+    // describes the tool's nature, not whether this build ran it.
+    let proposed = proposed(&events);
+    assert_eq!(proposed.len(), 1);
+    assert!(proposed[0].has_side_effects);
 
     let states = state_changes(&events);
     assert_eq!(states.len(), 2);
@@ -462,8 +486,12 @@ async fn a_second_tool_round_reuses_the_conversation() {
     let tail = &messages[messages.len() - 5..];
     assert_eq!(tail[0].role, MessageRole::User);
     assert_eq!(tail[1].role, MessageRole::Assistant);
+    assert_eq!(tail[1].tool_calls.len(), 1);
+    assert_eq!(tail[1].tool_calls[0].id, ToolCallId("call-1".into()));
     assert_eq!(tail[2].tool_call_id, Some(ToolCallId("call-1".into())));
     assert_eq!(tail[3].role, MessageRole::Assistant);
+    assert_eq!(tail[3].tool_calls.len(), 1);
+    assert_eq!(tail[3].tool_calls[0].id, ToolCallId("call-2".into()));
     assert_eq!(tail[4].tool_call_id, Some(ToolCallId("call-2".into())));
     assert_eq!(tail[4].content.text, "hay.txt:1:a needle here");
 

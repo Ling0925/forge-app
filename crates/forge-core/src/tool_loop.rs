@@ -45,6 +45,14 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Reports the tool's nature, not how this build handles it: only the four
+/// read-only tools are side-effect free; every other name — including the
+/// rejected write_file/edit_file/command and unknown tools — counts as
+/// side-effecting, so nothing unproven escapes a future approval gate.
+pub(crate) fn has_side_effects(name: &str) -> bool {
+    !matches!(name, "read_file" | "list_dir" | "glob" | "grep")
+}
+
 pub(crate) async fn execute(
     call: ToolCall,
     workspace: PathBuf,

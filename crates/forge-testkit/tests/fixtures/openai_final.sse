@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl_second","choices":[{"index":0,"delta":{"role":"assistant","content":"The file says hi."}}],"usage":null}
+
+data: {"id":"chatcmpl_second","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}
+
+data: {"id":"chatcmpl_second","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":6,"total_tokens":36}}
+
+data: [DONE]
+

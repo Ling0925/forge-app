@@ -25,6 +25,8 @@ fn request(text: &str) -> ProviderRequest {
                 attachments: vec![],
             },
             tool_call_id: None,
+            tool_calls: vec![],
+            is_error: false,
         }],
         tools: vec![],
     }

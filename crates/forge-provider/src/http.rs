@@ -1,5 +1,5 @@
 use crate::{sse::SseParser, *};
-use forge_protocol::{ProviderSettings, Usage};
+use forge_protocol::{MessageRole, ProviderSettings, Usage};
 use reqwest::{Client, Response, header::HeaderValue};
 use serde_json::{Value, json};
 use std::{
@@ -130,17 +130,7 @@ impl HttpProvider {
         };
         let url = reqwest::Url::parse(&format!("{}{path}", endpoint.trim_end_matches('/')))
             .map_err(|_| configuration("invalid provider endpoint"))?;
-        let mut messages: Vec<Value> = request
-            .messages
-            .iter()
-            .map(|message| {
-                let mut value = json!({"role":message.role,"content":message.content.text});
-                if let Some(id) = &message.tool_call_id {
-                    value["tool_call_id"] = json!(id);
-                }
-                value
-            })
-            .collect();
+        let mut messages = encode_messages(self.api, &request.messages)?;
         let mut body = json!({"model":request.model.model,"stream":true});
         let mut builder = self.client.post(url);
         match self.api {
@@ -235,6 +225,97 @@ impl HttpProvider {
             key: key.into(),
         }))
     }
+}
+
+/// Provider-facing message forms: Anthropic carries assistant tool calls as
+/// `tool_use` content blocks and answers them with `tool_result` blocks inside
+/// a user message; OpenAI carries `tool_calls` on the assistant message and
+/// answers each with a `role: tool` message keyed by `tool_call_id`.
+fn encode_messages(api: Api, messages: &[ProviderMessage]) -> Result<Vec<Value>, ProviderError> {
+    let mut out: Vec<Value> = Vec::new();
+    for message in messages {
+        match api {
+            Api::Anthropic => anthropic_message(&mut out, message)?,
+            Api::OpenAi => openai_message(&mut out, message)?,
+        }
+    }
+    Ok(out)
+}
+/// Append a user-role content block, merging into a trailing user message so
+/// consecutive user content stays in one Anthropic message.
+fn anthropic_user_block(out: &mut Vec<Value>, block: Value) {
+    if let Some(last) = out.last_mut()
+        && last["role"] == "user"
+    {
+        if let Some(blocks) = last["content"].as_array_mut() {
+            blocks.push(block);
+        } else {
+            let text = last["content"].take();
+            last["content"] = json!([{"type":"text","text":text}, block]);
+        }
+        return;
+    }
+    out.push(json!({"role":"user","content":[block]}));
+}
+fn anthropic_message(out: &mut Vec<Value>, message: &ProviderMessage) -> Result<(), ProviderError> {
+    match message.role {
+        MessageRole::User => {
+            if matches!(out.last(), Some(last) if last["role"] == "user") {
+                anthropic_user_block(out, json!({"type":"text","text":message.content.text}));
+            } else {
+                out.push(json!({"role":"user","content":message.content.text}));
+            }
+        }
+        MessageRole::Assistant => {
+            let mut content = Vec::new();
+            if !message.content.text.is_empty() {
+                content.push(json!({"type":"text","text":message.content.text}));
+            }
+            for call in &message.tool_calls {
+                content.push(json!({
+                    "type":"tool_use","id":call.id.0,"name":call.name,
+                    "input":serde_json::from_str::<Value>(&call.arguments_json).unwrap_or_else(|_| json!({})),
+                }));
+            }
+            match (content.len(), message.tool_calls.is_empty()) {
+                (0, _) => {}
+                (1, true) => out.push(json!({"role":"assistant","content":message.content.text})),
+                _ => out.push(json!({"role":"assistant","content":content})),
+            }
+        }
+        MessageRole::Tool => {
+            let mut block = json!({
+                "type":"tool_result",
+                "tool_use_id":message.tool_call_id.as_ref().ok_or_else(|| configuration("tool result message is missing tool_call_id"))?.0,
+                "content":message.content.text,
+            });
+            if message.is_error {
+                block["is_error"] = true.into();
+            }
+            anthropic_user_block(out, block);
+        }
+    }
+    Ok(())
+}
+fn openai_message(out: &mut Vec<Value>, message: &ProviderMessage) -> Result<(), ProviderError> {
+    match message.role {
+        MessageRole::Assistant if !message.tool_calls.is_empty() => out.push(json!({
+            "role":"assistant",
+            "content":message.content.text,
+            "tool_calls":message.tool_calls.iter().map(|call| json!({
+                "id":call.id.0,"type":"function",
+                "function":{"name":call.name,"arguments":call.arguments_json}
+            })).collect::<Vec<_>>(),
+        })),
+        MessageRole::Assistant if message.content.text.is_empty() => {}
+        MessageRole::Tool => out.push(json!({
+            "role":"tool",
+            "tool_call_id":message.tool_call_id.as_ref().ok_or_else(|| configuration("tool result message is missing tool_call_id"))?.0,
+            "content":message.content.text,
+        })),
+        _ => out.push(json!({"role":message.role,"content":message.content.text})),
+    }
+    Ok(())
 }
 
 struct HttpStream {

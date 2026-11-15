@@ -74,6 +74,7 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_protocol::*;
 
     #[test]
     fn creates_schema_and_reopens_without_losing_data() {
@@ -174,5 +175,108 @@ mod tests {
             matches!(migrate(&mut connection), Err(StoreError::NewerSchema { found, .. }) if found == future_version)
         );
         assert_eq!(schema_version(&connection).unwrap(), future_version);
+    }
+
+    #[test]
+    fn tool_calls_round_trip_update_in_place_and_gate_tool_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let tx = store.write().unwrap();
+        tx.workspace(&Workspace {
+            id: WorkspaceId("w".into()),
+            root: "/w".into(),
+            name: "w".into(),
+        })
+        .unwrap();
+        tx.session(&Session {
+            id: SessionId("s".into()),
+            workspace_id: WorkspaceId("w".into()),
+            title: "t".into(),
+            model: ModelSelection {
+                provider: "anthropic".into(),
+                model: "m".into(),
+            },
+            permission_mode: PermissionMode::Ask,
+            state: SessionState::Idle,
+            archived: false,
+            queue_state: QueueState::Active,
+            created_at: 0,
+            updated_at: 0,
+            last_finished_run: None,
+        })
+        .unwrap();
+        tx.run(&Run {
+            id: RunId("r".into()),
+            session_id: SessionId("s".into()),
+            queue_item_id: None,
+            state: RunState::Running,
+            outcome: None,
+            usage: Usage::default(),
+            started_at: 0,
+            finished_at: None,
+        })
+        .unwrap();
+        tx.turn(&Turn {
+            id: TurnId("t".into()),
+            run_id: RunId("r".into()),
+            ordinal: 0,
+        })
+        .unwrap();
+        // A tool message cannot precede the call row it references.
+        let tool_message = |id: &str, call: Option<&str>| Message {
+            id: MessageId(id.into()),
+            ordinal: 0,
+            input_id: None,
+            run_id: RunId("r".into()),
+            turn_id: TurnId("t".into()),
+            role: MessageRole::Tool,
+            content: Content {
+                text: "out".into(),
+                attachments: vec![],
+            },
+            tool_call_id: call.map(|id| ToolCallId(id.into())),
+        };
+        assert!(tx.message(&tool_message("m-early", Some("c1"))).is_err());
+        for (id, tool) in [("c1", "read_file"), ("c2", "write_file")] {
+            tx.tool_call(&ToolCall {
+                id: ToolCallId(id.into()),
+                run_id: RunId("r".into()),
+                tool: tool.into(),
+                arguments_json: "{}".into(),
+                state: ToolCallState::Proposed,
+                result: None,
+                has_side_effects: tool == "write_file",
+            })
+            .unwrap();
+        }
+        tx.message(&tool_message("m1", Some("c1"))).unwrap();
+        tx.commit().unwrap();
+
+        // Finishing a call updates only state and result.
+        let mut call = store.tool_call(&ToolCallId("c1".into())).unwrap().unwrap();
+        assert_eq!(call.state, ToolCallState::Proposed);
+        call.state = ToolCallState::Succeeded;
+        call.result = Some(Content {
+            text: "body".into(),
+            attachments: vec![],
+        });
+        let tx = store.write().unwrap();
+        tx.tool_call(&call).unwrap();
+        tx.commit().unwrap();
+        let stored = store.tool_call(&ToolCallId("c1".into())).unwrap().unwrap();
+        assert_eq!(stored.state, ToolCallState::Succeeded);
+        assert_eq!(stored.result.unwrap().text, "body");
+        assert_eq!(stored.tool, "read_file");
+        assert!(!stored.has_side_effects);
+
+        let calls = store.tool_calls(&RunId("r".into())).unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["c1", "c2"]
+        );
+        assert!(calls[1].has_side_effects);
     }
 }

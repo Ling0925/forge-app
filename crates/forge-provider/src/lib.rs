@@ -11,10 +11,22 @@ use std::{
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderToolCall {
+    pub id: ToolCallId,
+    pub name: String,
+    pub arguments_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderMessage {
     pub role: MessageRole,
     pub content: Content,
+    /// On a `role: tool` message: the call this result answers.
     pub tool_call_id: Option<ToolCallId>,
+    /// On a `role: assistant` message: the calls it issued, in order.
+    pub tool_calls: Vec<ProviderToolCall>,
+    /// On a `role: tool` message: the call failed (Anthropic `is_error`).
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -4,7 +4,8 @@ mod tool_loop;
 
 use forge_protocol::*;
 use forge_provider::{
-    ErrorKind, ProviderError, ProviderFactory, ProviderMessage, ProviderRequest, StreamEvent,
+    ErrorKind, ProviderError, ProviderFactory, ProviderMessage, ProviderRequest, ProviderToolCall,
+    StreamEvent,
 };
 use forge_store::{StoreError, WriteTransaction};
 use forge_tools::{cancellation::CancellationToken, clock::Clock};
@@ -50,9 +51,11 @@ struct Running {
     configuration: Result<(ProviderSettings, Option<String>), ProviderError>,
     workspace: PathBuf,
     generation: String,
-    tail: Vec<ProviderMessage>,
     calls: Vec<PendingCall>,
     remaining: VecDeque<ToolCall>,
+    /// An assistant Message row already exists for this run (written alongside
+    /// the first tool batch), so an empty final response adds no row.
+    assistant_persisted: bool,
     cancellation: CancellationToken,
 }
 struct PendingCall {
@@ -76,7 +79,7 @@ impl Running {
 enum Internal {
     Stream(RunId, Result<StreamEvent, ProviderError>),
     KeyTested(ProviderId, Result<(), ProviderError>),
-    ToolFinished(RunId, ToolCallId, tool_loop::Outcome),
+    ToolFinished(RunId, ToolCall, tool_loop::Outcome),
 }
 struct ProviderJob {
     request: ProviderRequest,
@@ -578,6 +581,8 @@ impl Runtime {
                             attachments: vec![],
                         },
                         tool_call_id: None,
+                        tool_calls: vec![],
+                        is_error: false,
                     }],
                     tools: vec![],
                 };
@@ -659,21 +664,13 @@ impl Runtime {
             content,
             tool_call_id: None,
         };
-        let mut messages: Vec<_> = self
-            .services
-            .store
-            .messages(&session.id)?
-            .into_iter()
-            .map(|m| ProviderMessage {
-                role: m.role,
-                content: m.content,
-                tool_call_id: m.tool_call_id,
-            })
-            .collect();
+        let mut messages = self.provider_messages(&session.id)?;
         messages.push(ProviderMessage {
             role: message.role.clone(),
             content: message.content.clone(),
             tool_call_id: None,
+            tool_calls: vec![],
+            is_error: false,
         });
         session.state = SessionState::Running;
         session.updated_at = now;
@@ -719,9 +716,9 @@ impl Runtime {
                 configuration: configuration.clone(),
                 workspace,
                 generation: String::new(),
-                tail: Vec::new(),
                 calls: Vec::new(),
                 remaining: VecDeque::new(),
+                assistant_persisted: false,
                 cancellation: CancellationToken::default(),
             },
         );
@@ -887,37 +884,48 @@ impl Runtime {
 
     /// The provider response ended with tool calls: propose every call, then run
     /// them sequentially so each terminal state is published before the next starts.
+    /// The assistant message that produced the calls and the `tool_calls` rows
+    /// land in the same commit, so persisted context always pairs correctly.
     fn execute_tools(&mut self, run: RunId) -> Result<(), StoreError> {
-        let (first, events) = {
+        let (first, assistant, calls, events) = {
             let running = self.active.get_mut(&run).expect("stream has active run");
-            running.tail.push(ProviderMessage {
+            let assistant = Message {
+                id: MessageId(self.services.store.new_id()?),
+                ordinal: 0,
+                input_id: None,
+                run_id: run.clone(),
+                turn_id: running.turn.clone(),
                 role: MessageRole::Assistant,
                 content: Content {
                     text: take(&mut running.generation),
                     attachments: vec![],
                 },
                 tool_call_id: None,
-            });
+            };
             let calls: Vec<ToolCall> = take(&mut running.calls)
                 .into_iter()
-                .map(|pending| ToolCall {
-                    id: pending.id,
-                    run_id: run.clone(),
-                    tool: pending.name,
-                    arguments_json: if pending.arguments.is_empty() {
-                        "{}".into()
-                    } else {
-                        pending.arguments
-                    },
-                    state: ToolCallState::Proposed,
-                    result: None,
-                    has_side_effects: false,
+                .map(|pending| {
+                    let has_side_effects = tool_loop::has_side_effects(&pending.name);
+                    ToolCall {
+                        id: pending.id,
+                        run_id: run.clone(),
+                        tool: pending.name,
+                        arguments_json: if pending.arguments.is_empty() {
+                            "{}".into()
+                        } else {
+                            pending.arguments
+                        },
+                        state: ToolCallState::Proposed,
+                        result: None,
+                        has_side_effects,
+                    }
                 })
                 .collect();
             let first = calls[0].clone();
             running.remaining = calls.iter().skip(1).cloned().collect();
             let mut events: Vec<Event> = calls
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(|call| Event::ToolCallProposed { call })
                 .collect();
             events.push(Event::ToolCallStateChanged {
@@ -925,11 +933,23 @@ impl Runtime {
                 state: ToolCallState::Running,
                 result: None,
             });
-            (first, events)
+            (first, assistant, calls, events)
         };
-        for envelope in self.commit(events, |_| Ok(()))? {
+        let mut running_first = first.clone();
+        running_first.state = ToolCallState::Running;
+        for envelope in self.commit(events, |tx| {
+            tx.message(&assistant)?;
+            for call in &calls {
+                tx.tool_call(call)?;
+            }
+            tx.tool_call(&running_first)
+        })? {
             self.broadcast(envelope);
         }
+        self.active
+            .get_mut(&run)
+            .expect("stream has active run")
+            .assistant_persisted = true;
         self.start_tool(run, first);
         Ok(())
     }
@@ -941,14 +961,14 @@ impl Runtime {
         let sender = self.sender.clone();
         tokio::spawn(async move {
             let outcome = tool_loop::execute(call.clone(), workspace, cancellation).await;
-            let _ = sender.send(Internal::ToolFinished(run, call.id, outcome));
+            let _ = sender.send(Internal::ToolFinished(run, call, outcome));
         });
     }
 
     fn tool_finished(
         &mut self,
         run: RunId,
-        call: ToolCallId,
+        mut call: ToolCall,
         outcome: tool_loop::Outcome,
     ) -> Result<(), StoreError> {
         let (state, result) = match outcome {
@@ -960,28 +980,39 @@ impl Runtime {
             text,
             attachments: vec![],
         });
-        let next = {
+        call.state = state.clone();
+        call.result = result.clone();
+        let (next, message) = {
             let running = self.active.get_mut(&run).expect("stream has active run");
-            running.tail.push(ProviderMessage {
-                role: MessageRole::Tool,
-                content: result.clone().unwrap_or_else(|| Content {
-                    text: String::new(),
-                    attachments: vec![],
-                }),
-                tool_call_id: Some(call.clone()),
-            });
             if state == ToolCallState::Cancelled {
                 running.remaining.clear();
             }
-            running.remaining.pop_front()
+            let id = self.services.store.new_id()?;
+            let message = result.clone().map(|content| Message {
+                id: MessageId(id),
+                ordinal: 0,
+                input_id: None,
+                run_id: run.clone(),
+                turn_id: running.turn.clone(),
+                role: MessageRole::Tool,
+                content,
+                tool_call_id: Some(call.id.clone()),
+            });
+            (running.remaining.pop_front(), message)
         };
         for envelope in self.commit(
             vec![Event::ToolCallStateChanged {
-                call,
+                call: call.id.clone(),
                 state: state.clone(),
                 result,
             }],
-            |_| Ok(()),
+            |tx| {
+                tx.tool_call(&call)?;
+                if let Some(message) = &message {
+                    tx.message(message)?;
+                }
+                Ok(())
+            },
         )? {
             self.broadcast(envelope);
         }
@@ -993,13 +1024,15 @@ impl Runtime {
                 },
             )?,
             (_, Some(next)) => {
+                let mut next = next;
+                next.state = ToolCallState::Running;
                 for envelope in self.commit(
                     vec![Event::ToolCallStateChanged {
                         call: next.id.clone(),
                         state: ToolCallState::Running,
                         result: None,
                     }],
-                    |_| Ok(()),
+                    |tx| tx.tool_call(&next),
                 )? {
                     self.broadcast(envelope);
                 }
@@ -1010,29 +1043,75 @@ impl Runtime {
         Ok(())
     }
 
+    /// Rebuild the provider-visible transcript from persisted rows. Each
+    /// `role: tool` message pairs with the assistant row that produced its
+    /// call — the most recent assistant message — so the emitted assistant
+    /// carries exactly the calls that have a persisted result. Calls whose
+    /// result was never written (a run interrupted mid-execution, or one
+    /// cancelled before completing) leave no tool message and are dropped from
+    /// the transcript rather than breaking the providers' pairing contract.
+    fn provider_messages(&self, session: &SessionId) -> Result<Vec<ProviderMessage>, StoreError> {
+        let mut messages: Vec<ProviderMessage> = Vec::new();
+        let mut owner: Option<usize> = None;
+        for message in self.services.store.messages(session)? {
+            match message.role {
+                MessageRole::Assistant => {
+                    owner = Some(messages.len());
+                    messages.push(ProviderMessage {
+                        role: MessageRole::Assistant,
+                        content: message.content,
+                        tool_call_id: None,
+                        tool_calls: vec![],
+                        is_error: false,
+                    });
+                }
+                MessageRole::User => {
+                    owner = None;
+                    messages.push(ProviderMessage {
+                        role: MessageRole::User,
+                        content: message.content,
+                        tool_call_id: None,
+                        tool_calls: vec![],
+                        is_error: false,
+                    });
+                }
+                MessageRole::Tool => {
+                    let (Some(id), Some(owner)) = (message.tool_call_id.clone(), owner) else {
+                        continue;
+                    };
+                    let Some(call) = self.services.store.tool_call(&id)? else {
+                        continue;
+                    };
+                    messages[owner].tool_calls.push(ProviderToolCall {
+                        id: call.id.clone(),
+                        name: call.tool.clone(),
+                        arguments_json: call.arguments_json.clone(),
+                    });
+                    messages.push(ProviderMessage {
+                        role: MessageRole::Tool,
+                        content: message.content,
+                        tool_call_id: Some(id),
+                        tool_calls: vec![],
+                        is_error: call.state == ToolCallState::Failed,
+                    });
+                }
+            }
+        }
+        Ok(messages)
+    }
+
     /// All tool calls of a provider response are done; feed the results back and
     /// keep the same run going with a follow-up provider request.
     fn continue_run(&mut self, run: RunId) -> Result<(), StoreError> {
-        let (model, configuration, messages) = {
-            let running = self.active.get_mut(&run).expect("stream has active run");
-            let mut messages = self
-                .services
-                .store
-                .messages(&running.active.run.session_id)?
-                .into_iter()
-                .map(|message| ProviderMessage {
-                    role: message.role,
-                    content: message.content,
-                    tool_call_id: message.tool_call_id,
-                })
-                .collect::<Vec<_>>();
-            messages.extend(running.tail.iter().cloned());
+        let (model, configuration, session_id) = {
+            let running = self.active.get(&run).expect("stream has active run");
             (
                 running.model.clone(),
                 running.configuration.clone(),
-                messages,
+                running.active.run.session_id.clone(),
             )
         };
+        let messages = self.provider_messages(&session_id)?;
         self.start(ProviderJob {
             request: ProviderRequest {
                 run,
@@ -1119,8 +1198,15 @@ impl Runtime {
         self.finish_with(id, outcome)
     }
     fn finish_with(&mut self, id: RunId, outcome: RunOutcome) -> Result<(), StoreError> {
-        let running = self.active.get(&id).expect("stream has active run");
+        let running = self.active.get_mut(&id).expect("stream has active run");
         let mut run = running.active.run.clone();
+        // The persisted assistant text is this response's share only; earlier
+        // responses each persisted their own row alongside their tool calls.
+        let text = take(&mut running.generation);
+        let persist_message = !text.is_empty() || !running.assistant_persisted;
+        let usage = running.usage.clone();
+        let input_id = running.active.input_id.clone();
+        let turn = running.turn.clone();
         let mut session = self
             .services
             .store
@@ -1135,12 +1221,12 @@ impl Runtime {
         run.outcome = Some(outcome.clone());
         let now = self.now();
         run.finished_at = Some(now);
-        run.usage = running.usage.clone();
+        run.usage = usage;
         session.state = SessionState::Idle;
         session.updated_at = now;
         session.last_finished_run = Some(FinishedRun {
             run: run.id.clone(),
-            input_id: Some(running.active.input_id.clone()),
+            input_id: Some(input_id),
             outcome: outcome.clone(),
             started_at: run.started_at,
             finished_at: now,
@@ -1150,10 +1236,10 @@ impl Runtime {
             ordinal: 0,
             input_id: None,
             run_id: run.id.clone(),
-            turn_id: running.turn.clone(),
+            turn_id: turn,
             role: MessageRole::Assistant,
             content: Content {
-                text: running.active.text.clone(),
+                text,
                 attachments: vec![],
             },
             tool_call_id: None,
@@ -1179,7 +1265,7 @@ impl Runtime {
             },
         ]);
         let tx = self.services.store.write()?;
-        if success {
+        if success && persist_message {
             tx.message(&message)?;
         }
         tx.run(&run)?;
