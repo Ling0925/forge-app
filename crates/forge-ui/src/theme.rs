@@ -10,9 +10,11 @@ pub const DARK_NAME: &str = "Forge Dark";
 pub const LIGHT_HC_NAME: &str = "Forge Light HC";
 pub const DARK_HC_NAME: &str = "Forge Dark HC";
 
-/// "Increase contrast" variants (§3 / §8): secondary and tertiary text use the
-/// primary foreground and hairline borders use `borderStrong`. Derived from
-/// the bundled JSON by exact colour substitution so both stay in sync.
+/// "Increase contrast" variants (§3 / §8 + visual v2 §5.4): secondary and
+/// tertiary text use the primary foreground, hairline borders use
+/// `borderStrong`, and elevation shadows are off — elements that read
+/// `theme.shadow` fall back to a 1pt `borderStrong` ring instead. Derived
+/// from the bundled JSON by exact colour substitution so both stay in sync.
 pub fn high_contrast_json() -> String {
     let mut json = THEME_JSON
         .replace(
@@ -20,7 +22,8 @@ pub fn high_contrast_json() -> String {
             &format!("\"{LIGHT_HC_NAME}\""),
         )
         .replace(&format!("\"{DARK_NAME}\""), &format!("\"{DARK_HC_NAME}\""))
-        .replace("\"is_default\": true", "\"is_default\": false");
+        .replace("\"is_default\": true", "\"is_default\": false")
+        .replace("\"shadow\": true", "\"shadow\": false");
     for palette in [&crate::tokens::LIGHT, &crate::tokens::DARK] {
         for (from, to) in [
             (palette.fg2, palette.fg),
@@ -60,7 +63,7 @@ pub fn init(cx: &mut App) {
 }
 
 /// Forced appearance from `FORGE_UI_APPEARANCE=light|dark` (screenshots,
-/// manual checks); `None` follows the system.
+/// manual checks); `None` follows the settings pref / system.
 pub fn forced_mode() -> Option<ThemeMode> {
     match std::env::var("FORGE_UI_APPEARANCE").ok()?.as_str() {
         "light" => Some(ThemeMode::Light),
@@ -71,9 +74,20 @@ pub fn forced_mode() -> Option<ThemeMode> {
 
 /// Applies the forced appearance if set, otherwise follows the system.
 pub fn sync_appearance(window: Option<&mut Window>, cx: &mut App) {
+    apply_appearance(forge_state::Appearance::System, window, cx);
+}
+
+/// Appearance priority: `FORGE_UI_APPEARANCE` (forced) > the 外观 → 主题
+/// setting (`ui_prefs.appearance`) > the system (visual v2 settings card).
+pub fn apply_appearance(pref: forge_state::Appearance, window: Option<&mut Window>, cx: &mut App) {
+    use forge_state::Appearance::*;
     match forced_mode() {
         Some(mode) => Theme::change(mode, window, cx),
-        None => Theme::sync_system_appearance(window, cx),
+        None => match pref {
+            Light => Theme::change(ThemeMode::Light, window, cx),
+            Dark => Theme::change(ThemeMode::Dark, window, cx),
+            System => Theme::sync_system_appearance(window, cx),
+        },
     }
 }
 

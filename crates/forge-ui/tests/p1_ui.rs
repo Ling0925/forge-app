@@ -162,6 +162,11 @@ impl Fixture {
             .unwrap()
     }
 
+    fn composer_id(&self, cx: &mut TestAppContext) -> gpui_kit::ElementId {
+        let composer = cx.update(|cx| self.app.read(cx).composer().clone());
+        ("input", composer.entity_id()).into()
+    }
+
     fn events(&self, cx: &mut TestAppContext, events: Vec<Event>) {
         self.update(cx, |app, window, cx| {
             for mut event in events {
@@ -1201,4 +1206,207 @@ fn settings_scrim_covers_window_and_uses_scrim_token(cx: &mut TestAppContext) {
             }
         });
     }
+}
+
+// ------------------------------------------------------------------ v2.1 §0
+
+/// §0: the header is 52pt with 24pt side padding, ＋新会话 is a 32pt row,
+/// and the empty column keeps its last row 48pt off the bottom edge.
+#[gpui_kit::test]
+fn v2_1_header_sidebar_and_empty_metrics(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let header = window.find("session-header");
+        assert_eq!(header.bounds().size.height, px(52.));
+        // The title starts exactly one PADDING_X inside the header.
+        let title = window.find("session-title");
+        assert_eq!(
+            title.bounds().origin.x - header.bounds().origin.x,
+            px(24.),
+            "horizontal padding is 24 now"
+        );
+        assert_eq!(window.find("new-session").bounds().size.height, px(32.));
+        // Bottom padding 60 → 48: the column centers its block inside the
+        // padded box, so the bottom slack exceeds the top slack by exactly
+        // the padding (48) regardless of the block's height.
+        let col = window.find("timeline-empty").bounds();
+        let first = window.find("empty-title").bounds();
+        let last = window.find("example-3").bounds();
+        let bottom_slack = col.origin.y + col.size.height - (last.origin.y + last.size.height);
+        let top_slack = first.origin.y - col.origin.y;
+        assert_eq!(bottom_slack - top_slack, px(48.));
+    });
+}
+
+/// §0: idle renders no hint row — no painted line and no leftover gap — and
+/// the send button's accessibility description carries "↩ 发送 · ⇧↩ 换行",
+/// reachable when focus lands on it (the managed tooltip itself is
+/// hover-only, so the description is the keyboard surface).
+#[gpui_kit::test]
+fn idle_composer_has_no_hint_row_and_send_carries_the_shortcuts(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("composer-hint").is_none(),
+            "the idle hint row is gone"
+        );
+        // The composer column is exactly the card: no residual row or gap.
+        let composer = window.find("composer");
+        let card = window.find("composer-box");
+        assert_eq!(composer.bounds(), card.bounds());
+        let send = window.find("composer-send");
+        assert_eq!(send.label(), Some("发送"));
+        assert_eq!(send.description(), Some("↩ 发送 · ⇧↩ 换行"));
+        assert_eq!(send.bounds().size.height, px(32.));
+        assert_eq!(send.disabled(), Some(true), "empty draft");
+    });
+    // A real draft — typed like a user — enables the button so it joins tab
+    // traversal, where its description announces both shortcuts. Typed input
+    // reaches `set_draft` via deferred `InputEvent`s: give the app a
+    // `run_until_parked` between typing and asserting.
+    let input_id = f.composer_id(cx);
+    f.with_window(cx, |window, cx| window.click(input_id, cx));
+    cx.run_until_parked();
+    f.with_window(cx, |window, cx| window.input("draft", cx));
+    cx.run_until_parked();
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("composer-send").disabled(),
+            None,
+            "draft enables send"
+        );
+        let mut focused = None;
+        for _ in 0..12 {
+            window.focus_next(cx);
+            window.render_frame(cx);
+            focused = window.find("composer-send").focused();
+            if focused == Some(true) {
+                break;
+            }
+        }
+        assert_eq!(focused, Some(true), "Tab reaches the send button");
+        assert_eq!(
+            window.find("composer-send").description(),
+            Some("↩ 发送 · ⇧↩ 换行")
+        );
+    });
+}
+
+/// §0: only the actionable notices remain under the composer — the queue
+/// hint while running with `queue_when_busy`, and the no-key notice with
+/// its 打开设置 link — and the old 28pt controls are 32pt everywhere.
+#[gpui_kit::test]
+fn v2_1_remaining_hints_and_32pt_controls(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    // The no-key notice keeps its link on the empty screen — and its
+    // 打开设置 button is a 32pt control like the rest.
+    f.update(cx, |app, window, cx| {
+        let key = Event::ProviderKeyConfigured {
+            provider: "openai".into(),
+            key_status: KeyStatus::Missing,
+        };
+        fixture_event(app, key, window, cx);
+    });
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("no-key").is_some());
+        assert!(window.try_find("composer-open-settings").is_some());
+        assert_eq!(
+            window.find("composer-hint").label(),
+            Some("先在设置里添加 API Key"),
+            "no-key notice stays"
+        );
+        assert_eq!(window.find("no-key-settings").bounds().size.height, px(32.));
+    });
+
+    // Key restored → a run with queue support shows "↩ 加入队列 · ⌥↩ 插话".
+    f.update(cx, |app, window, cx| {
+        let key = Event::ProviderKeyConfigured {
+            provider: "openai".into(),
+            key_status: KeyStatus::Configured,
+        };
+        fixture_event(app, key, window, cx);
+        app.state.capabilities = forge_state::Capabilities::P3;
+        app.state.set_draft("hi");
+        app.state.composer_key(forge_state::ComposerKey::Enter);
+        app.after_change(window, cx);
+    });
+    cx.run_until_parked();
+    f.backend.take();
+    f.events(
+        cx,
+        vec![Event::RunStarted {
+            run: run("r1"),
+            input_id: "in-x".into(),
+        }],
+    );
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let hint = window.find("composer-hint");
+        assert!(hint.visible(), "queue hint stays");
+        assert_eq!(hint.label(), Some("↩ 加入队列 · ⌥↩ 插话"));
+        assert_eq!(window.find("composer-stop").label(), Some("停止"));
+    });
+
+    // Error-card action buttons are 32pt (was ~28).
+    f.update(cx, |app, window, cx| {
+        let finished = Event::RunFinished {
+            run: "r1".into(),
+            outcome: RunOutcome::Failed {
+                kind: RunErrorKind::Network,
+                message: "lost".into(),
+                http_status: None,
+                retry_after_ms: None,
+                retryable: true,
+            },
+            finished_at: 1,
+        };
+        fixture_event(app, finished, window, cx);
+    });
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        for id in ["error-r1-primary", "error-r1-secondary"] {
+            assert_eq!(
+                window.find(id).bounds().size.height,
+                px(32.),
+                "{id} is a 32pt control"
+            );
+        }
+    });
+
+    // Settings: key field, 保存/移除, ✕ and the theme track are all 32pt;
+    // the theme segments are the 28pt outline nested inside it.
+    f.with_window(cx, |window, cx| {
+        window.press("cmd-,", cx);
+        window.render_frame(cx);
+        for id in [
+            "settings-input-openai",
+            "settings-save-openai",
+            "settings-remove-openai",
+            "settings-input-anthropic",
+            "settings-save-anthropic",
+            "settings-close",
+            "settings-theme-track",
+        ] {
+            assert_eq!(
+                window.find(id).bounds().size.height,
+                px(32.),
+                "{id} is a 32pt control"
+            );
+        }
+        for id in [
+            "settings-theme-light",
+            "settings-theme-dark",
+            "settings-theme-system",
+        ] {
+            assert_eq!(
+                window.find(id).bounds().size.height,
+                px(28.),
+                "{id}: 32pt track − 2 × 2pt inset"
+            );
+        }
+    });
 }

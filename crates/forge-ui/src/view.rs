@@ -74,8 +74,11 @@ pub struct ForgeApp {
     /// Focus to restore when the settings panel closes (Esc or 关闭).
     settings_return_focus: Option<FocusHandle>,
     /// `ui_prefs` as last loaded or sent; a change is persisted once the
-    /// drag ends (sidebar width / visibility, inspector).
+    /// drag ends (sidebar width / visibility, inspector, appearance).
     persisted_prefs: Option<BTreeMap<String, String>>,
+    /// The 外观 → 主题 value currently applied to the gpui theme; a change
+    /// (settings click or a Core-pushed ui_prefs update) re-applies it.
+    applied_appearance: forge_state::Appearance,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -139,8 +142,9 @@ impl ForgeApp {
                     this.after_change(window, cx);
                 }
             }),
-            cx.observe_window_appearance(window, |_, window, cx| {
-                crate::theme::sync_appearance(Some(window), cx);
+            cx.observe_window_appearance(window, |this, window, cx| {
+                let pref = this.state.ui.appearance;
+                crate::theme::apply_appearance(pref, Some(window), cx);
             }),
         ];
 
@@ -216,6 +220,7 @@ impl ForgeApp {
             settings_close_focus: cx.focus_handle(),
             settings_return_focus: None,
             persisted_prefs: None,
+            applied_appearance: forge_state::Appearance::System,
             _tasks: tasks,
             _subscriptions: subscriptions,
         };
@@ -267,6 +272,13 @@ impl ForgeApp {
     /// timeline into their gpui entities, exits if the quit flow finished.
     pub fn after_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.persist_prefs_if_changed();
+        // 外观 → 主题 (v2.1 settings card): re-apply when the pref changed —
+        // from the settings segmented control or a Core `Settings` update.
+        let appearance = self.state.ui.appearance;
+        if appearance != self.applied_appearance {
+            self.applied_appearance = appearance;
+            crate::theme::apply_appearance(appearance, Some(window), cx);
+        }
         for outgoing in self.state.take_outbox() {
             let token = outgoing.token;
             let future = self.backend.execute(outgoing.command);
@@ -363,12 +375,18 @@ impl ForgeApp {
             self.composer
                 .update(cx, |input, cx| input.set_value(draft, window, cx));
         }
-        // §6.9: placeholder follows the state (no key → "先在设置里添加 API Key").
-        // No key wins even before a session exists (fresh install, §6.3).
+        // §6.9: placeholder follows the state (no key → "先在设置里添加 API Key";
+        // v2.1 running → "运行中"). No key wins even before a session exists.
         let no_key = self.state.settings.key_missing()
             || self.state.composer_mode() == ComposerMode::Disabled(DisabledReason::NoKey);
+        let busy = matches!(
+            self.state.composer_mode(),
+            ComposerMode::Running | ComposerMode::Cancelling
+        );
         let placeholder = if no_key {
             t("composer.no_key")
+        } else if busy {
+            t("composer.placeholder.running")
         } else {
             t("composer.placeholder.idle")
         };
@@ -786,12 +804,17 @@ impl ForgeApp {
     fn render_sidebar(&self, sidebar: SidebarVm, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let palette = *Palette::for_dark(theme.is_dark());
-        // §6.1: "＋ 新会话" left-aligned with its ⌘N hint on the right.
+        // §6.1 + §0: "＋ 新会话" is a full-width row (32pt, radius-sm) with
+        // its ⌘N hint on the right, 8pt from the sidebar edge.
         let new_session = Button::new("new-session")
             .ghost()
             .small()
             .w_full()
+            .h(px(tokens::component::sidebar::NEW_SESSION_HEIGHT))
+            .px_3()
+            .mb_2()
             .justify_start()
+            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
             .accessibility_label(t("sidebar.new_session"))
             .tooltip(t("menu.file.new_session"))
             .child(
@@ -805,7 +828,8 @@ impl ForgeApp {
                         div()
                             .text_size(px(tokens::CAPTION.size))
                             .line_height(px(tokens::CAPTION.line_height))
-                            .text_color(rgb(palette.fg2))
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .text_color(rgb(palette.fg3))
                             .child("⌘N"),
                     ),
             )
@@ -821,8 +845,11 @@ impl ForgeApp {
             .flex_shrink_0()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
-            .p_3()
-            .gap_4()
+            // Rows sit 8pt from the sidebar edge (v2.1 component sidebar.edge).
+            .px(px(tokens::component::sidebar::EDGE))
+            .pt_3()
+            .pb_3()
+            .gap_1()
             .child(new_session);
         if sidebar.is_empty() {
             list = list.child(
@@ -865,23 +892,24 @@ impl ForgeApp {
                 "a11y.sidebar.group",
                 &[("group", name), ("n", &count.to_string())],
             );
+            // v2.1: caption-size fg3 group titles; the count stays in the
+            // group's accessibility label instead of a visual badge.
             let mut section = v_flex()
                 .id(SharedString::from(format!("group-{key}")))
                 .role(Role::List)
                 .aria_label(label)
                 .gap_0p5()
                 .child(
-                    h_flex()
+                    div()
                         .id(SharedString::from(format!("group-{key}-header")))
                         .px_3()
-                        .pt_1()
-                        .gap_1p5()
+                        .pt_3()
+                        .pb_1()
                         .text_size(px(tokens::CAPTION.size))
                         .line_height(px(tokens::CAPTION.line_height))
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .text_color(rgb(palette.fg2))
+                        .text_color(rgb(palette.fg3))
                         .child(name)
-                        .child(div().child(count.to_string()))
                         .test_support(),
                 );
             for row in rows {
@@ -936,23 +964,27 @@ impl ForgeApp {
         };
         let id = row.id.clone();
         let approvals = row.approvals;
-        // §6.1: 48pt, two lines, 12pt side padding, radius-md.
+        // §6.1 + v2.1: 48pt, two lines, 12pt side padding, radius-sm (8);
+        // the selected capsule is neutral `selected` with a Semibold title.
         h_flex()
             .id(SharedString::from(format!("session-{}", row.id.0)))
             .role(Role::ListItem)
             .aria_label(row.a11y_label.clone())
             .aria_selected(row.selected)
-            .h(px(48.))
+            .h(px(tokens::component::sidebar::ROW_HEIGHT))
             .flex_shrink_0()
             .gap_2()
-            .px_3()
-            .rounded(px(8.))
+            .px(px(tokens::component::sidebar::ROW_PADDING))
+            .py_1()
+            .rounded(px(tokens::component::sidebar::ROW_RADIUS))
             .cursor_pointer()
             .when(row.selected, |row| {
-                row.bg(theme.sidebar_accent)
+                row.bg(rgb(tokens::component::sidebar::selected_bg(&palette)))
                     .text_color(theme.sidebar_accent_foreground)
             })
-            .when(!row.selected, |row| row.hover(|s| s.bg(theme.list_hover)))
+            .when(!row.selected, |row| {
+                row.hover(|s| s.bg(rgb(tokens::component::sidebar::hover_bg(&palette))))
+            })
             .child(
                 v_flex()
                     .min_w_0()
@@ -967,8 +999,12 @@ impl ForgeApp {
                                     .flex_1()
                                     .min_w_0()
                                     .text_size(px(tokens::BODY.size))
-                                    .line_height(px(tokens::BODY.line_height))
-                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .line_height(px(tokens::FOOTNOTE.line_height))
+                                    .font_weight(if row.selected {
+                                        gpui_kit::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui_kit::FontWeight::MEDIUM
+                                    })
                                     .truncate()
                                     .child(row.title.clone()),
                             )
@@ -1006,29 +1042,36 @@ impl ForgeApp {
             .context
             .percent()
             .map(|p| tf("header.context", &[("percent", &p.to_string())]));
+        let palette = *Palette::for_dark(theme.is_dark());
+        // §0: the header is borderless, 52pt tall, 24pt side padding; the
+        // model is a `chip` tag next to the title.
         Some(
             h_flex()
                 .id("session-header")
-                .h(px(52.))
+                .h(px(tokens::component::header::HEIGHT))
                 .flex_shrink_0()
-                .px_8()
+                .px(px(tokens::component::header::PADDING_X))
                 .gap_3()
                 .items_center()
-                .border_b_1()
-                .border_color(theme.border)
                 .child(
                     div()
+                        .id("session-title")
                         .text_size(px(tokens::TITLE3.size))
                         .line_height(px(tokens::TITLE3.line_height))
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .truncate()
-                        .child(vm.session.title.clone()),
+                        .child(vm.session.title.clone())
+                        .test_support(),
                 )
                 .child(
                     div()
-                        .text_size(px(tokens::FOOTNOTE.size))
-                        .line_height(px(tokens::FOOTNOTE.line_height))
-                        .text_color(theme.muted_foreground)
+                        .px_2()
+                        .py_1()
+                        .rounded(px(tokens::RADIUS_SM))
+                        .bg(rgb(palette.chip))
+                        .text_size(px(tokens::CAPTION.size))
+                        .line_height(px(tokens::CAPTION.line_height))
+                        .text_color(rgb(palette.fg2))
                         .child(vm.session.model.model.clone()),
                 )
                 .child(div().flex_1())
@@ -1039,12 +1082,18 @@ impl ForgeApp {
                         .text_color(theme.muted_foreground)
                         .child(c)
                 }))
+                .test_support()
                 .into_any_element(),
         )
     }
 
-    fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Empty screen (v2.1 §5, §0: 48pt bottom pad): title only, the floating
+    /// composer and the stacked suggestion rows (icon + Semibold title + →,
+    /// descriptions removed). `composer` is the same element the docked
+    /// layout renders.
+    fn render_empty(&self, cx: &mut Context<Self>, composer: AnyElement) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = *Palette::for_dark(theme.is_dark());
         // `unavailable` is not "未配置 Key" (no banner for an unreadable keychain).
         let no_key = self.state.settings.key_missing();
         let has_session = self.state.selected().is_some();
@@ -1053,42 +1102,27 @@ impl ForgeApp {
             .flex_1()
             .items_center()
             .justify_center()
-            .gap_6()
             .px_6()
+            .pb(px(tokens::component::empty_state::BOTTOM))
             .child(
                 div()
+                    .id("empty-title")
                     .text_size(px(tokens::TITLE1.size))
                     .line_height(px(tokens::TITLE1.line_height))
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .child(t("empty.title")),
+                    .child(t("empty.title"))
+                    .test_support(),
             );
-        if has_session && !no_key {
-            col = col.child(
-                v_flex()
-                    .w(px(360.))
-                    .max_w_full()
-                    .gap_2()
-                    .children((1..=3).map(|i| {
-                        Button::new(SharedString::from(format!("example-{i}")))
-                            .label(t(&format!("empty.example.{i}")))
-                            .outline()
-                            .w_full()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.fill_example(i, window, cx)
-                            }))
-                    })),
-            );
-        }
         if no_key {
-            let palette = *Palette::for_dark(theme.is_dark());
             col = col.child(
                 h_flex()
                     .id("no-key")
                     .role(Role::Group)
+                    .mt_6()
                     .gap_3()
                     .px_4()
                     .py_3()
-                    .rounded(px(8.))
+                    .rounded(px(tokens::RADIUS_SM))
                     .bg(rgb(palette.info_bg))
                     .text_color(rgb(palette.fg))
                     .child(Icon::new(IconName::Info).text_color(rgb(palette.info)))
@@ -1098,11 +1132,90 @@ impl ForgeApp {
                             .label(t("composer.open_settings"))
                             .small()
                             .outline()
+                            // §0: the old 28pt button is 32 like the rest.
+                            .h(px(tokens::component::button::HEIGHT))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
                             ),
                     )
                     .test_support(),
+            );
+        }
+        // Title → composer 24pt; composer → suggestions 16pt.
+        col = col.child(div().w_full().mt_6().child(composer));
+        if has_session && !no_key {
+            let icons = [IconName::Search, IconName::Check, IconName::PenLine];
+            col = col.child(
+                h_flex().w_full().justify_center().px_8().mt_4().child(
+                    v_flex()
+                        .w_full()
+                        .max_w(px(forge_state::CONTENT_MAX))
+                        .gap_2()
+                        .children((1..=3).map(|i| {
+                            let text = SharedString::from(t(&format!("empty.example.{i}")));
+                            Button::new(SharedString::from(format!("example-{i}")))
+                                .custom(
+                                    gpui_kit::component::button::ButtonCustomVariant::new(cx)
+                                        .color(
+                                            rgb(tokens::component::card::suggestion::bg(&palette))
+                                                .into(),
+                                        )
+                                        .foreground(rgb(palette.fg).into())
+                                        .hover(
+                                            rgb(tokens::component::card::suggestion::hover(
+                                                &palette,
+                                            ))
+                                            .into(),
+                                        )
+                                        .active(
+                                            rgb(tokens::component::card::suggestion::hover(
+                                                &palette,
+                                            ))
+                                            .into(),
+                                        ),
+                                )
+                                .w_full()
+                                .h_auto()
+                                .justify_start()
+                                .p(px(tokens::component::card::PADDING))
+                                .rounded(px(tokens::RADIUS_MD))
+                                .accessibility_label(text.clone())
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_3()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .size(px(16.))
+                                                .flex_shrink_0()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    Icon::new(icons[i - 1])
+                                                        .text_color(rgb(palette.fg)),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::BODY.size))
+                                                .line_height(px(tokens::BODY.line_height))
+                                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                                .truncate()
+                                                .child(text),
+                                        )
+                                        .child(div().flex_1())
+                                        .child(
+                                            Icon::new(IconName::ArrowRight)
+                                                .text_color(rgb(palette.fg3)),
+                                        ),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.fill_example(i, window, cx)
+                                }))
+                        })),
+                ),
             );
         }
         col.test_support().into_any_element()
@@ -1248,13 +1361,11 @@ impl ForgeApp {
         )
     }
 
+    /// Timeline scroller. The empty screen is rendered by `render` itself so
+    /// the composer can sit inside it; this only handles onboarding and rows.
     fn render_timeline(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(onboarding) = self.render_onboarding(cx) {
             return onboarding;
-        }
-        let empty = self.state.selected().is_none_or(|vm| vm.is_empty());
-        if empty {
-            return self.render_empty(cx);
         }
         let rows = self.rows.clone();
         let weak = cx.weak_entity();
@@ -1271,10 +1382,20 @@ impl ForgeApp {
                     move |index, _, cx| {
                         let row = rows.borrow().get(index).cloned();
                         match row {
-                            Some(row) => div()
-                                .pt_5()
-                                .child(render_row(&row, &weak, cx))
-                                .into_any_element(),
+                            // v2.1 §2: 12pt inside a turn, 24pt between turns
+                            // (a Divider ends one).
+                            Some(row) => {
+                                let gap = match rows.borrow().get(index.wrapping_sub(1)) {
+                                    Some(TimelineRowVm::Divider { .. }) if index > 0 => {
+                                        tokens::component::timeline::TURN_GAP
+                                    }
+                                    _ => tokens::component::timeline::ROW_GAP,
+                                };
+                                div()
+                                    .pt(px(gap))
+                                    .child(render_row(&row, &weak, cx))
+                                    .into_any_element()
+                            }
                             None => div().into_any_element(),
                         }
                     },
@@ -1286,9 +1407,17 @@ impl ForgeApp {
             .into_any_element()
     }
 
+    /// Floating composer (v2.1 §0/§2/§4): `surface` card, radius-xl,
+    /// `shadow-sm`, 1pt `borderStrong` (1.5pt `accent` + 3pt 16% glow on
+    /// focus). The 32pt circular send and the "■ 停止" pill sit 8pt from the
+    /// card border. §0: no idle hint row — the "↩ 发送 · ⇧↩ 换行" /
+    /// "停止 ⌘." shortcuts live on the buttons' tooltips and accessibility
+    /// descriptions; the only remaining line is the no-key notice or the
+    /// queue-capable running hint.
     fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let palette = *Palette::for_dark(theme.is_dark());
+        use tokens::component::composer as cc;
         let mode = self.state.composer_mode();
         let disabled = matches!(mode, ComposerMode::Disabled(_));
         let no_key = mode == ComposerMode::Disabled(DisabledReason::NoKey);
@@ -1298,59 +1427,50 @@ impl ForgeApp {
             .state
             .selected()
             .and_then(|vm| vm.composer.error.clone());
-        let button_disabled = if busy {
-            mode == ComposerMode::Cancelling
-        } else {
-            !self.state.can_send()
-        };
-        // §6.9 + 2026-11-14 D1: "停止 ⌘." = transparent fill, `danger` text and
-        // 1pt `danger` border (light #C01F17, dark #FF7A70), `dangerBg` on
-        // hover; never `dangerBtn` (2.55:1 on dark). "发送 ↩" = accent / onAccent.
         let button: AnyElement = if busy {
+            // v2.1: "■ 停止" outline pill (borderStrong / fg), Semibold; ⌘.
+            // moves to the tooltip and the AccessKit description. While
+            // cancelling it is a readable disabled control, never faded.
             let stopping = mode == ComposerMode::Cancelling;
-            let label = if stopping {
-                t("composer.stopping")
-            } else {
-                t("composer.stop_key")
-            };
-            div()
-                .id("composer-stop")
-                .role(Role::Button)
-                .aria_label(if stopping {
+            let button = Button::new("composer-stop")
+                .icon(IconName::Square)
+                .label(if stopping {
                     t("composer.stopping")
                 } else {
                     t("composer.stop")
                 })
-                .h(px(24.))
-                .px_2()
-                .flex()
-                .items_center()
-                .rounded(px(6.))
+                .accessibility_label(if stopping {
+                    t("composer.stopping")
+                } else {
+                    t("composer.stop")
+                })
+                .tooltip(t("composer.stop_key"))
+                .custom(
+                    gpui_kit::component::button::ButtonCustomVariant::new(cx)
+                        .foreground(rgb(cc::stop_fg(&palette)).into())
+                        .hover(rgb(cc::stop_hover(&palette)).into())
+                        .active(rgb(cc::stop_hover(&palette)).into()),
+                )
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .h(px(cc::SEND_SIZE))
+                .px_3()
+                .rounded(px(tokens::RADIUS_LG))
                 .border_1()
-                .text_sm()
-                .when(stopping, |el| {
-                    el.border_color(rgb(palette.subtle))
-                        .bg(rgb(palette.subtle))
-                        .text_color(rgb(palette.fg3))
-                })
-                .when(!stopping, |el| {
-                    el.border_color(rgb(palette.danger))
-                        .text_color(rgb(palette.danger))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(palette.danger_bg)))
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.primary_button(window, cx)),
-                        )
-                })
-                .child(label)
-                .test_support()
-                .into_any_element()
+                .border_color(rgb(cc::stop_border(&palette)))
+                .disabled(stopping)
+                .on_click(cx.listener(|this, _, window, cx| this.primary_button(window, cx)));
+            crate::style::disabled_readable(button, stopping, cx).into_any_element()
         } else {
+            // 32pt circle, accent/onAccent; disabled keeps fg3 on subtle
+            // (5.00:1 light / 4.71:1 dark), the v2.1 "send.off" state.
+            let button_disabled = !self.state.can_send();
             let button = Button::new("composer-send")
-                .label(t("composer.send_key"))
+                .icon(IconName::ArrowUp)
                 .accessibility_label(t("composer.send"))
+                .tooltip(t("composer.send_key"))
                 .primary()
-                .small()
+                .with_size(gpui_kit::component::Size::Size(px(cc::SEND_SIZE)))
+                .rounded_full()
                 .disabled(button_disabled)
                 .on_click(cx.listener(|this, _, window, cx| this.primary_button(window, cx)));
             crate::style::disabled_readable(button, button_disabled, cx).into_any_element()
@@ -1376,23 +1496,37 @@ impl ForgeApp {
             })
             .unwrap_or_default();
 
-        // §6.9 / §3.1: surface fill + 1pt borderStrong whether enabled or not;
-        // focus adds the 2pt accent ring; disabled only changes the
-        // placeholder and drops the ring (no grey fill).
+        // Card: padding 16 top/sides, 8 bottom so the control row ends 8pt
+        // from the border. Focus swaps the resting borderStrong for the 1.5pt
+        // accent stroke plus the 3pt 16% glow (stacked on shadow-sm).
+        let shadows = theme.shadow;
+        let mut elevation = if shadows {
+            crate::style::shadow_sm(theme.is_dark())
+        } else {
+            Vec::new()
+        };
+        if focused && shadows {
+            elevation.push(crate::style::focus_glow(cc::focus_glow(&palette)));
+        }
         let field = v_flex()
             .id("composer-box")
             .w_full()
-            .rounded(px(12.))
-            .bg(rgb(palette.surface))
-            .border_1()
-            .border_color(rgb(palette.border_strong))
-            .when(focused, |el| {
-                el.border_2().border_color(rgb(palette.accent))
-            })
-            .px_3()
-            .pt_2()
-            .pb_1()
-            .gap_1()
+            .rounded(px(cc::RADIUS))
+            .bg(rgb(cc::fill(&palette)))
+            .border(px(if focused {
+                cc::BORDER_FOCUS
+            } else {
+                cc::BORDER
+            }))
+            .border_color(rgb(if focused {
+                cc::focus_border(&palette)
+            } else {
+                cc::resting_border(&palette)
+            }))
+            .shadow(elevation)
+            .px(px(cc::PADDING))
+            .pt(px(cc::PADDING))
+            .pb(px(cc::CONTROL_INSET))
             .child(
                 Textarea::new(&self.composer)
                     .aria_label(t("a11y.composer"))
@@ -1404,11 +1538,13 @@ impl ForgeApp {
             .child(
                 h_flex()
                     .id("composer-toolbar")
-                    .h(px(28.))
+                    .h(px(cc::SEND_SIZE))
+                    .mt(px(cc::CONTROL_INSET))
+                    .mr(px(-cc::CONTROL_INSET))
                     .gap_2()
                     .items_center()
-                    .text_size(px(tokens::CAPTION.size))
-                    .line_height(px(tokens::CAPTION.line_height))
+                    .text_size(px(tokens::FOOTNOTE.size))
+                    .line_height(px(tokens::FOOTNOTE.line_height))
                     .text_color(rgb(palette.fg2))
                     .child(
                         Button::new("composer-attach")
@@ -1419,8 +1555,14 @@ impl ForgeApp {
                             .tooltip(t("composer.attach")),
                     )
                     .children(workspace.map(|name| {
+                        // Workspace chip: `chip` fill, radius-sm, fg2 (mock .ws).
                         h_flex()
                             .gap_1()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(tokens::RADIUS_SM))
+                            .bg(rgb(cc::chip_bg(&palette)))
+                            .text_color(rgb(cc::chip_fg(&palette)))
                             .child(Icon::new(IconName::Folder).xsmall())
                             .child(name)
                     }))
@@ -1431,24 +1573,40 @@ impl ForgeApp {
             )
             .test_support();
 
-        let hint: AnyElement = if no_key {
-            h_flex()
-                .gap_1()
-                .child(t("composer.no_key"))
-                .child(
-                    Button::new("composer-open-settings")
-                        .label(t("composer.open_settings"))
-                        .link()
-                        .xsmall()
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
-                        ),
-                )
-                .into_any_element()
+        // §0: the idle hint line is gone — the send button's tooltip and
+        // accessibility description carry "↩ 发送 · ⇧↩ 换行". Only the
+        // actionable notices remain: the no-key link and, when running with
+        // queue_when_busy, "↩ 加入队列 · ⌥↩ 插话".
+        let hint: Option<AnyElement> = if no_key {
+            Some(
+                h_flex()
+                    .id("composer-hint")
+                    .role(Role::Group)
+                    .aria_label(t("composer.no_key"))
+                    .gap_1()
+                    .child(t("composer.no_key"))
+                    .child(
+                        Button::new("composer-open-settings")
+                            .label(t("composer.open_settings"))
+                            .link()
+                            .xsmall()
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
+                            ),
+                    )
+                    .test_support()
+                    .into_any_element(),
+            )
         } else {
-            div()
-                .child(t(self.state.composer_hint_key()))
-                .into_any_element()
+            self.state.composer_hint_key().map(|key| {
+                div()
+                    .id("composer-hint")
+                    .role(Role::Group)
+                    .aria_label(t(key))
+                    .child(t(key))
+                    .test_support()
+                    .into_any_element()
+            })
         };
 
         h_flex()
@@ -1456,8 +1614,8 @@ impl ForgeApp {
             .justify_center()
             .flex_shrink_0()
             .px_8()
-            .pb_6()
-            .pt_3()
+            .pb(px(cc::BOTTOM))
+            .pt_2()
             .child(
                 v_flex()
                     .id("composer")
@@ -1472,12 +1630,23 @@ impl ForgeApp {
                             div()
                                 .id("composer-error")
                                 .role(Role::Alert)
-                                .text_xs()
+                                .text_size(px(tokens::FOOTNOTE.size))
                                 .text_color(rgb(palette.danger))
                                 .child(error),
                         )
                     })
-                    .child(div().text_xs().text_color(rgb(palette.fg2)).child(hint)),
+                    .when_some(hint, |col, hint| {
+                        col.child(
+                            div()
+                                .w_full()
+                                .text_center()
+                                .text_size(px(tokens::FOOTNOTE.size))
+                                .line_height(px(tokens::FOOTNOTE.line_height))
+                                .text_color(rgb(palette.fg3))
+                                .child(hint),
+                        )
+                    })
+                    .test_support(),
             )
             .into_any_element()
     }
@@ -1632,22 +1801,99 @@ impl ForgeApp {
         )
     }
 
-    /// "模型与 Key" (§6.13, P1 subset) as an in-window panel: one row per
-    /// provider with Core's `key_configured` status, a masked key field,
-    /// 保存 / 移除. Opened by ⌘,, "打开设置" on error cards and the no-key notice.
+    /// "模型与 Key" (§6.13, P1 subset) as an in-window dialog, grouped per the
+    /// v2.1 mock: 模型服务 (provider key rows + 默认模型), 外观 (主题
+    /// segmented control), 关于 (version badge). Rows are title + value /
+    /// control; the keychain note moved into the ⓘ tooltips.
     fn render_settings(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.state.settings.open {
             return None;
         }
         let theme = cx.theme().clone();
-        let palette = *Palette::for_dark(theme.is_dark());
-        let mut rows = v_flex().gap_3();
+        let dark = theme.is_dark();
+        let palette = *Palette::for_dark(dark);
+        let shadows = theme.shadow;
+        use tokens::component::card::settings_bg;
+        use tokens::component::dialog as dg;
+
+        // Settings item row inside a group card (`.it`): padded, children
+        // supplied by the caller; `first` rows carry no top hairline.
+        let item = |children: Vec<AnyElement>, first: bool| {
+            let el = h_flex()
+                .w_full()
+                .min_w_0()
+                .min_h(px(52.))
+                .items_center()
+                .px(px(tokens::component::card::PADDING))
+                .py_2()
+                .gap_3();
+            let el = if first {
+                el
+            } else {
+                el.border_t_1().border_color(rgb(dg::separator(&palette)))
+            };
+            el.children(children)
+        };
+        let info = |id: SharedString, note: SharedString| {
+            Button::new(id)
+                .icon(IconName::Info)
+                .ghost()
+                .xsmall()
+                // ⓘ notes tab after the index-0 controls and before 关闭
+                // (index 2), keeping the first row control first.
+                .tab_index(1)
+                .accessibility_label(note.clone())
+                .tooltip(note)
+        };
+        let badge = |icon: Option<IconName>, text: String, fg: u32| {
+            h_flex()
+                .gap_1()
+                .items_center()
+                .flex_shrink_0()
+                .text_size(px(tokens::CAPTION.size))
+                .line_height(px(tokens::CAPTION.line_height))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .text_color(rgb(fg))
+                .children(icon.map(|icon| Icon::new(icon).xsmall().text_color(rgb(fg))))
+                .child(text)
+                .into_any_element()
+        };
+        // Row title (Semibold, flexes) + optional ⓘ whose tooltip and
+        // AccessKit description carry the explanatory note (v2.1).
+        let item_title = |name: &'static str, note: Option<(SharedString, SharedString)>| {
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .truncate()
+                        .child(name),
+                )
+                .children(note.map(|(id, note)| info(id, note)))
+                .into_any_element()
+        };
+        let note_of = |unavailable: bool| {
+            if unavailable {
+                SharedString::from(t("settings.keychain_denied"))
+            } else {
+                SharedString::from(t("settings.key.note"))
+            }
+        };
+
+        // ---- 模型服务: one item per provider (name + ⓘ + badge + controls),
+        // then the read-only 默认模型 row.
+        let mut service_items: Vec<AnyElement> = Vec::new();
         for (index, ((id, name), (provider, input))) in
             PROVIDERS.iter().zip(self.key_inputs.iter()).enumerate()
         {
             let configured = self.state.settings.has_key_for(provider);
             let unavailable = self.state.settings.key_unavailable(provider);
-            let status = match self.state.settings.key_status.get(provider) {
+            let local = self.state.settings.key_status.get(provider);
+            let failed = matches!(local, Some(LocalKeyState::Failed { .. }));
+            let status = match local {
                 _ if unavailable => t("settings.key.status.unavailable").to_owned(),
                 Some(LocalKeyState::SavedUnverified) => t("settings.key.status.saved").to_owned(),
                 Some(LocalKeyState::Testing) => t("settings.key.status.testing").to_owned(),
@@ -1659,7 +1905,15 @@ impl ForgeApp {
                 _ if configured => t("settings.key.status.saved").to_owned(),
                 _ => t("settings.key.status.unconfigured").to_owned(),
             };
-            rows = rows.child(
+            // Badge: ✓ success when verified, ✕ danger on failure, fg2 else.
+            let (badge_icon, badge_fg) = if unavailable || failed {
+                (Some(IconName::CircleX), palette.danger)
+            } else if matches!(local, Some(LocalKeyState::Verified)) {
+                (Some(IconName::CircleCheck), palette.success)
+            } else {
+                (None, palette.fg2)
+            };
+            service_items.push(
                 v_flex()
                     .id(SharedString::from(format!("settings-key-{id}")))
                     .role(Role::Group)
@@ -1669,44 +1923,34 @@ impl ForgeApp {
                     ))
                     .w_full()
                     .min_w_0()
-                    .gap_1p5()
+                    .min_h(px(52.))
+                    .px(px(tokens::component::card::PADDING))
+                    .py_2()
+                    .gap_2()
+                    .when(!service_items.is_empty(), |el| {
+                        el.border_t_1().border_color(rgb(dg::separator(&palette)))
+                    })
                     .child(
-                        // Name · status · 重试; wraps to a second line rather
-                        // than pushing past the panel edge.
                         h_flex()
                             .w_full()
                             .min_w_0()
                             .flex_wrap()
                             .gap_x_2()
                             .gap_y_1()
-                            .child(
-                                div()
-                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                    .child(*name),
-                            )
+                            .items_center()
+                            .child(item_title(
+                                name,
+                                Some((
+                                    SharedString::from(format!("settings-info-{id}")),
+                                    note_of(unavailable),
+                                )),
+                            ))
                             .child(
                                 div()
                                     .id(SharedString::from(format!("settings-status-{id}")))
-                                    .text_sm()
-                                    .text_color(rgb(if unavailable {
-                                        palette.danger
-                                    } else {
-                                        palette.fg2
-                                    }))
-                                    .when(unavailable, |el| {
-                                        el.child(
-                                            Icon::new(IconName::TriangleAlert)
-                                                .text_color(rgb(palette.danger)),
-                                        )
-                                    })
-                                    .flex()
-                                    .min_w_0()
-                                    .gap_1()
-                                    .items_center()
-                                    .child(status)
+                                    .child(badge(badge_icon, status, badge_fg))
                                     .test_support(),
                             )
-                            .child(div().flex_1())
                             .when(unavailable, |row| {
                                 let focus = self.key_retry_focus[index].clone();
                                 row.child(
@@ -1719,6 +1963,8 @@ impl ForgeApp {
                                         ))
                                         .outline()
                                         .small()
+                                        // §0: the old 28pt controls are 32 now.
+                                        .h(px(tokens::component::button::HEIGHT))
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.retry_key_status(index, window, cx)
                                         })),
@@ -1727,7 +1973,7 @@ impl ForgeApp {
                     )
                     .child(
                         // The key field shrinks (flex-1 + min-w-0) so 保存 /
-                        // 移除 always stay inside the panel.
+                        // 移除 always stay inside the card.
                         h_flex()
                             .w_full()
                             .min_w_0()
@@ -1737,7 +1983,10 @@ impl ForgeApp {
                                     .id(SharedString::from(format!("settings-input-{id}")))
                                     .flex_1()
                                     .min_w_0()
-                                    .child(Input::new(input).small())
+                                    // §0: 32pt control height (Input's default
+                                    // medium already renders h-8).
+                                    .h(px(tokens::component::button::HEIGHT))
+                                    .child(Input::new(input))
                                     .test_support(),
                             )
                             .child(
@@ -1746,6 +1995,7 @@ impl ForgeApp {
                                     .label(t("settings.key.save"))
                                     .primary()
                                     .small()
+                                    .h(px(tokens::component::button::HEIGHT))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.save_key(index, false, window, cx)
                                     })),
@@ -1759,15 +2009,135 @@ impl ForgeApp {
                                     .label(t("settings.key.remove"))
                                     .outline()
                                     .small()
+                                    .h(px(tokens::component::button::HEIGHT))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.save_key(index, true, window, cx)
                                     })),
                                 )
                             }),
                     )
-                    .test_support(),
+                    .test_support()
+                    .into_any_element(),
             );
         }
+        let model = self
+            .state
+            .settings
+            .settings
+            .as_ref()
+            .map(|s| s.model.model.clone())
+            .unwrap_or_default();
+        service_items.push(
+            item(
+                vec![
+                    item_title(
+                        t("settings.model.label"),
+                        Some((
+                            "settings-info-model".into(),
+                            t("settings.model.note").into(),
+                        )),
+                    ),
+                    badge(None, model, palette.fg2),
+                ],
+                service_items.is_empty(),
+            )
+            .into_any_element(),
+        );
+
+        // ---- 外观: 主题 segmented control (ui_prefs.appearance.theme).
+        let appearance = self.state.ui.appearance;
+        use tokens::component::segmented as segc;
+        let seg = |id: &'static str, label: &'static str, value: forge_state::Appearance| {
+            let on = appearance == value;
+            Button::new(SharedString::from(format!("settings-theme-{id}")))
+                .label(t(label))
+                .ghost()
+                .xsmall()
+                .flex_1()
+                // 32pt track, 2pt inset → 28pt segments nesting at
+                // radius-sm − 2 (§0 concentric outline).
+                .h(px(segc::SEGMENT_HEIGHT))
+                .rounded(px(segc::segment_radius()))
+                .when(on, |b| {
+                    b.bg(rgb(palette.surface))
+                        .text_color(rgb(palette.fg))
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .when(shadows, |b| b.shadow(crate::style::shadow_sm(dark)))
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.state.ui.appearance = value;
+                    this.after_change(window, cx);
+                }))
+                .into_any_element()
+        };
+        let appearance_items = vec![
+            item(
+                vec![
+                    item_title(t("settings.theme"), None),
+                    h_flex()
+                        .id("settings-theme-track")
+                        .items_center()
+                        .h(px(segc::TRACK_HEIGHT))
+                        .p(px(segc::TRACK_INSET))
+                        .rounded(px(segc::TRACK_RADIUS))
+                        .bg(rgb(palette.subtle))
+                        .test_support()
+                        .child(seg(
+                            "light",
+                            "settings.theme.light",
+                            forge_state::Appearance::Light,
+                        ))
+                        .child(seg(
+                            "dark",
+                            "settings.theme.dark",
+                            forge_state::Appearance::Dark,
+                        ))
+                        .child(seg(
+                            "system",
+                            "settings.theme.system",
+                            forge_state::Appearance::System,
+                        ))
+                        .into_any_element(),
+                ],
+                true,
+            )
+            .into_any_element(),
+        ];
+
+        // ---- 关于: Forge + version badge (read-only; no update checker).
+        let about_items = vec![
+            item(
+                vec![item_title("Forge", None), {
+                    let v = env!("CARGO_PKG_VERSION").to_owned();
+                    badge(
+                        None,
+                        tf("settings.about.version", &[("version", v.as_str())]),
+                        palette.fg2,
+                    )
+                }],
+                true,
+            )
+            .into_any_element(),
+        ];
+
+        let group = |title: &'static str, items: Vec<AnyElement>| {
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(tokens::CAPTION.size))
+                        .line_height(px(tokens::CAPTION.line_height))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(rgb(palette.fg3))
+                        .child(t(title)),
+                )
+                .child(
+                    v_flex()
+                        .rounded(px(tokens::component::card::RADIUS))
+                        .bg(rgb(settings_bg(&palette, dark)))
+                        .children(items),
+                )
+        };
         let error = self.state.settings.error.clone();
         Some(
             div()
@@ -1785,7 +2155,7 @@ impl ForgeApp {
                 .bg(theme.overlay)
                 // Modal scrim: blocks hover, clicks and the scroll wheel for
                 // everything behind it. Clicking it does not close the panel
-                // (only Esc or 关闭 do).
+                // (only Esc or ✕ do).
                 .occlude()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -1796,23 +2166,24 @@ impl ForgeApp {
                         .id("settings-trap")
                         .track_focus(&self.settings_focus)
                         .tab_stop(false)
-                        .w(px(520.))
+                        .w(px(dg::WIDTH))
                         .max_w_full()
                         .min_w_0()
                         .child(
                             v_flex()
                                 .id("settings")
                                 .role(Role::Dialog)
-                                .aria_label(t("settings.page.keys"))
+                                .aria_label(t("settings.page"))
                                 .w_full()
                                 .min_w_0()
-                                .p_5()
-                                .gap_4()
-                                .rounded(px(12.))
+                                .p(px(dg::PADDING))
+                                .gap(px(dg::GROUP_GAP))
+                                .rounded(px(dg::RADIUS))
                                 .bg(rgb(palette.surface))
-                                .border_1()
-                                .border_color(rgb(palette.border))
-                                .shadow_lg()
+                                .when_some(dg::border_color(&palette, dark, shadows), |el, c| {
+                                    el.border_1().border_color(rgb(c))
+                                })
+                                .shadow(crate::style::shadow_lg(dark))
                                 .child(
                                     h_flex()
                                         .items_center()
@@ -1821,23 +2192,29 @@ impl ForgeApp {
                                                 .text_size(px(tokens::TITLE2.size))
                                                 .line_height(px(tokens::TITLE2.line_height))
                                                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                                .child(t("settings.page.keys")),
+                                                .child(t("settings.page")),
                                         )
                                         .child(div().flex_1())
                                         .child(
                                             Button::new("settings-close")
                                                 .track_focus(&self.settings_close_focus)
-                                                // Last tab stop: the cycle starts in the rows.
-                                                .tab_index(1)
-                                                .label(t("settings.close"))
+                                                // Last tab stop: the cycle starts in the rows
+                                                // (ⓘ notes sit at index 1).
+                                                .tab_index(2)
+                                                .icon(IconName::X)
                                                 .ghost()
                                                 .small()
+                                                .h(px(tokens::component::button::HEIGHT))
+                                                .accessibility_label(t("a11y.settings.close"))
+                                                .tooltip(t("settings.close"))
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.close_settings(window, cx)
                                                 })),
                                         ),
                                 )
-                                .child(rows)
+                                .child(group("settings.group.services", service_items))
+                                .child(group("settings.group.appearance", appearance_items))
+                                .child(group("settings.group.about", about_items))
                                 .when_some(error, |col, error| {
                                     col.child(
                                         div()
@@ -1848,12 +2225,6 @@ impl ForgeApp {
                                             .child(error),
                                     )
                                 })
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(palette.fg2))
-                                        .child(t("settings.key.note")),
-                                )
                                 .test_support(),
                         )
                         .focus_trap("settings-trap", &self.settings_focus),
@@ -1898,8 +2269,21 @@ impl Render for ForgeApp {
         }
         let settings = self.render_settings(cx);
         let header = self.render_header(cx);
-        let timeline = self.render_timeline(cx);
+        // v2.1: on the empty screen the composer sits inside it between the
+        // title and the suggestion rows; otherwise it docks at the bottom.
+        let empty =
+            self.state.onboarding.is_none() && self.state.selected().is_none_or(|vm| vm.is_empty());
         let composer = self.render_composer(window, cx);
+        let content: AnyElement = if empty {
+            self.render_empty(cx, composer)
+        } else {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .child(self.render_timeline(cx))
+                .child(composer)
+                .into_any_element()
+        };
         let theme = cx.theme().clone();
         let (sidebar, divider) = match sidebar {
             Some((s, d)) => (Some(s), Some(d)),
@@ -1960,8 +2344,7 @@ impl Render for ForgeApp {
                     .min_w_0()
                     .h_full()
                     .children(header)
-                    .child(timeline)
-                    .child(composer),
+                    .child(content),
             )
             .children(inspector)
             .children(settings)

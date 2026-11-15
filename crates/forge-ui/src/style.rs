@@ -1,9 +1,10 @@
-//! Shared control styling rules from §3.1.
+//! Shared control styling rules from §3.1 and the visual v2 elevation /
+//! type-role helpers.
 
 use crate::tokens::Palette;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::button::Button;
-use gpui_kit::{App, Div, ParentElement, Styled, div, px, rgb};
+use gpui_kit::{App, BoxShadow, Div, ParentElement, Styled, div, hsla, px, rgb};
 
 /// §3.1 rule 3: a disabled control keeps readable text — `fg3` on `subtle`
 /// (5.00:1 light / 4.71:1 dark) with a `borderStrong` outline — and signals
@@ -20,6 +21,44 @@ pub fn disabled_readable(button: Button, disabled: bool, cx: &App) -> Button {
         .text_color(rgb(palette.fg3))
         .border_1()
         .border_color(rgb(palette.subtle))
+}
+
+/// v2 `shadow-sm` (Composer): 0 1px 2px α4% + 0 2px 8px α6% — the dark theme
+/// lifts the two layers to 30% / 25%.
+pub fn shadow_sm(dark: bool) -> Vec<BoxShadow> {
+    let (a, b) = if dark { (0.30, 0.25) } else { (0.04, 0.06) };
+    vec![
+        BoxShadow::new(px(0.), px(1.), hsla(0., 0., 0., a)).blur_radius(px(2.)),
+        BoxShadow::new(px(0.), px(2.), hsla(0., 0., 0., b)).blur_radius(px(8.)),
+    ]
+}
+
+/// v2 `shadow-lg` (dialogs): light 0 12px 32px −8px α18% + 0 4px 8px −4px α8%;
+/// dark one deep layer 0 16px 40px −8px α60% (plus a 1pt border, set by the
+/// dialog itself).
+pub fn shadow_lg(dark: bool) -> Vec<BoxShadow> {
+    if dark {
+        vec![
+            BoxShadow::new(px(0.), px(16.), hsla(0., 0., 0., 0.60))
+                .blur_radius(px(40.))
+                .spread_radius(px(-8.)),
+        ]
+    } else {
+        vec![
+            BoxShadow::new(px(0.), px(12.), hsla(0., 0., 0., 0.18))
+                .blur_radius(px(32.))
+                .spread_radius(px(-8.)),
+            BoxShadow::new(px(0.), px(4.), hsla(0., 0., 0., 0.08))
+                .blur_radius(px(8.))
+                .spread_radius(px(-4.)),
+        ]
+    }
+}
+
+/// v2 composer focus glow: `0 0 0 3px` accent at 16% — a spread ring with no
+/// blur or offset, layered on top of `shadow_sm`.
+pub fn focus_glow(accent: u32) -> BoxShadow {
+    BoxShadow::new(px(0.), px(0.), rgb(accent).opacity(0.16).into()).spread_radius(px(3.))
 }
 
 /// Kbd-style shortcut chip (`⌥⌘1`) in `fg3` (2026-11-14 Inspector tabs).

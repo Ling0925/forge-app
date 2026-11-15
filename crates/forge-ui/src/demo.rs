@@ -507,8 +507,9 @@ mod tests {
         let (app, now) = populated(Scene::Running);
         assert_eq!(now, BASE + 98_000);
         assert_eq!(app.composer_mode(), ComposerMode::Running);
-        // The demo caps lack queue_when_busy → the P1 hint, not ⌥↩ 插话.
-        assert_eq!(app.composer_hint_key(), "composer.hint.running_p1");
+        // v2.1: the demo caps lack queue_when_busy, so no visible hint line —
+        // the "运行中" placeholder and the stop pill's ⌘. tooltip carry it.
+        assert_eq!(app.composer_hint_key(), None);
         assert!(
             app.timeline_rows()
                 .iter()

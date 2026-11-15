@@ -152,7 +152,7 @@ fn p1_busy_session_does_not_queue_or_steer() {
     start_run(&mut app);
     app.set_draft("next");
     assert_eq!(app.composer_mode(), ComposerMode::Running);
-    assert_eq!(app.composer_hint_key(), "composer.hint.running_p1");
+    assert_eq!(app.composer_hint_key(), None);
     assert_eq!(
         app.composer_key(ComposerKey::Enter),
         KeyOutcome::Ignored(IgnoreReason::Busy)
@@ -170,7 +170,7 @@ fn p3_busy_enter_queues_and_alt_enter_steers_with_steer_id() {
     let mut app = app_with_session();
     app.capabilities = Capabilities::P3;
     start_run(&mut app);
-    assert_eq!(app.composer_hint_key(), "composer.hint.running");
+    assert_eq!(app.composer_hint_key(), Some("composer.hint.running"));
     app.set_draft("queued");
     assert!(matches!(
         app.composer_key(ComposerKey::Enter),
@@ -209,7 +209,7 @@ fn no_key_and_storage_error_disable_the_composer() {
         app.composer_mode(),
         ComposerMode::Disabled(DisabledReason::NoKey)
     );
-    assert_eq!(app.composer_hint_key(), "composer.no_key");
+    assert_eq!(app.composer_hint_key(), Some("composer.no_key"));
     app.set_draft("x");
     assert_eq!(
         app.composer_key(ComposerKey::Enter),

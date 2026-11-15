@@ -1435,18 +1435,23 @@ impl AppState {
         }
     }
 
-    /// Hint key under the composer (§6.9 / §10).
-    pub fn composer_hint_key(&self) -> &'static str {
+    /// Hint key under the composer (§6.9 / §10), or `None` when the composer
+    /// shows no hint line. Visual v2.1 §0: idle shows no line — the "↩ 发送 ·
+    /// ⇧↩ 换行" info moved to the send button's tooltip and accessibility
+    /// description. Without `queue_when_busy` the running state likewise
+    /// carries its explanation in the "运行中" placeholder and the stop
+    /// button's "停止 ⌘." tooltip.
+    pub fn composer_hint_key(&self) -> Option<&'static str> {
         match self.composer_mode() {
             ComposerMode::Running | ComposerMode::Cancelling => {
                 if self.capabilities.queue_when_busy {
-                    "composer.hint.running"
+                    Some("composer.hint.running")
                 } else {
-                    "composer.hint.running_p1"
+                    None
                 }
             }
-            ComposerMode::Disabled(DisabledReason::NoKey) => "composer.no_key",
-            _ => "composer.hint.idle",
+            ComposerMode::Disabled(DisabledReason::NoKey) => Some("composer.no_key"),
+            _ => None,
         }
     }
 

@@ -367,7 +367,7 @@ fn key_configured_drives_banner_and_composer() {
         app.composer_mode(),
         ComposerMode::Disabled(DisabledReason::NoKey)
     );
-    assert_eq!(app.composer_hint_key(), "composer.no_key");
+    assert_eq!(app.composer_hint_key(), Some("composer.no_key"));
     // Saving a key: SetProviderKey, then Core confirms with ProviderKeyConfigured.
     app.set_provider_key("openai".into(), Some("  sk-test-123  ".into()));
     let out = single_command(&mut app);
@@ -447,6 +447,44 @@ fn ui_prefs_round_trip_through_settings() {
     };
     assert_eq!(settings.ui_prefs["sidebar.width"], "260");
     assert_eq!(settings.ui_prefs["sidebar.visible"], "false");
+}
+
+/// 外观 → 主题 persists through `Settings.ui_prefs` like the layout keys
+/// (visual v2): Core-stored values restore on load and the current choice is
+/// written back on persist.
+#[test]
+fn appearance_pref_round_trips_through_settings() {
+    let mut app = app();
+    assert_eq!(app.ui.appearance, Appearance::System, "default");
+
+    // Stored values restore on load; an unknown one is ignored, not applied.
+    let mut s = settings(true);
+    s.ui_prefs.insert("appearance.theme".into(), "dark".into());
+    app.load_settings(s);
+    assert_eq!(app.ui.appearance, Appearance::Dark);
+    let mut s = settings(true);
+    s.ui_prefs.insert("appearance.theme".into(), "sepia".into());
+    app.load_settings(s);
+    assert_eq!(app.ui.appearance, Appearance::Dark, "invalid keeps current");
+
+    // Changing the choice writes "appearance.theme" back to Core.
+    app.ui.appearance = Appearance::Light;
+    app.persist_ui_prefs();
+    let Command::UpdateSettings { settings } = single_command(&mut app).command else {
+        panic!("UpdateSettings expected")
+    };
+    assert_eq!(settings.ui_prefs["appearance.theme"], "light");
+
+    // 跟随系统 is stored explicitly: it overrides a pinned value on load.
+    app.ui.appearance = Appearance::System;
+    app.persist_ui_prefs();
+    let Command::UpdateSettings { settings } = single_command(&mut app).command else {
+        panic!("UpdateSettings expected")
+    };
+    assert_eq!(settings.ui_prefs["appearance.theme"], "system");
+    app.ui.appearance = Appearance::Dark;
+    app.load_settings(settings);
+    assert_eq!(app.ui.appearance, Appearance::System);
 }
 
 #[test]
@@ -1056,7 +1094,7 @@ fn key_status_three_states_unavailable_is_not_missing() {
         app.settings.key_status[&openai],
         LocalKeyState::SavedUnverified
     );
-    assert_ne!(app.composer_hint_key(), "composer.no_key");
+    assert_ne!(app.composer_hint_key(), Some("composer.no_key"));
 
     // unavailable: not configured, but never the missing ("未配置 Key") UI.
     at(
@@ -1074,7 +1112,7 @@ fn key_status_three_states_unavailable_is_not_missing() {
         app.composer_mode(),
         ComposerMode::Disabled(DisabledReason::NoKey)
     );
-    assert_ne!(app.composer_hint_key(), "composer.no_key");
+    assert_ne!(app.composer_hint_key(), Some("composer.no_key"));
     assert_eq!(app.settings.key_status[&openai], LocalKeyState::Unavailable);
     assert_eq!(app.settings.key_status[&openai].label(), "无法读取钥匙串");
 
@@ -1093,7 +1131,7 @@ fn key_status_three_states_unavailable_is_not_missing() {
         app.composer_mode(),
         ComposerMode::Disabled(DisabledReason::NoKey)
     );
-    assert_eq!(app.composer_hint_key(), "composer.no_key");
+    assert_eq!(app.composer_hint_key(), Some("composer.no_key"));
     assert_eq!(app.settings.key_status[&openai].label(), "未配置");
 
     // Snapshot rows go through the same mapping.
