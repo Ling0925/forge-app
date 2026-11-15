@@ -8,7 +8,7 @@ use forge_provider::{ErrorKind, ProviderError, StreamEvent};
 use forge_store::Store;
 use forge_testkit::provider::{FixedProviderFactory, Script, ScriptedProvider, Step};
 use forge_tools::clock::FakeClock;
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 
 const KEY: &str = "sentinel-runtime-key-never-persist";
@@ -548,4 +548,209 @@ async fn malformed_provider_stream_fails_the_run() {
 
     assert!(proposed(&events).is_empty());
     assert!(matches!(outcome(&events), RunOutcome::Failed { .. }));
+}
+
+#[tokio::test]
+async fn a_call_id_repeated_in_a_later_round_fails_the_run() {
+    // The provider repeats call-1 in the second response of the same run. The
+    // id already has a persisted row from round one; accepting it would upsert
+    // that row and hang the new result on the old call's tool/arguments.
+    let mut h = Harness::new([
+        Script::Stream(tool_call("call-1", "read_file", "{\"path\":\"note.txt\"}")),
+        Script::Stream(tool_call("call-1", "list_dir", "{\"path\":\".\"}")),
+        done("done"),
+    ]);
+    let workspace = h.directory.path().join("ws");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("note.txt"), "file-body\n").unwrap();
+    let session = h.session(&workspace).await;
+    accepted(h.command(send(&session, "in-1")).await);
+    let events = h.until_finished().await;
+
+    assert!(matches!(
+        outcome(&events),
+        RunOutcome::Failed {
+            kind: RunErrorKind::Server,
+            ..
+        }
+    ));
+    // Only round one was proposed; no second ToolCallProposed/result for the
+    // repeated id.
+    assert_eq!(proposed(&events).len(), 1);
+    assert_eq!(state_changes(&events).len(), 2);
+    // The persisted first-round call is untouched: its tool, arguments and
+    // result still describe the read_file call that actually ran.
+    let stored = h
+        .runtime
+        .services
+        .store
+        .tool_call(&ToolCallId("call-1".into()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.tool, "read_file");
+    assert_eq!(stored.arguments_json, "{\"path\":\"note.txt\"}");
+    assert_eq!(stored.state, ToolCallState::Succeeded);
+    assert_eq!(stored.result.unwrap().text, "file-body\n");
+    // The second response made it to the provider before the run failed.
+    assert_eq!(h.provider.requests().len(), 2);
+    // The rest of that response (arguments delta, Finished) drains as stale
+    // events without panicking.
+    for _ in 0..2 {
+        assert!(h.runtime.dispatch_next().await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn a_call_id_repeated_in_a_later_run_fails_that_run() {
+    // The id namespace is provider-wide, not per run: run 2's fresh call-1
+    // would collide with run 1's persisted row, so it fails as invalid input.
+    let mut h = Harness::new([
+        Script::Stream(tool_call("call-1", "read_file", "{\"path\":\"note.txt\"}")),
+        done("done"),
+        Script::Stream(tool_call("call-1", "list_dir", "{\"path\":\".\"}")),
+        done("done"),
+    ]);
+    let workspace = h.directory.path().join("ws");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("note.txt"), "file-body\n").unwrap();
+    let session = h.session(&workspace).await;
+    accepted(h.command(send(&session, "in-1")).await);
+    let events = h.until_finished().await;
+    assert_eq!(*outcome(&events), RunOutcome::Succeeded);
+
+    accepted(h.command(send(&session, "in-2")).await);
+    let events = h.until_finished().await;
+    assert!(matches!(
+        outcome(&events),
+        RunOutcome::Failed {
+            kind: RunErrorKind::Server,
+            ..
+        }
+    ));
+    // Run 1's call row is untouched by run 2's repeated id.
+    let stored = h
+        .runtime
+        .services
+        .store
+        .tool_call(&ToolCallId("call-1".into()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.tool, "read_file");
+    assert_eq!(stored.result.unwrap().text, "file-body\n");
+    // The rest of run 2's response drains as stale events.
+    for _ in 0..2 {
+        assert!(h.runtime.dispatch_next().await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn late_stream_events_after_terminal_state_are_ignored() {
+    // The duplicate id finishes the run mid-stream; the provider task keeps
+    // draining its script, so deltas/usage/arg deltas and the stream error all
+    // arrive after the run is already terminal. They must be dropped, not
+    // panic on the missing running state.
+    let mut h = Harness::new([Script::Stream(vec![
+        Step::Event(StreamEvent::ToolCallStarted {
+            id: ToolCallId("call-1".into()),
+            name: "read_file".into(),
+        }),
+        Step::Event(StreamEvent::ToolCallStarted {
+            id: ToolCallId("call-1".into()),
+            name: "read_file".into(),
+        }),
+        Step::Event(StreamEvent::TextDelta("late".into())),
+        Step::Event(usage(1)),
+        Step::Event(StreamEvent::ToolArgumentsDelta {
+            id: ToolCallId("call-1".into()),
+            json: "{}".into(),
+        }),
+        Step::Error(ProviderError {
+            code: None,
+            kind: ErrorKind::Network,
+            message: "dropped".into(),
+        }),
+    ])]);
+    let workspace = h.directory.path().join("ws");
+    std::fs::create_dir(&workspace).unwrap();
+    let session = h.session(&workspace).await;
+    accepted(h.command(send(&session, "in-1")).await);
+    let events = h.until_finished().await;
+    assert!(matches!(outcome(&events), RunOutcome::Failed { .. }));
+
+    // Exactly the four stale internals remain: text delta, usage, arguments
+    // delta, stream error. Draining them must not panic.
+    for _ in 0..4 {
+        assert!(h.runtime.dispatch_next().await.unwrap());
+    }
+    assert!(h.events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn every_assistant_row_of_a_tool_run_is_persisted_and_returned() {
+    // Each provider response persists its own assistant row, so a two-round
+    // tool run leaves three assistant rows with distinct text for one run id.
+    // LoadHistory returns them all — folding them away is a consumer concern.
+    let mut h = Harness::new([
+        Script::Stream({
+            let mut steps = tool_call("call-1", "list_dir", "{\"path\":\".\"}");
+            steps.insert(
+                0,
+                Step::Event(StreamEvent::TextDelta("first reply.".into())),
+            );
+            steps
+        }),
+        Script::Stream({
+            let mut steps = tool_call("call-2", "grep", "{\"pattern\":\"needle\"}");
+            steps.insert(
+                0,
+                Step::Event(StreamEvent::TextDelta("second reply.".into())),
+            );
+            steps
+        }),
+        done("final reply."),
+    ]);
+    let workspace = h.directory.path().join("ws");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("hay.txt"), "a needle here\n").unwrap();
+    let session = h.session(&workspace).await;
+    accepted(h.command(send(&session, "in-1")).await);
+    let events = h.until_finished().await;
+    assert_eq!(*outcome(&events), RunOutcome::Succeeded);
+
+    let assert_rows = |messages: &[Message]| {
+        let rows: Vec<(&MessageRole, &str)> = messages
+            .iter()
+            .map(|m| (&m.role, m.content.text.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (&MessageRole::User, "run the tools"),
+                (&MessageRole::Assistant, "first reply."),
+                (&MessageRole::Tool, "hay.txt"),
+                (&MessageRole::Assistant, "second reply."),
+                (&MessageRole::Tool, "hay.txt:1:a needle here"),
+                (&MessageRole::Assistant, "final reply."),
+            ]
+        );
+    };
+    let stored = h.runtime.services.store.messages(&session).unwrap();
+    assert_rows(&stored);
+    let run_ids: BTreeSet<_> = stored.iter().map(|m| m.run_id.clone()).collect();
+    assert_eq!(run_ids.len(), 1);
+
+    accepted(
+        h.command(Command::LoadHistory {
+            session: session.clone(),
+            before: None,
+            limit: 50,
+        })
+        .await,
+    );
+    let loaded = loop {
+        if let Event::HistoryLoaded { messages, .. } = h.next().await.event {
+            break messages;
+        }
+    };
+    assert_rows(&loaded);
 }

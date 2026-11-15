@@ -16,8 +16,10 @@ const KEY: &str = "sentinel-runtime-key-never-persist";
 const ANTHROPIC_CALLS: &str = include_str!("fixtures/anthropic_tool_calls.sse");
 const ANTHROPIC_MISSING: &str = include_str!("fixtures/anthropic_tool_missing.sse");
 const ANTHROPIC_FINAL: &str = include_str!("fixtures/anthropic_final.sse");
+const ANTHROPIC_MALFORMED: &str = include_str!("fixtures/anthropic_tool_malformed.sse");
 const OPENAI_CALLS: &str = include_str!("fixtures/openai_tool_calls.sse");
 const OPENAI_FINAL: &str = include_str!("fixtures/openai_final.sse");
+const OPENAI_MISSING: &str = include_str!("fixtures/openai_tool_missing.sse");
 const TOOL_NAMES: [&str; 4] = ["read_file", "list_dir", "glob", "grep"];
 
 struct Harness {
@@ -280,6 +282,49 @@ async fn anthropic_failed_tool_result_sets_is_error() {
 }
 
 #[tokio::test]
+async fn anthropic_malformed_tool_arguments_stay_visible_on_the_wire() {
+    let requests = run_pair("anthropic", ANTHROPIC_MALFORMED, ANTHROPIC_FINAL).await;
+    // `tool_use.input` must stay a JSON object (Anthropic 400s otherwise), but
+    // malformed arguments must not be silently replaced with `{}` — the raw
+    // text is preserved under a marker key so the model can see what it sent.
+    // A valid-but-non-object value (`[]`) is wrapped the same way.
+    let messages = body(&requests[1])["messages"].clone();
+    assert_eq!(
+        messages[0],
+        json!({"role":"user","content":"run the tools"})
+    );
+    let assistant = &messages[1];
+    assert_eq!(assistant["role"], "assistant");
+    assert_eq!(
+        assistant["content"],
+        json!([
+            {"type":"tool_use","id":"call_bad","name":"read_file","input":{"_forge_malformed_arguments":"{\"path\":"}},
+            {"type":"tool_use","id":"call_arr","name":"read_file","input":{"_forge_malformed_arguments":"[]"}}
+        ])
+    );
+    let results = messages[2]["content"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    for (result, id) in results.iter().zip(["call_bad", "call_arr"]) {
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], id);
+        assert_eq!(result["is_error"], true);
+        assert!(!result["content"].as_str().unwrap().is_empty());
+    }
+    assert!(
+        results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("EOF while parsing")
+    );
+    assert!(
+        results[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("invalid length 0")
+    );
+}
+
+#[tokio::test]
 async fn openai_continuation_encodes_assistant_tool_calls_and_tool_messages() {
     let requests = run_pair("openai", OPENAI_CALLS, OPENAI_FINAL).await;
     first_request_assertions("openai", &requests[0]);
@@ -295,6 +340,24 @@ async fn openai_continuation_encodes_assistant_tool_calls_and_tool_messages() {
             ]},
             {"role":"tool","tool_call_id":"call_read","content":"file-body\n"},
             {"role":"tool","tool_call_id":"call_list","content":"note.txt"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn openai_failed_tool_result_is_a_tool_message_without_error_flag() {
+    let requests = run_pair("openai", OPENAI_MISSING, OPENAI_FINAL).await;
+    // The chat-completions wire has no is_error equivalent: a failed result is
+    // a plain role:tool message keyed by the exact tool_call_id, arguments on
+    // the assistant tool_calls stay the provider's raw JSON string.
+    assert_eq!(
+        body(&requests[1])["messages"],
+        json!([
+            {"role":"user","content":"run the tools"},
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"call_gone","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"missing.txt\"}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_gone","content":"No such file or directory (os error 2)"}
         ])
     );
 }

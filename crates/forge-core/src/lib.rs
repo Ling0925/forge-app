@@ -810,6 +810,12 @@ impl Runtime {
         run: RunId,
         result: Result<StreamEvent, ProviderError>,
     ) -> Result<(), StoreError> {
+        // The provider task drains its stream even after the run reached a
+        // terminal state (e.g. a malformed stream failed it mid-response);
+        // events arriving after that are stale and must not touch the run.
+        if !self.active.contains_key(&run) {
+            return Ok(());
+        }
         match result {
             Ok(StreamEvent::TextDelta(text)) => {
                 let running = self.active.get_mut(&run).expect("stream has active run");
@@ -834,7 +840,13 @@ impl Runtime {
             }
             Ok(StreamEvent::ToolCallStarted { id, name }) => {
                 let running = self.active.get_mut(&run).expect("stream has active run");
-                if running.calls.iter().any(|call| call.id == id) {
+                // A call id is unique across the conversation, not within one
+                // response: reusing an id already persisted by an earlier
+                // round or run would upsert that call's row and hang the new
+                // result on the old tool/arguments.
+                if running.calls.iter().any(|call| call.id == id)
+                    || self.services.store.tool_call(&id)?.is_some()
+                {
                     self.finish(
                         run,
                         Err(invalid_response("provider repeated a tool call id")),
@@ -971,6 +983,11 @@ impl Runtime {
         mut call: ToolCall,
         outcome: tool_loop::Outcome,
     ) -> Result<(), StoreError> {
+        // A tool task can outlive its run (the run already finished or was
+        // removed); its late completion is stale and must not touch the run.
+        if !self.active.contains_key(&run) {
+            return Ok(());
+        }
         let (state, result) = match outcome {
             tool_loop::Outcome::Succeeded(text) => (ToolCallState::Succeeded, Some(text)),
             tool_loop::Outcome::Failed(text) => (ToolCallState::Failed, Some(text)),

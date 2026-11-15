@@ -257,6 +257,17 @@ fn anthropic_user_block(out: &mut Vec<Value>, block: Value) {
     }
     out.push(json!({"role":"user","content":[block]}));
 }
+/// Anthropic requires `tool_use.input` to be a JSON object. Arguments the
+/// provider emitted that never parsed into one (truncated JSON, or a valid
+/// non-object value) keep their raw text under a marker key instead of being
+/// silently replaced with an empty object — the paired `tool_result` already
+/// reports the failure to the model.
+fn tool_input(arguments_json: &str) -> Value {
+    match serde_json::from_str::<Value>(arguments_json) {
+        Ok(value) if value.is_object() => value,
+        _ => json!({"_forge_malformed_arguments": arguments_json}),
+    }
+}
 fn anthropic_message(out: &mut Vec<Value>, message: &ProviderMessage) -> Result<(), ProviderError> {
     match message.role {
         MessageRole::User => {
@@ -274,7 +285,7 @@ fn anthropic_message(out: &mut Vec<Value>, message: &ProviderMessage) -> Result<
             for call in &message.tool_calls {
                 content.push(json!({
                     "type":"tool_use","id":call.id.0,"name":call.name,
-                    "input":serde_json::from_str::<Value>(&call.arguments_json).unwrap_or_else(|_| json!({})),
+                    "input":tool_input(&call.arguments_json),
                 }));
             }
             match (content.len(), message.tool_calls.is_empty()) {
