@@ -11,6 +11,7 @@ pub mod backend;
 pub mod card;
 pub mod clock;
 pub mod demo;
+mod focus_help;
 pub mod style;
 pub mod theme;
 mod timeline_view;

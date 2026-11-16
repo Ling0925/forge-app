@@ -464,8 +464,8 @@ pub fn nested_radius(outer: f32, padding: f32) -> f32 {
 /// the look touches this layer and [`Palette`], never call-site literals.
 pub mod component {
     use super::{
-        Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, RADIUS_XL, SPACE_2, SPACE_3, SPACE_4, SPACE_6,
-        SPACE_8, SPACE_12, nested_radius,
+        Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, RADIUS_XL, SPACE_1, SPACE_2, SPACE_3, SPACE_4,
+        SPACE_6, SPACE_8, SPACE_12, nested_radius,
     };
 
     /// Composer: floating surface, v2.1 §2/§4.
@@ -677,6 +677,30 @@ pub mod component {
     pub mod empty_state {
         use super::*;
         pub const BOTTOM: f32 = SPACE_12;
+    }
+
+    /// Keyboard-focus shortcut help (§0: 键盘聚焦时也能看到 tooltip): a
+    /// floating chip anchored to the focused control, painted by the
+    /// deferred/anchored popover primitives so it never claims layout space.
+    pub mod help {
+        use super::*;
+        /// Chip radius (`radius-sm`).
+        pub const RADIUS: f32 = RADIUS_SM;
+        /// Side padding (`space-2`).
+        pub const PAD_X: f32 = SPACE_2;
+        /// Vertical padding (`space-1`).
+        pub const PAD_Y: f32 = SPACE_1;
+        /// Gap between the trigger's top edge and the chip.
+        pub const GAP: f32 = SPACE_1;
+        pub fn bg(p: &Palette) -> u32 {
+            p.surface
+        }
+        pub fn fg(p: &Palette) -> u32 {
+            p.fg
+        }
+        pub fn border(p: &Palette) -> u32 {
+            p.border_strong
+        }
     }
 
     /// Cards are spaced 8pt apart in a group/stack.

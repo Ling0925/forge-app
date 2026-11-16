@@ -1410,3 +1410,242 @@ fn v2_1_remaining_hints_and_32pt_controls(cx: &mut TestAppContext) {
         }
     });
 }
+
+fn painted(window: &gpui_kit::Window, text: &str) -> bool {
+    gpui_kit::base::test_support::texts(window)
+        .into_iter()
+        .any(|t| t.visible() && t.text() == text)
+}
+
+/// §0/§4 rendered-tree keyboard-help tests: the shortcut surface is a
+/// painted chip — not AccessKit metadata or the hover-only managed tooltip.
+/// Input focus reveals "↩ 发送 · ⇧↩ 换行" while the empty-draft send stays
+/// disabled and unreachable; a focused enabled send reveals the same chip.
+/// Escape and blur hide it (Escape keeps focus and sends nothing), and the
+/// hover tooltip + a11y description stay on the button throughout.
+#[gpui_kit::test]
+fn composer_keyboard_focus_paints_shortcut_help(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    // Empty draft: send is disabled and not a tab stop, but the focused
+    // input still paints the shortcuts above the control.
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        let chip = window
+            .try_find("composer-help")
+            .expect("input focus must show the help chip");
+        assert!(chip.visible());
+        assert!(
+            painted(window, "↩ 发送 · ⇧↩ 换行"),
+            "the shortcuts are rendered text, not a11y metadata"
+        );
+        assert_eq!(window.find("composer-send").disabled(), Some(true));
+        assert_eq!(
+            window.find("composer-send").description(),
+            Some("↩ 发送 · ⇧↩ 换行"),
+            "the accessibility description stays on the control"
+        );
+        assert!(
+            chip.bounds().bottom() <= window.find("composer-send").bounds().top(),
+            "the chip floats above the send control"
+        );
+        assert_eq!(
+            window.find("composer").bounds(),
+            window.find("composer-box").bounds(),
+            "the chip reserves no layout space"
+        );
+    });
+    // Escape hides the chip; focus stays in the input; nothing sends.
+    let input = f.composer_id(cx);
+    f.with_window(cx, |window, cx| window.press("escape", cx));
+    cx.run_until_parked();
+    f.with_window(cx, |window, _| {
+        assert!(window.try_find("composer-help").is_none());
+        assert_eq!(
+            window.find(input.clone()).focused(),
+            Some(true),
+            "Escape keeps focus, it never steals it"
+        );
+    });
+    assert!(f.backend.take().is_empty(), "Escape sent nothing");
+    // Blur re-arms: Tab to the attach control hides the send chip (its own
+    // note paints instead); Shift-Tab back to the input brings it back.
+    f.with_window(cx, |window, cx| {
+        window.focus_next(cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("composer-attach").focused(), Some(true));
+        assert!(window.try_find("composer-help").is_none());
+        let tip = window
+            .try_find("composer-attach-help")
+            .expect("attach focus shows its own chip");
+        assert!(tip.visible());
+        assert!(painted(window, "添加附件（即将支持）"));
+        window.focus_prev(cx);
+        window.render_frame(cx);
+        let chip = window
+            .try_find("composer-help")
+            .expect("input refocus re-arms the chip");
+        assert!(chip.visible());
+    });
+    // A real draft enables send; focusing it paints the same shortcuts.
+    f.with_window(cx, |window, cx| window.input("draft", cx));
+    cx.run_until_parked();
+    f.with_window(cx, |window, cx| {
+        assert_eq!(window.find("composer-send").disabled(), None);
+        let mut focused = None;
+        for _ in 0..12 {
+            window.focus_next(cx);
+            window.render_frame(cx);
+            focused = window.find("composer-send").focused();
+            if focused == Some(true) {
+                break;
+            }
+        }
+        assert_eq!(focused, Some(true), "Tab reaches the enabled send");
+        let chip = window
+            .try_find("composer-help")
+            .expect("send focus shows the help chip");
+        assert!(chip.visible());
+        assert!(painted(window, "↩ 发送 · ⇧↩ 换行"));
+        // Escape hides it; focus stays on send; the draft survives.
+        window.press("escape", cx);
+        assert!(window.try_find("composer-help").is_none());
+        assert_eq!(window.find("composer-send").focused(), Some(true));
+        assert_eq!(
+            window.find("composer-send").disabled(),
+            None,
+            "Escape kept the draft"
+        );
+    });
+    cx.run_until_parked();
+    assert!(
+        !f.backend
+            .take()
+            .iter()
+            .any(|c| matches!(c, Command::Send { .. })),
+        "Escape on the send button must not send"
+    );
+    // Blur hides it too.
+    f.with_window(cx, |window, cx| {
+        window.focus_next(cx);
+        window.render_frame(cx);
+        assert!(window.try_find("composer-help").is_none(), "blur hides");
+    });
+}
+
+/// §0/§4: the same focus-chip rule covers the error card's ⋯ and shortcut
+/// buttons plus the settings ⓘ notes — every migrated tooltip paints on
+/// keyboard focus too.
+#[gpui_kit::test]
+fn error_card_and_settings_notes_paint_keyboard_help(cx: &mut TestAppContext) {
+    let f = Fixture::new(cx, 1280.);
+    // Failed run → error card with 重试 (⌘R) + ⋯.
+    f.start_run(cx, "r1");
+    f.update(cx, |app, window, cx| {
+        let finished = Event::RunFinished {
+            run: "r1".into(),
+            outcome: RunOutcome::Failed {
+                kind: RunErrorKind::Network,
+                message: "lost".into(),
+                http_status: None,
+                retry_after_ms: None,
+                retryable: true,
+            },
+            finished_at: 1,
+        };
+        fixture_event(app, finished, window, cx);
+    });
+    cx.run_until_parked();
+    f.with_window(cx, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("error-r1-primary").label(), Some("重试"));
+        // The ⋯ overflow sits first in the card's tab order (header row):
+        // focus it and its "更多操作" note paints as a chip.
+        let mut focused = None;
+        for _ in 0..40 {
+            window.focus_next(cx);
+            window.render_frame(cx);
+            focused = window.find("error-r1-more").focused();
+            if focused == Some(true) {
+                break;
+            }
+        }
+        assert_eq!(focused, Some(true), "the ⋯ button is a tab stop");
+        let chip = window
+            .try_find("error-r1-more-tip")
+            .expect("⋯ focus paints its note");
+        assert!(chip.visible());
+        assert!(painted(window, "更多操作"));
+        // Escape hides it; the ⋯ keeps focus; nothing fires.
+        window.press("escape", cx);
+        assert!(window.try_find("error-r1-more-tip").is_none());
+        assert_eq!(window.find("error-r1-more").focused(), Some(true));
+        // Tab order continues to 重试: "重试 ⌘R" paints on focus too.
+        let mut focused = None;
+        for _ in 0..10 {
+            window.focus_next(cx);
+            window.render_frame(cx);
+            focused = window.find("error-r1-primary").focused();
+            if focused == Some(true) {
+                break;
+            }
+        }
+        assert_eq!(focused, Some(true), "the primary action is a tab stop");
+        let chip = window
+            .try_find("error-r1-primary-tip")
+            .expect("primary focus paints its shortcut");
+        assert!(chip.visible());
+        assert!(painted(window, "重试 ⌘R"));
+    });
+    assert!(f.backend.take().is_empty(), "Escape fired nothing");
+
+    // Settings ⓘ notes: focus paints the keychain note as a chip.
+    f.with_window(cx, |window, cx| {
+        window.press("cmd-,", cx);
+        window.render_frame(cx);
+        let mut focused = None;
+        for _ in 0..30 {
+            window.focus_next(cx);
+            window.render_frame(cx);
+            focused = window.find("settings-info-openai").focused();
+            if focused == Some(true) {
+                break;
+            }
+        }
+        assert_eq!(focused, Some(true), "the ⓘ button is a tab stop");
+        let chip = window
+            .try_find("settings-info-openai-tip")
+            .expect("ⓘ focus paints its note");
+        assert!(chip.visible());
+        assert!(painted(
+            window,
+            "Key 只保存在本机钥匙串里，不写入数据库或日志。"
+        ));
+
+        // The ✕ header button keeps its label tooltip-only; focus paints
+        // "关闭" as the same chip, and Escape still closes the panel.
+        let mut focused = None;
+        for _ in 0..30 {
+            window.focus_next(cx);
+            window.render_frame(cx);
+            focused = window.find("settings-close").focused();
+            if focused == Some(true) {
+                break;
+            }
+        }
+        assert_eq!(focused, Some(true), "the ✕ button is a tab stop");
+        let chip = window
+            .try_find("settings-close-tip")
+            .expect("✕ focus paints its label");
+        assert!(chip.visible());
+        assert!(painted(window, "关闭"));
+    });
+    f.with_window(cx, |window, cx| {
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("settings-close-tip").is_none()
+                && window.try_find("settings-close").is_none(),
+            "Escape still dismisses the panel (chip and button gone)"
+        );
+    });
+}

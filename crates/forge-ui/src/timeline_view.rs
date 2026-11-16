@@ -7,6 +7,8 @@
 //! ("运行失败：<类型>"), a one-line reason and 重试 as the (single) primary
 //! button — details stay behind "查看日志".
 
+use crate::actions::CloseSettings;
+use crate::focus_help::{self, FocusHelp};
 use crate::tokens::{self, Palette};
 use crate::view::ForgeApp;
 use forge_state::i18n::{t, tf};
@@ -44,7 +46,12 @@ fn column(child: impl IntoElement) -> AnyElement {
         .into_any_element()
 }
 
-pub fn render_row(row: &TimelineRowVm, app: &WeakEntity<ForgeApp>, cx: &mut App) -> AnyElement {
+pub fn render_row(
+    row: &TimelineRowVm,
+    app: &WeakEntity<ForgeApp>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let theme = cx.theme().clone();
     let palette = *Palette::for_dark(theme.is_dark());
     let key = SharedString::from(row.key().to_owned());
@@ -191,7 +198,7 @@ pub fn render_row(row: &TimelineRowVm, app: &WeakEntity<ForgeApp>, cx: &mut App)
                 .text_color(theme.muted_foreground)
                 .into_any_element()
         }
-        TimelineRowVm::Error(card) => render_error_card(card, &palette, app, cx),
+        TimelineRowVm::Error(card) => render_error_card(card, &palette, app, window, cx),
         TimelineRowVm::Divider {
             icon,
             text,
@@ -262,15 +269,19 @@ pub fn render_row(row: &TimelineRowVm, app: &WeakEntity<ForgeApp>, cx: &mut App)
 }
 
 /// v2.1 action button: the visible label is the action name only — the
-/// shortcut (⌘R / ⌘N, latest card only) sits on the tooltip, which Button
-/// mirrors into the AccessKit description. 重试 is the one primary button.
+/// shortcut (⌘R / ⌘N, latest card only) sits on the tooltip (hover), the
+/// §0 focus chip (keyboard) and the AccessKit description (screen readers).
+/// 重试 is the one primary button. Returns the element plus the
+/// `FocusHelp` scope so the card can dismiss the chip on Escape.
 fn action_button(
     card: &ErrorCardVm,
     action: ErrorAction,
     primary: bool,
     app: &WeakEntity<ForgeApp>,
-    cx: &App,
-) -> Button {
+    palette: &Palette,
+    window: &mut Window,
+    cx: &mut App,
+) -> (AnyElement, FocusHelp) {
     let id = SharedString::from(format!(
         "error-{}-{}",
         card.run_id.0,
@@ -285,21 +296,25 @@ fn action_button(
         _ => (t(action.label_key()).to_owned(), false),
     };
     let shortcut = card.primary_shortcut.filter(|_| primary && !disabled);
+    let tip: Option<SharedString> = shortcut.map(|shortcut| {
+        tf(
+            "error.action.with_shortcut",
+            &[("label", t(action.label_key())), ("shortcut", shortcut)],
+        )
+        .into()
+    });
+    let help = focus_help::state(window, cx, format!("{id}-help"));
+    let show = help.showing(tip.is_some() && help.focused(window, cx));
     let weak = app.clone();
     let run = card.run_id.clone();
-    let button = Button::new(id)
+    let button = Button::new(id.clone())
         .label(label.clone())
         .accessibility_label(label)
         .small()
         // §0: the old 28pt card buttons are 32pt now.
         .h(px(tokens::component::button::HEIGHT))
         .disabled(disabled)
-        .when_some(shortcut, |button, shortcut| {
-            button.tooltip(tf(
-                "error.action.with_shortcut",
-                &[("label", t(action.label_key())), ("shortcut", shortcut)],
-            ))
-        })
+        .when_some(tip.clone(), |button, tip| button.tooltip(tip))
         .on_click(move |_, window, cx| {
             weak.update(cx, |this, cx| this.error_action(&run, action, window, cx))
                 .ok();
@@ -312,7 +327,17 @@ fn action_button(
             .outline()
             .border_color(rgb(cx_palette_border_strong(cx))),
     };
-    crate::style::disabled_readable(button, disabled, cx)
+    let button = crate::style::disabled_readable(button, disabled, cx);
+    let element = match tip {
+        Some(tip) => focus_help::anchor(
+            &help,
+            button,
+            focus_help::bubble(&help, format!("{id}-tip"), tip, show, palette, cx),
+        )
+        .into_any_element(),
+        None => button.into_any_element(),
+    };
+    (element, help)
 }
 
 /// `borderStrong` from the app's palette for outline buttons inside cards.
@@ -324,11 +349,14 @@ fn cx_palette_border_strong(cx: &App) -> u32 {
 /// bar, header is the ✕ icon + Semibold "运行失败：<错误类型>" in `danger`
 /// (no status pill — the icon and bar carry the state), one-line reason in
 /// `fg`, `meta` in `fg3`, actions = primary 重试 + outline "查看日志" + the
-/// ⋯ overflow (复制错误信息). Full detail lines stay in the toggle.
+/// ⋯ overflow (复制错误信息). Full detail lines stay in the toggle. §0:
+/// every tooltip-only fact (the ⋯ label, the primary shortcut) also shows
+/// as a focus chip; Escape hides it and keeps bubbling.
 fn render_error_card(
     card: &ErrorCardVm,
     palette: &Palette,
     app: &WeakEntity<ForgeApp>,
+    window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
     use tokens::component::card as ct;
@@ -360,11 +388,28 @@ fn render_error_card(
         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(copy_text.clone()));
     });
     let more_id = SharedString::from(format!("{id}-more"));
+    let more_help = focus_help::state(window, cx, format!("{more_id}-help"));
+    let more_show = more_help.showing(more_help.focused(window, cx));
+    let (primary_button, primary_help) =
+        action_button(card, card.primary, true, app, palette, window, cx);
+    let (secondary_button, _) =
+        action_button(card, card.secondary, false, app, palette, window, cx);
     v_flex()
         .id(SharedString::from(id.clone()))
         .role(Role::Group)
         .aria_label(card.a11y_label.clone())
         .aria_description(card.body.clone())
+        .on_action({
+            // Escape here resolves to `CloseSettings` (root context) —
+            // hide the card's help chips, then keep the event moving so
+            // the settings/root Escape behaviours still run.
+            let primary_help = primary_help.clone();
+            let more_help = more_help.clone();
+            move |_: &CloseSettings, window, cx| {
+                primary_help.dismiss(window, cx);
+                more_help.dismiss(window, cx);
+            }
+        })
         .relative()
         .overflow_hidden()
         .p(px(ct::PADDING))
@@ -397,8 +442,9 @@ fn render_error_card(
                 )
                 .child(card.a11y_label.clone())
                 .child(div().flex_1())
-                .child(
-                    Button::new(more_id)
+                .child(focus_help::anchor(
+                    &more_help,
+                    Button::new(more_id.clone())
                         .icon(IconName::Ellipsis)
                         .ghost()
                         .xsmall()
@@ -412,7 +458,15 @@ fn render_error_card(
                             );
                             menu
                         }),
-                )
+                    focus_help::bubble(
+                        &more_help,
+                        format!("{more_id}-tip"),
+                        t("card.more"),
+                        more_show,
+                        palette,
+                        cx,
+                    ),
+                ))
                 .test_support(),
         )
         .child(
@@ -431,8 +485,8 @@ fn render_error_card(
                 .mt_3()
                 .ml(px(tokens::SPACE_6))
                 .gap_2()
-                .child(action_button(card, card.primary, true, app, cx))
-                .child(action_button(card, card.secondary, false, app, cx)),
+                .child(primary_button)
+                .child(secondary_button),
         )
         .children(details)
         .test_support()

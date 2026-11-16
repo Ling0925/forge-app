@@ -7,6 +7,7 @@ use crate::actions::{
 };
 use crate::announce::Announcer;
 use crate::backend::{Backend, EventReceiver, StartError};
+use crate::focus_help::{self, FocusHelp};
 use crate::timeline_view::render_row;
 use crate::tokens::{self, Palette};
 use forge_protocol::{EventEnvelope, ProviderId, RunId, SessionId};
@@ -25,7 +26,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle,
+    AnyElement, App, AppContext, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle,
     Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     ParentElement, PromptButton, PromptLevel, Render, Role, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::FluentBuilder,
@@ -1379,7 +1380,7 @@ impl ForgeApp {
                 MessageScroller::new(
                     "timeline-scroller",
                     self.scroller.clone(),
-                    move |index, _, cx| {
+                    move |index, window, cx| {
                         let row = rows.borrow().get(index).cloned();
                         match row {
                             // v2.1 §2: 12pt inside a turn, 24pt between turns
@@ -1393,7 +1394,7 @@ impl ForgeApp {
                                 };
                                 div()
                                     .pt(px(gap))
-                                    .child(render_row(&row, &weak, cx))
+                                    .child(render_row(&row, &weak, window, cx))
                                     .into_any_element()
                             }
                             None => div().into_any_element(),
@@ -1410,11 +1411,13 @@ impl ForgeApp {
     /// Floating composer (v2.1 §0/§2/§4): `surface` card, radius-xl,
     /// `shadow-sm`, 1pt `borderStrong` (1.5pt `accent` + 3pt 16% glow on
     /// focus). The 32pt circular send and the "■ 停止" pill sit 8pt from the
-    /// card border. §0: no idle hint row — the "↩ 发送 · ⇧↩ 换行" /
-    /// "停止 ⌘." shortcuts live on the buttons' tooltips and accessibility
-    /// descriptions; the only remaining line is the no-key notice or the
+    /// card border. §0: no idle hint row — while the field or the send/stop
+    /// control holds keyboard focus, a floating chip above the control
+    /// renders "↩ 发送 · ⇧↩ 换行" / "停止 ⌘." (`focus_help`; hover still
+    /// gets the managed tooltip, screen readers the accessibility
+    /// description). The only remaining line is the no-key notice or the
     /// queue-capable running hint.
-    fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let palette = *Palette::for_dark(theme.is_dark());
         use tokens::component::composer as cc;
@@ -1427,10 +1430,23 @@ impl ForgeApp {
             .state
             .selected()
             .and_then(|vm| vm.composer.error.clone());
+        // §0/§4 keyboard-help state: one scope wraps whichever action button
+        // is live (send ⇄ stop); the attach button gets its own. Both stay
+        // out of Tab order; Escape on the composer column dismisses either
+        // chip until blur and keeps bubbling.
+        let send_help = focus_help::state(window, cx, "composer-send-help");
+        let attach_help = focus_help::state(window, cx, "composer-attach-help");
+        let input_focused = !disabled && self.composer.read(cx).focus_handle(cx).is_focused(window);
+        let action_focused = send_help.focused(window, cx);
+        // The disabled empty-draft send is not a tab stop, so the text field
+        // must also raise the chip; the stop control uses the same rule.
+        let send_help_show = !disabled && send_help.showing(input_focused || action_focused);
+        let attach_help_show = attach_help.showing(attach_help.focused(window, cx));
         let button: AnyElement = if busy {
             // v2.1: "■ 停止" outline pill (borderStrong / fg), Semibold; ⌘.
-            // moves to the tooltip and the AccessKit description. While
-            // cancelling it is a readable disabled control, never faded.
+            // is the hover tooltip, the focus chip and the AccessKit
+            // description. While cancelling it is a readable disabled
+            // control, never faded.
             let stopping = mode == ComposerMode::Cancelling;
             let button = Button::new("composer-stop")
                 .icon(IconName::Square)
@@ -1459,7 +1475,20 @@ impl ForgeApp {
                 .border_color(rgb(cc::stop_border(&palette)))
                 .disabled(stopping)
                 .on_click(cx.listener(|this, _, window, cx| this.primary_button(window, cx)));
-            crate::style::disabled_readable(button, stopping, cx).into_any_element()
+            let button = crate::style::disabled_readable(button, stopping, cx);
+            focus_help::anchor(
+                &send_help,
+                button,
+                focus_help::bubble(
+                    &send_help,
+                    "composer-help",
+                    t("composer.stop_key"),
+                    send_help_show,
+                    &palette,
+                    cx,
+                ),
+            )
+            .into_any_element()
         } else {
             // 32pt circle, accent/onAccent; disabled keeps fg3 on subtle
             // (5.00:1 light / 4.71:1 dark), the v2.1 "send.off" state.
@@ -1473,10 +1502,23 @@ impl ForgeApp {
                 .rounded_full()
                 .disabled(button_disabled)
                 .on_click(cx.listener(|this, _, window, cx| this.primary_button(window, cx)));
-            crate::style::disabled_readable(button, button_disabled, cx).into_any_element()
+            let button = crate::style::disabled_readable(button, button_disabled, cx);
+            focus_help::anchor(
+                &send_help,
+                button,
+                focus_help::bubble(
+                    &send_help,
+                    "composer-help",
+                    t("composer.send_key"),
+                    send_help_show,
+                    &palette,
+                    cx,
+                ),
+            )
+            .into_any_element()
         };
 
-        let focused = !disabled && self.composer.read(cx).focus_handle(cx).is_focused(window);
+        let focused = input_focused;
         let workspace = self
             .state
             .active_workspace
@@ -1547,12 +1589,25 @@ impl ForgeApp {
                     .line_height(px(tokens::FOOTNOTE.line_height))
                     .text_color(rgb(palette.fg2))
                     .child(
-                        Button::new("composer-attach")
-                            .icon(gpui_kit::assets::IconName::Paperclip)
-                            .ghost()
-                            .xsmall()
-                            .accessibility_label(t("composer.attach"))
-                            .tooltip(t("composer.attach")),
+                        // The paperclip only explains itself in a tooltip —
+                        // same keyboard-help treatment as the send control.
+                        focus_help::anchor(
+                            &attach_help,
+                            Button::new("composer-attach")
+                                .icon(gpui_kit::assets::IconName::Paperclip)
+                                .ghost()
+                                .xsmall()
+                                .accessibility_label(t("composer.attach"))
+                                .tooltip(t("composer.attach")),
+                            focus_help::bubble(
+                                &attach_help,
+                                "composer-attach-help",
+                                t("composer.attach"),
+                                attach_help_show,
+                                &palette,
+                                cx,
+                            ),
+                        ),
                     )
                     .children(workspace.map(|name| {
                         // Workspace chip: `chip` fill, radius-sm, fg2 (mock .ws).
@@ -1573,10 +1628,12 @@ impl ForgeApp {
             )
             .test_support();
 
-        // §0: the idle hint line is gone — the send button's tooltip and
-        // accessibility description carry "↩ 发送 · ⇧↩ 换行". Only the
-        // actionable notices remain: the no-key link and, when running with
-        // queue_when_busy, "↩ 加入队列 · ⌥↩ 插话".
+        // §0: the idle hint line stays gone — keyboard focus on the field or
+        // the send/stop control raises the "↩ 发送 · ⇧↩ 换行" / "停止 ⌘."
+        // chip, hover the managed tooltip, and the AccessKit description
+        // covers screen readers. Only the actionable notices remain: the
+        // no-key link and, when running with queue_when_busy, "↩ 加入队列 ·
+        // ⌥↩ 插话".
         let hint: Option<AnyElement> = if no_key {
             Some(
                 h_flex()
@@ -1621,6 +1678,17 @@ impl ForgeApp {
                     .id("composer")
                     .key_context(COMPOSER_CONTEXT)
                     .on_action(cx.listener(Self::on_steer))
+                    .on_action({
+                        // Escape hides whichever help chip is up (the input
+                        // propagates the key; keep letting it bubble to the
+                        // root listener).
+                        let send_help = send_help.clone();
+                        let attach_help = attach_help.clone();
+                        move |_: &Escape, window, cx| {
+                            send_help.dismiss(window, cx);
+                            attach_help.dismiss(window, cx);
+                        }
+                    })
                     .w_full()
                     .max_w(px(forge_state::CONTENT_MAX))
                     .gap_1()
@@ -1805,7 +1873,7 @@ impl ForgeApp {
     /// v2.1 mock: 模型服务 (provider key rows + 默认模型), 外观 (主题
     /// segmented control), 关于 (version badge). Rows are title + value /
     /// control; the keychain note moved into the ⓘ tooltips.
-    fn render_settings(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_settings(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.state.settings.open {
             return None;
         }
@@ -1834,17 +1902,44 @@ impl ForgeApp {
             };
             el.children(children)
         };
-        let info = |id: SharedString, note: SharedString| {
-            Button::new(id)
-                .icon(IconName::Info)
-                .ghost()
-                .xsmall()
-                // ⓘ notes tab after the index-0 controls and before 关闭
-                // (index 2), keeping the first row control first.
-                .tab_index(1)
-                .accessibility_label(note.clone())
-                .tooltip(note)
-        };
+        // §4 focus-chip state for every ⓘ note (provider rows + 默认模型);
+        // created up front because later closures already borrow `cx`.
+        let mut info_helps = BTreeMap::new();
+        for (id, _) in PROVIDERS {
+            info_helps.insert(
+                format!("settings-info-{id}"),
+                focus_help::state(window, cx, format!("settings-info-{id}-help")),
+            );
+        }
+        info_helps.insert(
+            "settings-info-model".to_owned(),
+            focus_help::state(window, cx, "settings-info-model-help"),
+        );
+        // The ✕ button's only visible mark is an icon; "关闭" is
+        // tooltip-only info → same §0 chip on keyboard focus.
+        let close_help = focus_help::state(window, cx, "settings-close-help");
+        let close_show = close_help.showing(close_help.focused(window, cx));
+        // ⓘ note button: the note is important content, not decoration —
+        // §4 shows it as a focus chip on keyboard focus as well as the
+        // hover tooltip and the AccessKit description.
+        let info =
+            |help: &FocusHelp, window: &Window, cx: &App, id: SharedString, note: SharedString| {
+                let show = help.showing(help.focused(window, cx));
+                focus_help::anchor(
+                    help,
+                    Button::new(id.clone())
+                        .icon(IconName::Info)
+                        .ghost()
+                        .xsmall()
+                        // ⓘ notes tab after the index-0 controls and before 关闭
+                        // (index 2), keeping the first row control first.
+                        .tab_index(1)
+                        .accessibility_label(note.clone())
+                        .tooltip(note.clone()),
+                    focus_help::bubble(help, format!("{id}-tip"), note, show, &palette, cx),
+                )
+                .into_any_element()
+            };
         let badge = |icon: Option<IconName>, text: String, fg: u32| {
             h_flex()
                 .gap_1()
@@ -1858,9 +1953,12 @@ impl ForgeApp {
                 .child(text)
                 .into_any_element()
         };
-        // Row title (Semibold, flexes) + optional ⓘ whose tooltip and
-        // AccessKit description carry the explanatory note (v2.1).
-        let item_title = |name: &'static str, note: Option<(SharedString, SharedString)>| {
+        // Row title (Semibold, flexes) + optional ⓘ whose tooltip, focus
+        // chip and AccessKit description carry the explanatory note (v2.1).
+        let item_title = |window: &Window,
+                          cx: &App,
+                          name: &'static str,
+                          note: Option<(SharedString, SharedString)>| {
             h_flex()
                 .flex_1()
                 .min_w_0()
@@ -1872,7 +1970,11 @@ impl ForgeApp {
                         .truncate()
                         .child(name),
                 )
-                .children(note.map(|(id, note)| info(id, note)))
+                .children(note.and_then(|(id, note)| {
+                    info_helps
+                        .get(id.as_str())
+                        .map(|help| info(help, window, cx, id, note))
+                }))
                 .into_any_element()
         };
         let note_of = |unavailable: bool| {
@@ -1939,6 +2041,8 @@ impl ForgeApp {
                             .gap_y_1()
                             .items_center()
                             .child(item_title(
+                                window,
+                                cx,
                                 name,
                                 Some((
                                     SharedString::from(format!("settings-info-{id}")),
@@ -2031,6 +2135,8 @@ impl ForgeApp {
             item(
                 vec![
                     item_title(
+                        window,
+                        cx,
                         t("settings.model.label"),
                         Some((
                             "settings-info-model".into(),
@@ -2073,7 +2179,7 @@ impl ForgeApp {
         let appearance_items = vec![
             item(
                 vec![
-                    item_title(t("settings.theme"), None),
+                    item_title(window, cx, t("settings.theme"), None),
                     h_flex()
                         .id("settings-theme-track")
                         .items_center()
@@ -2107,7 +2213,7 @@ impl ForgeApp {
         // ---- 关于: Forge + version badge (read-only; no update checker).
         let about_items = vec![
             item(
-                vec![item_title("Forge", None), {
+                vec![item_title(window, cx, "Forge", None), {
                     let v = env!("CARGO_PKG_VERSION").to_owned();
                     badge(
                         None,
@@ -2195,11 +2301,12 @@ impl ForgeApp {
                                                 .child(t("settings.page")),
                                         )
                                         .child(div().flex_1())
-                                        .child(
+                                        .child(focus_help::anchor(
+                                            &close_help,
                                             Button::new("settings-close")
                                                 .track_focus(&self.settings_close_focus)
-                                                // Last tab stop: the cycle starts in the rows
-                                                // (ⓘ notes sit at index 1).
+                                                // Last tab stop: the cycle starts in the
+                                                // rows (ⓘ notes sit at index 1).
                                                 .tab_index(2)
                                                 .icon(IconName::X)
                                                 .ghost()
@@ -2210,7 +2317,15 @@ impl ForgeApp {
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.close_settings(window, cx)
                                                 })),
-                                        ),
+                                            focus_help::bubble(
+                                                &close_help,
+                                                "settings-close-tip",
+                                                t("settings.close"),
+                                                close_show,
+                                                &palette,
+                                                cx,
+                                            ),
+                                        )),
                                 )
                                 .child(group("settings.group.services", service_items))
                                 .child(group("settings.group.appearance", appearance_items))
@@ -2267,7 +2382,7 @@ impl Render for ForgeApp {
                 .child(page)
                 .into_any_element();
         }
-        let settings = self.render_settings(cx);
+        let settings = self.render_settings(window, cx);
         let header = self.render_header(cx);
         // v2.1: on the empty screen the composer sits inside it between the
         // title and the suggestion rows; otherwise it docks at the bottom.

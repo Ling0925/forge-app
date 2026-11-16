@@ -1,7 +1,7 @@
 //! Actions, key bindings (§7) and the menu bar (§9).
 
 use forge_state::i18n::t;
-use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+use gpui_kit::component::input::{Copy, Cut, Escape, Paste, Redo, SelectAll, Undo};
 use gpui_kit::{App, KeyBinding, Menu, MenuItem, OsAction};
 
 gpui_kit::actions!(
@@ -60,6 +60,11 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("alt-enter", Steer, Some(COMPOSER_CONTEXT)),
+        // Composer-scope Escape: the textarea already maps Esc to
+        // `input::Escape`; this binding gives the send/stop/attach controls
+        // the same action so the composer column can dismiss its keyboard
+        // help chips (§0) and then keep propagating.
+        KeyBinding::new("escape", Escape, Some(COMPOSER_CONTEXT)),
     ]
 }
 
@@ -151,13 +156,17 @@ mod tests {
     #[test]
     fn key_bindings_bind_expected_actions() {
         let bindings = key_bindings();
-        assert_eq!(bindings.len(), 20);
-        for binding in &bindings {
+        assert_eq!(bindings.len(), 21);
+        for binding in &bindings[..20] {
             assert!(!binding.keystrokes().is_empty());
             assert!(binding.action().name().starts_with("forge::"));
         }
         assert!(bindings[5].action().partial_eq(&NewSession));
         assert!(bindings[9].action().partial_eq(&FocusComposer));
         assert!(bindings[14].action().partial_eq(&Quit));
+        // Composer-scope Esc dismisses the §0 keyboard-help chips via the
+        // shared `input::Escape` action (ui namespace, not forge).
+        assert!(bindings[20].action().partial_eq(&Escape));
+        assert!(!bindings[20].keystrokes().is_empty());
     }
 }
